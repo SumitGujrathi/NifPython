@@ -34,20 +34,6 @@ OffDates = ["01-26-2023","03-07-2023","03-30-2023","04-04-2023","04-07-2023","04
 
 def Pull_Chain_Data(Symbol):
 
-    # MongoDB Connection
-    # SECRET_KEY = config("SECRET_KEY")
-
-    Dataset_Name = "NSE"
-    Collection = Symbol
-
-    linkMD = f"mongodb+srv://sumitgujrathi24:8lpVTDIBtyHKWRH3@sumit.ybjewjm.mongodb.net/{Dataset_Name}?retryWrites=true&w=majority"
-#     linkMD = SECRET_KEY
-
-    Client = pymongo.MongoClient(linkMD, 27017)
-
-    db = Client[Dataset_Name]
-
-    DATA_NSE = db[Collection]
 
 
     # NSE live data Option Chain Nifty
@@ -59,18 +45,20 @@ def Pull_Chain_Data(Symbol):
                             'like Gecko) '
                             'Chrome/80.0.3987.149 Safari/537.36',
             'accept-language': 'en,gu;q=0.9,hi;q=0.8', 'accept-encoding': 'gzip, deflate, br'}
-    session = requests.Session()
-    request = session.get(url, headers=headers)
-    cookies = dict(request.cookies)
-
-    # print(response.status_code)
-    # DATA = response.content
-
-    # list of item to be data framed => 1 = 'expiryDates' , 2 = 'data' , 3 = 'underlyingValue' , 4 = 'strikePrices'
 
     try:
-        DATA = session.get(url, headers=headers, timeout=0.5, cookies=cookies).json()['records']['data']
+        session = requests.Session()
+        request = session.get(url, headers=headers)
+        cookies = dict(request.cookies)
 
+        # print(response.status_code)
+        # DATA = response.content
+
+        # list of item to be data framed => 1 = 'expiryDates' , 2 = 'data' , 3 = 'underlyingValue' , 4 = 'strikePrices'
+
+        DATA = session.get(url, headers=headers, timeout=1, cookies=cookies).json()['records']['data']
+        time.sleep(1)
+        
         Cols = ['PE.underlyingValue','expiryDate','PE.openInterest','PE.changeinOpenInterest','PE.impliedVolatility','PE.lastPrice','PE.totalBuyQuantity','PE.totalSellQuantity','strikePrice','CE.totalSellQuantity','CE.totalBuyQuantity','CE.lastPrice','CE.impliedVolatility','CE.changeinOpenInterest','CE.openInterest']
 
         df = pd.json_normalize(DATA)
@@ -96,9 +84,25 @@ def Pull_Chain_Data(Symbol):
         Pull_Time = datetime.now()
         OI = {"Date":Pull_Time, "PE_OI":PE_OI,"CE_OI":CE_OI, "PE_COI":PE_COI, "CE_COI":CE_COI, "NIFTY":NIFTY, "PCR":PCR, "PE_Volatility": PE_Volat, "CE_Volatility": CE_Volat}
 
+        # MongoDB Connection
+        # SECRET_KEY = config("SECRET_KEY")
+
+        Dataset_Name = "NSE"
+        Collection = Symbol
+
+        linkMD = f"mongodb+srv://sumitgujrathi24:8lpVTDIBtyHKWRH3@sumit.ybjewjm.mongodb.net/{Dataset_Name}?retryWrites=true&w=majority"
+#       linkMD = SECRET_KEY
+
+        Client = pymongo.MongoClient(linkMD, 27017)
+        time.sleep(1)
+
+        db = Client[Dataset_Name]
+
+        DATA_NSE = db[Collection]
+
         DATA_NSE.insert_one(OI)
 
-        print(OI)
+#         print(OI)
 
 
 
@@ -113,20 +117,20 @@ def Pull_Chain_Data(Symbol):
 # Date Setting 
 
 Today_Date = datetime.now().strftime('%m-%d-%Y')
-print(Today_Date)
+# print(Today_Date)
 
 
 # On_Day = Today_Date in OffDates # If False Market is On.
 On_Day = Today_Date in OffDates
 
-print(On_Day)
+# print(On_Day)
 
 
 # Start Time Setting 
 
 cur_time = datetime.now().strftime('%H:%M:%S')
 cur_time = datetime.strptime(cur_time, '%H:%M:%S').time()
-print(cur_time)
+# print(cur_time)
 
 
 # Start Time Setting
@@ -176,8 +180,8 @@ while restart:
 
 
                 # <= Main Script End =>
-                print(cur_time)
-                print("Pulling")
+#                 print(cur_time)
+#                 print("Pulling")
                 time.sleep(240)
                 
             else:
@@ -187,8 +191,8 @@ while restart:
                 cur_time = cur_time
 
 
-                print("Time Over")
-                print(cur_time)
+#                 print("Time Over")
+#                 print(cur_time)
                 restart = "Wait"      
 
                 Today_Date = datetime.now().strftime('%m-%d-%Y')
@@ -218,8 +222,8 @@ while restart:
         cur_time = cur_time
 
 
-        print("Off Day")
-        print(cur_time)
+#         print("Off Day")
+#         print(cur_time)
         restart = "Wait"
         Today_Date = datetime.now().strftime('%m-%d-%Y')
         Today_Date = Today_Date    
@@ -235,7 +239,7 @@ while restart:
 
             time.sleep(1)
             restart = True
-        time.sleep(43200)         
+        time.sleep(3600)         
 
 
 
