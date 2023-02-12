@@ -131,13 +131,13 @@ print(cur_time)
 
 # Start Time Setting
 
-Start_time = '10:30:00' # time on web 09:17:00 in india
+Start_time = '03:47:00' # time on web 09:17:00 in india 3:47:00 on web
 Start_time = datetime.strptime(Start_time, '%H:%M:%S').time()
 
 
 # Stop Time Setting 
 
-Stop_time = '23:30:00'   # time on web 15:28:00 in india
+Stop_time = '09:57:00'   # time on web 15:28:00 in india 9:57:00 on Web
 Stop_time = datetime.strptime(Stop_time, '%H:%M:%S').time()
 
 
