@@ -7,7 +7,7 @@ import pymongo
 from decouple import config
 
 
-SECRET_KEY = config("SECRET_KEY")
+# SECRET_KEY = config("SECRET_KEY")
 
 def Pull_Chain_Data(Symbol):
 
@@ -17,8 +17,8 @@ def Pull_Chain_Data(Symbol):
     Dataset_Name = "NSE"
     Collection = Symbol
 
-    # linkMD = f"mongodb+srv://sumitgujrathi24:8lpVTDIBtyHKWRH3@sumit.ybjewjm.mongodb.net/{Dataset_Name}?retryWrites=true&w=majority"
-    linkMD = SECRET_KEY
+    linkMD = f"mongodb+srv://sumitgujrathi24:8lpVTDIBtyHKWRH3@sumit.ybjewjm.mongodb.net/{Dataset_Name}?retryWrites=true&w=majority"
+#     linkMD = SECRET_KEY
 
     Client = pymongo.MongoClient(linkMD, 27017)
 
