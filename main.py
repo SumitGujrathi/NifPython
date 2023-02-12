@@ -29,7 +29,7 @@ OffDates = ["01-26-2023","03-07-2023","03-30-2023","04-04-2023","04-07-2023","04
 # NSE Data Pull + Data Clearing + MongoDB Funciton
 
 
-SECRET_KEY = config("SECRET_KEY")
+# SECRET_KEY = config("SECRET_KEY")
 
 
 def Pull_Chain_Data(Symbol):
@@ -40,8 +40,8 @@ def Pull_Chain_Data(Symbol):
     Dataset_Name = "NSE"
     Collection = Symbol
 
-    # linkMD = f"mongodb+srv://sumitgujrathi24:8lpVTDIBtyHKWRH3@sumit.ybjewjm.mongodb.net/{Dataset_Name}?retryWrites=true&w=majority"
-    linkMD = SECRET_KEY
+    linkMD = f"mongodb+srv://sumitgujrathi24:8lpVTDIBtyHKWRH3@sumit.ybjewjm.mongodb.net/{Dataset_Name}?retryWrites=true&w=majority"
+#     linkMD = SECRET_KEY
 
     Client = pymongo.MongoClient(linkMD, 27017)
 
