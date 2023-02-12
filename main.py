@@ -170,7 +170,7 @@ while restart:
 
 
                 Pull_Chain_Data("NIFTY")
-                Pull_Chain_Data("BANKNIFTY")
+#                 Pull_Chain_Data("BANKNIFTY")
 
 
 
