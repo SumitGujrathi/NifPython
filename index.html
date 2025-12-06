@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NSE Live Stock Tracker</title>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    
+    <script>
+        // Function to refresh the page every 60 seconds (1 minute)
+        setTimeout(function(){
+           window.location.reload(1);
+        }, 60000); // 60000 milliseconds = 60 seconds
+    </script>
+
+    <style>
+        body { padding-top: 20px; }
+        .container { max-width: 90%; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2 class="mb-4 text-primary">🇮🇳 Live NSE Stock Data</h2>
+        
+        <p class="text-muted">
+            Last Updated: <span class="badge badge-info">{{ last_update }}</span> 
+            | Next Auto-Refresh in 60 seconds...
+        </p>
+
+        {{ table_html | safe }}
+        
+        <footer class="mt-5 text-center text-secondary">
+            <small>Data sourced via yfinance.</small>
+        </footer>
+    </div>
+</body>
+</html>
