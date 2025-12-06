@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Nifty 100 Live Data</title>
+  <style>
+    body { font-family: Arial; padding: 20px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 20px; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: center; }
+    th { background: #222; color: white; }
+  </style>
+</head>
+
+<body>
+  <h2>📈 Nifty Live Stock Data (Auto Refresh Every 1 Minute)</h2>
+  <p id="status" style="font-weight:bold; color: red;"></p>
+  <table id="stockTable">
+    <thead>
+      <tr>
+        <th>Symbol</th>
+        <th>Price</th>
+        <th>Change</th>
+        <th>% Change</th>
+        <th>Updated</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+<script>
+
+// NIFTY 100 + Indexes
+const symbols = [
+  "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
+  "NIFTY50", "BANKNIFTY"
+];
+
+// Converts Yahoo symbols for indexes
+function convertSymbol(sym){
+  if (sym === "NIFTY50") return "%5ENSEI";
+  if (sym === "BANKNIFTY") return "%5ENSEBANK";
+  return sym;
+}
+
+async function fetchData(symbol) {
+  const yahooURL =
+    "https://query1.finance.yahoo.com/v8/finance/chart/" + convertSymbol(symbol);
+  
+  const apiURL =
+    "https://api.allorigins.win/raw?url=" + encodeURIComponent(yahooURL);
+
+  try {
+      const res = await fetch(apiURL);
+      if (!res.ok) throw new Error("Yahoo blocked or API error");
+
+      const data = await res.json();
+      const result = data.chart.result[0];
+      const price = result.meta.regularMarketPrice;
+      const prev = result.meta.chartPreviousClose;
+      const change = (price - prev).toFixed(2);
+      const percent = ((change / prev) * 100).toFixed(2);
+
+      return {
+        symbol,
+        price,
+        change,
+        percent,
+        time: new Date().toLocaleTimeString()
+      };
+
+  } catch (err) {
+      return { symbol, error: true };
+  }
+}
+
+async function updateTable() {
+  document.getElementById("status").innerText = "Updating...";
+  
+  const tbody = document.querySelector("#stockTable tbody");
+  tbody.innerHTML = "";
+
+  const results = await Promise.all(symbols.map(s => fetchData(s)));
+
+  results.forEach(row => {
+    const tr = document.createElement("tr");
+
+    if (row.error) {
+      tr.innerHTML = `
+        <td>${row.symbol}</td>
+        <td colspan="4" style="color:red;">Error fetching data</td>
+      `;
+    } else {
+      tr.innerHTML = `
+        <td>${row.symbol}</td>
+        <td>${row.price}</td>
+        <td style="color:${row.change >= 0 ? "green" : "red"};">
+            ${row.change}
+        </td>
+        <td style="color:${row.percent >= 0 ? "green" : "red"};">
+            ${row.percent}%
+        </td>
+        <td>${row.time}</td>
+      `;
+    }
+    tbody.appendChild(tr);
+  });
+
+  document.getElementById("status").innerText = 
+      "Last updated: " + new Date().toLocaleTimeString();
+}
+
+// First load
+updateTable();
+
+// Auto Refresh every 1 minute
+setInterval(updateTable, 60000);
+
+</script>
+</body>
+</html>
