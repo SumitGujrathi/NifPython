@@ -1,7 +1,8 @@
+Flask
 numpy
 pandas
 pymongo
-requests
-dnspython
+yfinance
+threading
 datetime
-python-decouple
+requests
