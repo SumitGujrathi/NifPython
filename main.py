@@ -1,83 +1,116 @@
 from flask import Flask, jsonify
-import yfinance as yf
-import pandas as pd
-import numpy as np
+import requests
 import os
-# REMOVED: import requests, HTTPAdapter, Retry
+import pandas as pd
+import numpy as np # Keep this for consistent NaN handling
 
 app = Flask(__name__)
 
 # --- Configuration ---
+# NSE API Tickers use the base symbol (e.g., INFY, not INFY.NS)
 STOCK_TICKERS = [
-    'INFY.NS',
-    'TCS.NS',
-    'RELIANCE.NS',
-    'HDFCBANK.NS'
+    'INFY',
+    'TCS',
+    'RELIANCE',
+    'HDFCBANK'
 ]
 
-# REMOVED: get_retry_session function
+# Base URL for the NSE API
+NSE_BASE_URL = 'https://www.nseindia.com/'
+NSE_QUOTE_URL = 'https://www.nseindia.com/api/quote-equity?symbol='
 
-@app.route('/')
-def home():
-    return "Stock Data API is running!", 200
+# Headers required to mimic a browser and maintain a session
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive'
+}
+
+
+def get_nse_session_cookies():
+    """
+    Establishes a session by hitting the base URL to get necessary cookies.
+    """
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    
+    # Hit the base URL once to get initial cookies (crucial for authentication)
+    session.get(NSE_BASE_URL, timeout=10)
+    return session
+
 
 def fetch_stock_data_raw(ticker_list):
     table_headers = ["Symbol", "LTP (Close)", "Open", "High", "Low", "P. Close", "Volume"]
     table_data = []
-    
-    # REMOVED: session = get_retry_session()
 
     try:
-        # NOTE: session=session argument IS REMOVED here
-        data = yf.download(
-            tickers=ticker_list,
-            period="5d",
-            interval="1d",
-            progress=False,
-            group_by='ticker',
-            # REMOVED: session=session 
-        )
+        # Start a new session for all requests
+        session = get_nse_session_cookies()
     except Exception as e:
-        return {"error": f"YFinance Download Error: {e}"}
+        return {"error": f"Failed to establish NSE session: {e}"}
 
-    if data.empty:
-        return {"error": "YFinance returned empty data."}
-
-    # ... (Rest of your data processing logic remains the same) ...
     for ticker in ticker_list:
-        try:
-            if ticker in data.columns.get_level_values(0):
-                ticker_data = data[ticker]
-                
-                if ticker_data.empty or ticker_data.iloc[-1].isnull().all():
-                     table_data.append([ticker, 'N/A', 0, 0, 0, 0, 0])
-                     continue
-                
-                latest_data = ticker_data.iloc[-1]
-                previous_close = ticker_data['Close'].iloc[-2] if len(ticker_data) >= 2 else None
-
-                volume_value = latest_data['Volume']
-                volume = int(volume_value) if not pd.isna(volume_value) and volume_value != 0 else 0
-
-                def get_price(value):
-                    return float(value) if not pd.isna(value) else 0.0
-
-                row = [
-                    ticker,
-                    get_price(latest_data['Close']),
-                    get_price(latest_data['Open']),
-                    get_price(latest_data['High']),
-                    get_price(latest_data['Low']),
-                    get_price(previous_close),
-                    volume
-                ]
-                table_data.append(row)
+        url = NSE_QUOTE_URL + ticker
         
+        try:
+            # 1. Fetch data for the current ticker using the established session
+            response = session.get(url, timeout=10)
+            response.raise_for_status() # Raise exception for bad status codes (4xx or 5xx)
+            
+            data = response.json()
+            
+            # 2. Extract specific data points
+            if not data.get('priceInfo'):
+                table_data.append([ticker, 'No Price Data', 0, 0, 0, 0, 0])
+                continue
+
+            price_info = data['priceInfo']
+            market_info = data['marketStatus']
+            
+            # Handle possible market closures/errors
+            if market_info.get('marketStatus') != 'Open' and market_info.get('marketStatus') != 'Closed':
+                 current_price = price_info.get('close') or price_info.get('lastPrice')
+            else:
+                 current_price = price_info.get('lastPrice')
+            
+            # The previous close is found under securityInfo
+            previous_close = data['securityInfo']['prevClose']
+
+            # 3. Format the row data
+            row = [
+                ticker,
+                price_info.get('lastPrice', 0.0), # LTP
+                price_info.get('open', 0.0),      # Open
+                price_info.get('dayHigh', 0.0),   # High
+                price_info.get('dayLow', 0.0),    # Low
+                previous_close,                   # P. Close
+                data['totalTradedVolume']         # Volume
+            ]
+            
+            # Convert values to correct types for Apps Script
+            # (Ensuring numbers are floats/integers, not strings)
+            row = [row[0]] + [float(x) if isinstance(x, (int, float, str)) and str(x).replace('.', '', 1).isdigit() else 0.0 for x in row[1:6]] + [int(row[6]) if str(row[6]).isdigit() else 0]
+            
+            table_data.append(row)
+
+        except requests.exceptions.HTTPError as e:
+            # This handles 403 Forbidden errors if the NSE API blocks the IP
+            table_data.append([ticker, f"HTTP Error: {e.response.status_code}", 0, 0, 0, 0, 0])
         except Exception as e:
             table_data.append([ticker, f"Processing Error: {str(e)}", 0, 0, 0, 0, 0])
-            continue
 
+
+    if not table_data:
+        return {"error": "NSE returned empty data or was blocked for all tickers."}
+        
     return {"headers": table_headers, "data": table_data}
+
+# --- Flask and Startup Routes remain the same ---
+
+@app.route('/')
+def home():
+    return "Stock Data API is running!", 200
 
 @app.route('/get-live-data')
 def get_live_data():
