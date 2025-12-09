@@ -1,5 +1,5 @@
 Flask
 gunicorn
-yfinance==0.20.0
+yfinance==0.2.1
 pandas
 numpy
