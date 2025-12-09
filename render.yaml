@@ -1,8 +1,10 @@
 services:
 - type: web
-  name: stock-data-api
+  name: stock-dashboard
   env: python
-  pythonVersion: 3.9.18
   buildCommand: pip install -r requirements.txt
-  startCommand: gunicorn app:app
+  # The Streamlit Start Command
+  startCommand: streamlit run main.py
+  # Setting the Streamlit port via environment variable is not needed,
+  # but this command is essential.
   plan: free
