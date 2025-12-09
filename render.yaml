@@ -2,7 +2,7 @@ services:
 - type: web
   name: stock-data-api
   env: python
-  pythonVersion: 3.9  # Change from the default 3.7 to 3.9 or higher
+  pythonVersion: 3.9  # <--- Ensure this line is added/updated
   buildCommand: pip install -r requirements.txt
   startCommand: gunicorn app:app
   plan: free
