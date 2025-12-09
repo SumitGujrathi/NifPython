@@ -3,6 +3,7 @@ from streamlit_autorefresh import st_autorefresh
 import yfinance as yf
 import pandas as pd
 from datetime import datetime
+import numpy as np # Used for general stability
 
 st.set_page_config(
     page_title="Stock Financial Dashboard",
@@ -10,6 +11,7 @@ st.set_page_config(
     layout="wide"
 )
 
+# --- Ticker Configuration ---
 STOCK_LIST = [
     "NIFTY_50", "NIFTY_BANK", "ACC", "ADANIPORTS", "SBIN", "AMBUJACEM",
     "WIPRO", "APOLLOTYRE", "ASIANPAINT", "AUROPHARMA", "AXISBANK",
@@ -67,21 +69,39 @@ def get_all_stocks_data():
     symbols_str = " ".join(yahoo_symbols)
     
     try:
+        # Attempt to fetch all tickers in one efficient call
         tickers = yf.Tickers(symbols_str)
         
         for stock_name in STOCK_LIST:
             yahoo_symbol = get_yahoo_symbol(stock_name)
             try:
                 ticker = tickers.tickers.get(yahoo_symbol)
-                if ticker:
+                
+                # Check if ticker object was successfully retrieved
+                if ticker and ticker.info:
                     info = ticker.info
                     
+                    # Extract raw data
                     current_price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose', 0)
                     open_price = info.get('open') or info.get('regularMarketOpen', 0)
                     high_price = info.get('dayHigh') or info.get('regularMarketDayHigh', 0)
                     low_price = info.get('dayLow') or info.get('regularMarketDayLow', 0)
                     prev_close = info.get('previousClose') or info.get('regularMarketPreviousClose', 0)
-                    volume = info.get('volume') or info.get('regularMarketVolume', 0)
+                    
+                    volume_raw = info.get('volume') or info.get('regularMarketVolume', 0)
+                    
+                    # --- CRITICAL FIX FOR VOLUME COMMA ERROR ---
+                    if isinstance(volume_raw, str):
+                        try:
+                            # Remove commas and convert to float/int
+                            volume = float(volume_raw.replace(',', ''))
+                        except ValueError:
+                            volume = 0
+                    elif isinstance(volume_raw, (int, float)):
+                        volume = volume_raw
+                    else:
+                        volume = 0
+                    # --- END FIX ---
                     
                     all_data.append({
                         "Symbol": stock_name,
@@ -93,38 +113,49 @@ def get_all_stocks_data():
                         "Volume": volume
                     })
                 else:
+                    # Handle cases where the ticker object exists but has no data
                     all_data.append({
                         "Symbol": stock_name,
-                        "Current Price / LTP": "N/A",
-                        "Open": "N/A",
-                        "High": "N/A",
-                        "Low": "N/A",
-                        "Previous Close": "N/A",
-                        "Volume": "N/A"
+                        "Current Price / LTP": "N/A", "Open": "N/A", "High": "N/A", 
+                        "Low": "N/A", "Previous Close": "N/A", "Volume": "N/A"
                     })
             except Exception:
+                 # Handle individual ticker processing failure
                 all_data.append({
                     "Symbol": stock_name,
-                    "Current Price / LTP": "N/A",
-                    "Open": "N/A",
-                    "High": "N/A",
-                    "Low": "N/A",
-                    "Previous Close": "N/A",
-                    "Volume": "N/A"
+                    "Current Price / LTP": "N/A", "Open": "N/A", "High": "N/A", 
+                    "Low": "N/A", "Previous Close": "N/A", "Volume": "N/A"
                 })
+    
     except Exception:
+        # Fallback to fetching tickers one by one if the bulk fetch fails
+        st.warning("Bulk fetch failed. Falling back to fetching data individually...")
         for stock_name in STOCK_LIST:
             yahoo_symbol = get_yahoo_symbol(stock_name)
             try:
                 ticker = yf.Ticker(yahoo_symbol)
                 info = ticker.info
                 
+                # Extract raw data
                 current_price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose', 0)
                 open_price = info.get('open') or info.get('regularMarketOpen', 0)
                 high_price = info.get('dayHigh') or info.get('regularMarketDayHigh', 0)
                 low_price = info.get('dayLow') or info.get('regularMarketDayLow', 0)
                 prev_close = info.get('previousClose') or info.get('regularMarketPreviousClose', 0)
-                volume = info.get('volume') or info.get('regularMarketVolume', 0)
+                
+                volume_raw = info.get('volume') or info.get('regularMarketVolume', 0)
+                
+                # --- CRITICAL FIX FOR VOLUME COMMA ERROR (ALSO APPLIED IN FALLBACK) ---
+                if isinstance(volume_raw, str):
+                    try:
+                        volume = float(volume_raw.replace(',', ''))
+                    except ValueError:
+                        volume = 0
+                elif isinstance(volume_raw, (int, float)):
+                    volume = volume_raw
+                else:
+                    volume = 0
+                # --- END FIX ---
                 
                 all_data.append({
                     "Symbol": stock_name,
@@ -138,12 +169,8 @@ def get_all_stocks_data():
             except Exception:
                 all_data.append({
                     "Symbol": stock_name,
-                    "Current Price / LTP": "N/A",
-                    "Open": "N/A",
-                    "High": "N/A",
-                    "Low": "N/A",
-                    "Previous Close": "N/A",
-                    "Volume": "N/A"
+                    "Current Price / LTP": "N/A", "Open": "N/A", "High": "N/A", 
+                    "Low": "N/A", "Previous Close": "N/A", "Volume": "N/A"
                 })
     
     return pd.DataFrame(all_data)
@@ -178,9 +205,14 @@ def main():
     with st.spinner("Fetching stock data for all symbols..."):
         df = get_all_stocks_data()
     
-    if not df.empty:
+    if not df.empty and df['Current Price / LTP'].iloc[0] != 'N/A':
         st.subheader("📊 Stock Price Data - All Symbols")
         
+        # Ensure the DataFrame is clean before formatting
+        numeric_cols = ["Current Price / LTP", "Open", "High", "Low", "Previous Close", "Volume"]
+        for col in numeric_cols:
+             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+             
         formatted_df = format_dataframe(df)
         
         st.dataframe(
@@ -199,7 +231,7 @@ def main():
             mime="text/csv"
         )
     else:
-        st.warning("Unable to fetch stock data. Please try again later.")
+        st.error("❌ Unable to fetch stock data for core symbols. Check connectivity or market status.")
     
     st.markdown("---")
     st.markdown(
