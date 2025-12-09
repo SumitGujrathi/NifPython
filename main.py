@@ -3,18 +3,23 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import os
-import json # Used for error logging/handling
+import json 
 
 app = Flask(__name__)
 
 # --- Configuration ---
-# Use .NS suffix for NSE tickers (e.g., INFY.NS)
+# Use .NS suffix for NSE tickers
 STOCK_TICKERS = [
     'INFY.NS',
     'TCS.NS',
     'RELIANCE.NS',
     'HDFCBANK.NS'
 ]
+
+@app.route('/')
+def home():
+    """A simple route to confirm the API is running."""
+    return "Stock Data API is running!", 200
 
 def fetch_stock_data_raw(ticker_list):
     """
@@ -25,9 +30,10 @@ def fetch_stock_data_raw(ticker_list):
     table_data = []
     
     try:
+        # Request data for 5 days to ensure we get a recent closing price
         data = yf.download(
             tickers=ticker_list,
-            period="2d",
+            period="5d", # <-- UPDATED PERIOD TO "5d"
             interval="1d",
             progress=False,
             group_by='ticker'
@@ -43,7 +49,6 @@ def fetch_stock_data_raw(ticker_list):
             if ticker in data.columns.get_level_values(0):
                 ticker_data = data[ticker]
                 
-                # Check for empty data for the specific ticker
                 if ticker_data.empty or ticker_data.iloc[-1].isnull().all():
                      table_data.append([ticker, 'N/A', 0, 0, 0, 0, 0])
                      continue
@@ -74,7 +79,6 @@ def fetch_stock_data_raw(ticker_list):
                 table_data.append(row)
         
         except Exception as e:
-            # If a specific ticker fails, append an error row
             table_data.append([ticker, f"Processing Error: {str(e)}", 0, 0, 0, 0, 0])
             continue
 
@@ -86,13 +90,11 @@ def get_live_data():
     data = fetch_stock_data_raw(STOCK_TICKERS)
     
     if 'error' in data:
-        # Render needs a JSON response even for errors
         return jsonify(data), 500  
         
     return jsonify(data)
 
 # --- Crucial for Render Deployment ---
-# Use Gunicorn with the PORT environment variable provided by Render
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
