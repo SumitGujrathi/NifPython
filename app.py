@@ -1,107 +1,84 @@
-from flask import Flask, render_template
-import pandas as pd
+from flask import Flask, jsonify
 import yfinance as yf
-import time
-import threading
-from datetime import datetime
+import pandas as pd
+import numpy as np
 
 app = Flask(__name__)
 
-# Global variable to store the fetched data
-GLOBAL_STOCK_DATA = []
-LAST_UPDATE_TIME = "Never"
-
-# Symbols list (from the previous script)
-SYMBOLS_TO_FETCH = [
-    '^NSEI', '^NSEBANK', 'ACC.NS', 'ADANIPORTS.NS', 'SBIN.NS', 
-    'AMBUJACEM.NS', 'WIPRO.NS', 'APOLLOTYRE.NS', 'ASIANPAINT.NS', 
-    'AUROPHARMA.NS', 'AXISBANK.NS', 'BAJFINANCE.NS', 'IOC.NS', 
-    'BANKBARODA.NS', 'BATAINDIA.NS', 'BERGEPAINT.NS', 'BHARATFORG.NS', 
-    'COALINDIA.NS', 'INDUSINDBK.NS', 'DRREDDY.NS', 'INFY.NS', 
-    'JSWSTEEL.NS', 'POWERGRID.NS', 'LICHSGFIN.NS', 'CANBK.NS', 
-    'MGL.NS', 'M&MFIN.NS', 'HDFCBANK.NS', 'MANAPPURAM.NS', 
-    'MARICO.NS', 'SUNTV.NS', 'HINDZINC.NS', 'ICICIBANK.NS', 'ZEEL.NS'
+# --- Your Stock Tickers List ---
+STOCK_TICKERS = [
+    'INFY.NS',
+    'TCS.NS',
+    'RELIANCE.NS',
+    'HDFCBANK.NS'
 ]
 
-def fetch_data_yf(symbol):
-    """Fetches data for a single symbol using yfinance."""
-    failed_data = {
-        'Symbol': symbol.replace('.NS', '').replace('^NSEI', 'NIFTY 50').replace('^NSEBANK', 'NIFTY BANK'),
-        'LTP': 'N/A', 'Open': 'N/A', 'High': 'N/A', 
-        'Low': 'N/A', 'Prev. Close': 'N/A', 'Volume': 'N/A'
-    }
-
+def fetch_stock_data_raw(ticker_list):
+    """
+    Fetches raw stock data using yfinance and returns it as a list of lists 
+    (ready for Apps Script).
+    """
+    table_headers = ["Symbol", "LTP (Close)", "Open", "High", "Low", "P. Close", "Volume"]
+    table_data = []
+    
     try:
-        ticker = yf.Ticker(symbol)
-        info = ticker.info
-        
-        if not info:
-             raise ValueError("No ticker info available")
-
-        data = {
-            'Symbol': symbol.replace('.NS', '').replace('^NSEI', 'NIFTY 50').replace('^NSEBANK', 'NIFTY BANK'),
-            'LTP': info.get('currentPrice', info.get('regularMarketPrice', 'N/A')), 
-            'Open': info.get('open', 'N/A'),
-            'High': info.get('dayHigh', 'N/A'),
-            'Low': info.get('dayLow', 'N/A'),
-            'Prev. Close': info.get('previousClose', 'N/A'), 
-            'Volume': info.get('volume', 'N/A') 
-        }
-        return data
-
+        data = yf.download(
+            tickers=ticker_list,
+            period="2d",
+            interval="1d",
+            progress=False,
+            group_by='ticker'
+        )
     except Exception as e:
-        print(f"⚠️ Error fetching data for {symbol}: {e}")
-        return failed_data
+        return {"error": f"YFinance Download Error: {e}"}
 
-def update_stock_data():
-    """Fetches and updates the global stock data."""
-    global GLOBAL_STOCK_DATA
-    global LAST_UPDATE_TIME
+    if data.empty:
+        return {"error": "YFinance returned empty data."}
+
+    for ticker in ticker_list:
+        try:
+            if ticker in data.columns.get_level_values(0):
+                ticker_data = data[ticker]
+                latest_data = ticker_data.iloc[-1]
+                
+                previous_close = ticker_data['Close'].iloc[-2] if len(ticker_data) >= 2 else None
+
+                # Format volume gracefully
+                volume_value = latest_data['Volume']
+                volume = int(volume_value) if not pd.isna(volume_value) and volume_value != 0 else 0
+
+                # Function to safely handle price values (float or 0)
+                def get_price(value):
+                    return float(value) if not pd.isna(value) else 0.0
+
+                # Append the raw numeric/string data row
+                row = [
+                    ticker,
+                    get_price(latest_data['Close']),
+                    get_price(latest_data['Open']),
+                    get_price(latest_data['High']),
+                    get_price(latest_data['Low']),
+                    get_price(previous_close),
+                    volume
+                ]
+                table_data.append(row)
+        
+        except Exception as e:
+            table_data.append([ticker, f"Error: {e}", 0, 0, 0, 0, 0])
+            continue
+
+    return {"headers": table_headers, "data": table_data}
+
+@app.route('/get-live-data')
+def get_live_data():
+    """API endpoint to fetch and return the stock data as JSON."""
+    data = fetch_stock_data_raw(STOCK_TICKERS)
     
-    new_data = []
-    print(f"\n[Updater] Starting data fetch at {datetime.now().strftime('%H:%M:%S')}")
-    
-    for symbol in SYMBOLS_TO_FETCH:
-        new_data.append(fetch_data_yf(symbol))
-        # Reduce delay for faster updates, but be careful not to trigger rate limits
-        time.sleep(0.2) 
-    
-    GLOBAL_STOCK_DATA = new_data
-    LAST_UPDATE_TIME = datetime.now().strftime("%H:%M:%S IST")
-    print(f"[Updater] Data update complete. Next run in 60 seconds.")
-
-
-def scheduled_update():
-    """Runs the update function periodically."""
-    while True:
-        update_stock_data()
-        # Wait for 60 seconds (1 minute) before the next run
-        time.sleep(60) 
-
-# Start the background thread for continuous updates
-update_thread = threading.Thread(target=scheduled_update)
-update_thread.daemon = True # Allows the main program to exit even if this thread is running
-update_thread.start()
-
-# --- Flask Routes ---
-
-@app.route('/')
-def index():
-    """Render the main index page with the stock data."""
-    # Convert list of dicts to DataFrame for easy HTML table generation
-    df = pd.DataFrame(GLOBAL_STOCK_DATA)
-    # Ensure all numbers are formatted nicely for the web table
-    df = df.round(2) 
-    
-    # Render the HTML template, passing the table and update time
-    return render_template(
-        'index.html', 
-        table_html=df.to_html(classes='table table-striped', index=False, float_format='{:,.2f}'.format),
-        last_update=LAST_UPDATE_TIME
-    )
+    if 'error' in data:
+        return jsonify(data), 500  # Return error with HTTP 500 status
+        
+    return jsonify(data)
 
 if __name__ == '__main__':
-    # Initial fetch to populate data before the web server starts
-    update_stock_data()
-    # Run the Flask app on port 5000
-    app.run(debug=True, use_reloader=False)
+    # When running locally
+    app.run(debug=True)
