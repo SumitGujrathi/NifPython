@@ -2,6 +2,7 @@ services:
 - type: web
   name: stock-data-api
   env: python
+  pythonVersion: 3.11 # Add this line to specify a newer version
   buildCommand: pip install -r requirements.txt
   startCommand: gunicorn app:app
   plan: free
