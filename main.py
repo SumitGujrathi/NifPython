@@ -3,12 +3,13 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import os
-import json 
+import requests # <-- NEW IMPORT
+from requests.adapters import HTTPAdapter # <-- NEW IMPORT
+from urllib3.util.retry import Retry # <-- NEW IMPORT
 
 app = Flask(__name__)
 
 # --- Configuration ---
-# Use .NS suffix for NSE tickers
 STOCK_TICKERS = [
     'INFY.NS',
     'TCS.NS',
@@ -16,27 +17,41 @@ STOCK_TICKERS = [
     'HDFCBANK.NS'
 ]
 
+# Configure requests session with retries for connection stability
+def get_retry_session():
+    session = requests.Session()
+    retry = Retry(
+        total=5, # 5 retries
+        read=5,
+        connect=5,
+        backoff_factor=0.5,
+        status_forcelist=[500, 502, 503, 504]
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
+
 @app.route('/')
 def home():
-    """A simple route to confirm the API is running."""
     return "Stock Data API is running!", 200
 
 def fetch_stock_data_raw(ticker_list):
-    """
-    Fetches raw stock data using yfinance and returns it as a dictionary 
-    with headers and data rows, ready for Apps Script.
-    """
     table_headers = ["Symbol", "LTP (Close)", "Open", "High", "Low", "P. Close", "Volume"]
     table_data = []
     
+    # 1. Get the robust session
+    session = get_retry_session()
+
     try:
-        # Request data for 5 days to ensure we get a recent closing price
+        # Pass the session to yfinance
         data = yf.download(
             tickers=ticker_list,
-            period="5d", # <-- UPDATED PERIOD TO "5d"
+            period="5d",
             interval="1d",
             progress=False,
-            group_by='ticker'
+            group_by='ticker',
+            session=session # <-- CRUCIAL CHANGE: USE THE RETRY SESSION
         )
     except Exception as e:
         return {"error": f"YFinance Download Error: {e}"}
@@ -44,6 +59,7 @@ def fetch_stock_data_raw(ticker_list):
     if data.empty:
         return {"error": "YFinance returned empty data."}
 
+    # ... (Rest of your data processing logic remains the same) ...
     for ticker in ticker_list:
         try:
             if ticker in data.columns.get_level_values(0):
@@ -54,19 +70,14 @@ def fetch_stock_data_raw(ticker_list):
                      continue
                 
                 latest_data = ticker_data.iloc[-1]
-                
-                # Get Previous Close (The 'Close' from the second-to-last row)
                 previous_close = ticker_data['Close'].iloc[-2] if len(ticker_data) >= 2 else None
 
-                # Safely get and format volume
                 volume_value = latest_data['Volume']
                 volume = int(volume_value) if not pd.isna(volume_value) and volume_value != 0 else 0
 
-                # Function to safely handle price values (float or 0)
                 def get_price(value):
                     return float(value) if not pd.isna(value) else 0.0
 
-                # Append the raw numeric/string data row
                 row = [
                     ticker,
                     get_price(latest_data['Close']),
@@ -86,15 +97,11 @@ def fetch_stock_data_raw(ticker_list):
 
 @app.route('/get-live-data')
 def get_live_data():
-    """API endpoint to fetch and return the stock data as JSON."""
     data = fetch_stock_data_raw(STOCK_TICKERS)
-    
     if 'error' in data:
         return jsonify(data), 500  
-        
     return jsonify(data)
 
-# --- Crucial for Render Deployment ---
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
