@@ -3,4 +3,5 @@ gunicorn
 yfinance==0.2.1
 pandas
 numpy
-typing-extensions
+typing-extensions 
+requests 
