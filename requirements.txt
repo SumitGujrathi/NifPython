@@ -1,6 +1,8 @@
 Flask
 gunicorn
-yfinance==0.2.1
+requests # <--- PRIMARY DATA FETCHING LIBRARY
+# yfinance is not used for data fetching anymore, you can remove it:
+# yfinance==0.2.1 
 pandas
 numpy
 typing-extensions
