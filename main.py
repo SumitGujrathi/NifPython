@@ -3,9 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import os
-import requests # <-- NEW IMPORT
-from requests.adapters import HTTPAdapter # <-- NEW IMPORT
-from urllib3.util.retry import Retry # <-- NEW IMPORT
+# REMOVED: import requests, HTTPAdapter, Retry
 
 app = Flask(__name__)
 
@@ -17,20 +15,7 @@ STOCK_TICKERS = [
     'HDFCBANK.NS'
 ]
 
-# Configure requests session with retries for connection stability
-def get_retry_session():
-    session = requests.Session()
-    retry = Retry(
-        total=5, # 5 retries
-        read=5,
-        connect=5,
-        backoff_factor=0.5,
-        status_forcelist=[500, 502, 503, 504]
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    return session
+# REMOVED: get_retry_session function
 
 @app.route('/')
 def home():
@@ -40,18 +25,17 @@ def fetch_stock_data_raw(ticker_list):
     table_headers = ["Symbol", "LTP (Close)", "Open", "High", "Low", "P. Close", "Volume"]
     table_data = []
     
-    # 1. Get the robust session
-    session = get_retry_session()
+    # REMOVED: session = get_retry_session()
 
     try:
-        # Pass the session to yfinance
+        # NOTE: session=session argument IS REMOVED here
         data = yf.download(
             tickers=ticker_list,
             period="5d",
             interval="1d",
             progress=False,
             group_by='ticker',
-            session=session # <-- CRUCIAL CHANGE: USE THE RETRY SESSION
+            # REMOVED: session=session 
         )
     except Exception as e:
         return {"error": f"YFinance Download Error: {e}"}
