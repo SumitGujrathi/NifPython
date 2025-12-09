@@ -3,8 +3,5 @@ services:
   name: stock-dashboard
   env: python
   buildCommand: pip install -r requirements.txt
-  # The Streamlit Start Command
   startCommand: streamlit run main.py
-  # Setting the Streamlit port via environment variable is not needed,
-  # but this command is essential.
   plan: free
