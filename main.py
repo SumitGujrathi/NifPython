@@ -2,10 +2,13 @@ from flask import Flask, jsonify
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import os
+import json # Used for error logging/handling
 
 app = Flask(__name__)
 
-# --- Your Stock Tickers List ---
+# --- Configuration ---
+# Use .NS suffix for NSE tickers (e.g., INFY.NS)
 STOCK_TICKERS = [
     'INFY.NS',
     'TCS.NS',
@@ -15,8 +18,8 @@ STOCK_TICKERS = [
 
 def fetch_stock_data_raw(ticker_list):
     """
-    Fetches raw stock data using yfinance and returns it as a list of lists 
-    (ready for Apps Script).
+    Fetches raw stock data using yfinance and returns it as a dictionary 
+    with headers and data rows, ready for Apps Script.
     """
     table_headers = ["Symbol", "LTP (Close)", "Open", "High", "Low", "P. Close", "Volume"]
     table_data = []
@@ -39,11 +42,18 @@ def fetch_stock_data_raw(ticker_list):
         try:
             if ticker in data.columns.get_level_values(0):
                 ticker_data = data[ticker]
+                
+                # Check for empty data for the specific ticker
+                if ticker_data.empty or ticker_data.iloc[-1].isnull().all():
+                     table_data.append([ticker, 'N/A', 0, 0, 0, 0, 0])
+                     continue
+                
                 latest_data = ticker_data.iloc[-1]
                 
+                # Get Previous Close (The 'Close' from the second-to-last row)
                 previous_close = ticker_data['Close'].iloc[-2] if len(ticker_data) >= 2 else None
 
-                # Format volume gracefully
+                # Safely get and format volume
                 volume_value = latest_data['Volume']
                 volume = int(volume_value) if not pd.isna(volume_value) and volume_value != 0 else 0
 
@@ -64,7 +74,8 @@ def fetch_stock_data_raw(ticker_list):
                 table_data.append(row)
         
         except Exception as e:
-            table_data.append([ticker, f"Error: {e}", 0, 0, 0, 0, 0])
+            # If a specific ticker fails, append an error row
+            table_data.append([ticker, f"Processing Error: {str(e)}", 0, 0, 0, 0, 0])
             continue
 
     return {"headers": table_headers, "data": table_data}
@@ -75,10 +86,13 @@ def get_live_data():
     data = fetch_stock_data_raw(STOCK_TICKERS)
     
     if 'error' in data:
-        return jsonify(data), 500  # Return error with HTTP 500 status
+        # Render needs a JSON response even for errors
+        return jsonify(data), 500  
         
     return jsonify(data)
 
+# --- Crucial for Render Deployment ---
+# Use Gunicorn with the PORT environment variable provided by Render
 if __name__ == '__main__':
-    # When running locally
-    app.run(debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
