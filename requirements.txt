@@ -1,8 +1,6 @@
-Flask
-gunicorn
-requests # <--- PRIMARY DATA FETCHING LIBRARY
-# yfinance is not used for data fetching anymore, you can remove it:
-# yfinance==0.2.1 
+streamlit
+streamlit-autorefresh
+yfinance
 pandas
+# Include other necessary scientific packages for yfinance/pandas stability
 numpy
-typing-extensions
