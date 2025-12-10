@@ -2,5 +2,3 @@ streamlit
 streamlit-autorefresh
 yfinance
 pandas
-# Include other necessary scientific packages for yfinance/pandas stability
-numpy
