@@ -1,1 +1,1 @@
-web: streamlit run stock_dashboard.py --server.port $PORT --server.enableCORS false
+web: streamlit run main.py --server.port $PORT --server.enableCORS false
