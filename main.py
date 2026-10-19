@@ -1,5 +1,3 @@
-# app.py
-
 import yfinance as yf
 import pandas as pd
 from datetime import datetime
@@ -64,103 +62,125 @@ def get_all_stocks_data_cached():
     """Checks cache and fetches new data if cache is expired."""
     global CACHE
     
-    # Check if cache is fresh
     if CACHE['data'] is not None and \
        (datetime.now() - CACHE['timestamp']).total_seconds() < CACHE_TTL_SECONDS:
         return CACHE['data'].copy(), CACHE['timestamp'] 
 
-    # Fetch new data
     df = _fetch_stocks_data_yfinance()
     current_time = datetime.now()
     
-    # Update cache
-    CACHE['data'] = df
-    CACHE['timestamp'] = current_time
+    if df is not None and not df.empty:
+        CACHE['data'] = df
+        CACHE['timestamp'] = current_time
+    elif CACHE['data'] is not None:
+        return CACHE['data'].copy(), CACHE['timestamp']
     
-    return df.copy(), current_time
+    return (df.copy() if df is not None else pd.DataFrame()), current_time
 
 
 def _fetch_stocks_data_yfinance():
-    """Core function to fetch stock data using yfinance."""
-    
+    """
+    Core function using yf.download batch requests.
+    Hits Yahoo Chart API, bypassing IP blocks on Render/cloud servers.
+    """
     all_data = []
     yahoo_symbols = [get_yahoo_symbol(stock) for stock in STOCK_LIST]
-    symbols_str = " ".join(yahoo_symbols)
-    DEFAULT_VALUE = None 
-
+    
     try:
-        # Attempt 1: Batch fetch using yf.Tickers
-        tickers = yf.Tickers(symbols_str)
-
-        for stock_name in STOCK_LIST:
-            yahoo_symbol = get_yahoo_symbol(stock_name)
-            try:
-                ticker = tickers.tickers.get(yahoo_symbol)
-                info = ticker.info if ticker else {}
-
-                # Fallback logic for price and volume data
-                current_price = info.get('currentPrice') or info.get('regularMarketPrice', DEFAULT_VALUE)
-                open_price = info.get('open') or info.get('regularMarketOpen', DEFAULT_VALUE)
-                high_price = info.get('dayHigh') or info.get('regularMarketDayHigh', DEFAULT_VALUE)
-                low_price = info.get('dayLow') or info.get('regularMarketDayLow', DEFAULT_VALUE)
-                prev_close = info.get('previousClose') or info.get('regularMarketPreviousClose', DEFAULT_VALUE)
-                volume = info.get('volume') or info.get('regularMarketVolume', DEFAULT_VALUE)
-
-                all_data.append({
-                    "Symbol": stock_name,
-                    "Current Price / LTP": current_price,
-                    "Open": open_price,
-                    "High": high_price,
-                    "Low": low_price,
-                    "Previous Close": prev_close,
-                    "Volume": volume
-                })
-            except Exception:
-                # Error fetching single ticker info
-                all_data.append({
-                    "Symbol": stock_name,
-                    "Current Price / LTP": DEFAULT_VALUE, "Open": DEFAULT_VALUE, 
-                    "High": DEFAULT_VALUE, "Low": DEFAULT_VALUE, 
-                    "Previous Close": DEFAULT_VALUE, "Volume": DEFAULT_VALUE
-                })
+        # Batch download historical price data (5d handles weekends/holidays)
+        df_batch = yf.download(
+            tickers=yahoo_symbols,
+            period="5d",
+            interval="1d",
+            group_by="ticker",
+            threads=True,
+            progress=False
+        )
     except Exception:
-        # If batch fetch fails entirely, return whatever data was collected (if any)
-        pass
+        df_batch = pd.DataFrame()
 
+    for stock_name in STOCK_LIST:
+        yahoo_symbol = get_yahoo_symbol(stock_name)
+        
+        current_price = None
+        open_price = None
+        high_price = None
+        low_price = None
+        prev_close = None
+        volume = None
+        
+        try:
+            ticker_df = pd.DataFrame()
+            if not df_batch.empty:
+                if isinstance(df_batch.columns, pd.MultiIndex):
+                    if yahoo_symbol in df_batch.columns.get_level_values(0):
+                        ticker_df = df_batch[yahoo_symbol].dropna(subset=['Close'])
+                    elif yahoo_symbol in df_batch.columns.get_level_values(1):
+                        ticker_df = df_batch.xs(yahoo_symbol, level=1, axis=1).dropna(subset=['Close'])
+                else:
+                    ticker_df = df_batch.dropna(subset=['Close'])
 
-    # Return DataFrame
+            # Fallback to single history query if missing from batch
+            if ticker_df.empty:
+                ticker_df = yf.Ticker(yahoo_symbol).history(period="5d").dropna(subset=['Close'])
+
+            if not ticker_df.empty:
+                latest = ticker_df.iloc[-1]
+                current_price = float(latest['Close'])
+                open_price = float(latest['Open'])
+                high_price = float(latest['High'])
+                low_price = float(latest['Low'])
+                volume = float(latest['Volume']) if 'Volume' in latest and pd.notna(latest['Volume']) else None
+                
+                if len(ticker_df) >= 2:
+                    prev_close = float(ticker_df.iloc[-2]['Close'])
+                else:
+                    prev_close = open_price
+
+        except Exception:
+            pass
+
+        all_data.append({
+            "Symbol": stock_name,
+            "Current Price / LTP": current_price,
+            "Open": open_price,
+            "High": high_price,
+            "Low": low_price,
+            "Previous Close": prev_close,
+            "Volume": volume
+        })
+
     return pd.DataFrame(all_data)
 
 
 def format_dataframe_to_html_table(df):
-    """
-    Formats the raw DataFrame into an HTML string for display.
-    """
+    """Formats the raw DataFrame into an HTML string for display."""
+    if df.empty:
+        return '<tr><td colspan="7" style="text-align: center; color: red;">No stock data available to display.</td></tr>', []
+
     formatted_df = df.copy()
 
-    # 1. Filter out rows where all numeric data is missing 
+    # Filter out rows where all numeric data is missing 
     numeric_cols = formatted_df.columns.drop('Symbol')
     formatted_df = formatted_df.dropna(subset=numeric_cols, how='all').reset_index(drop=True)
 
     if formatted_df.empty:
         return '<tr><td colspan="7" style="text-align: center; color: red;">No stock data available to display.</td></tr>', []
 
-    # 2. Format Price Columns
-    for col in [
-            "Current Price / LTP", "Open", "High", "Low", "Previous Close"
-    ]:
+    # Format Price Columns
+    for col in ["Current Price / LTP", "Open", "High", "Low", "Previous Close"]:
         numeric_col = pd.to_numeric(formatted_df[col], errors='coerce')
         formatted_df[col] = numeric_col.apply(
-            lambda x: "N/A" if pd.isna(x) or x == 0 else f"₹{x:,.2f}")
+            lambda x: "N/A" if pd.isna(x) or x == 0 else f"₹{x:,.2f}"
+        )
 
-    # 3. Format Volume Column
+    # Format Volume Column
     numeric_volume = pd.to_numeric(formatted_df["Volume"], errors='coerce')
     formatted_df["Volume"] = numeric_volume.apply(
-        lambda x: "N/A" if pd.isna(x) or x == 0 else f"{x:,.0f}")
+        lambda x: "N/A" if pd.isna(x) or x == 0 else f"{x:,.0f}"
+    )
     
-    # 4. Generate HTML Table Headers and Rows
     headers = formatted_df.columns.tolist()
-    
     header_html = "<tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr>"
     
     rows_html = ""
@@ -179,8 +199,11 @@ app = Flask(__name__)
 @app.route("/download_csv")
 def download_csv():
     """Route to download the raw stock data as a CSV file."""
-    
     df, _ = get_all_stocks_data_cached()
+    
+    if df.empty:
+        return "Error: No data available for download.", 404
+
     numeric_cols = df.columns.drop('Symbol')
     df_clean = df.dropna(subset=numeric_cols, how='all')
 
@@ -192,23 +215,16 @@ def download_csv():
     return Response(
         csv_data,
         mimetype="text/csv",
-        headers={"Content-disposition":
-                 "attachment; filename=stock_data_live.csv"}
+        headers={"Content-disposition": "attachment; filename=stock_data_live.csv"}
     )
 
 @app.route("/")
 def dashboard():
-    """The main route that generates the entire HTML page."""
-    
-    # Get cached data and timestamp
+    """Main route to render the dashboard."""
     df_data, last_updated_dt = get_all_stocks_data_cached()
-    
-    # Generate the HTML table content and get headers
     table_content_html, _ = format_dataframe_to_html_table(df_data)
-
     last_updated_str = last_updated_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    # --- Full HTML String Generation ---
     html_content = f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -216,7 +232,7 @@ def dashboard():
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="refresh" content="{CACHE_TTL_SECONDS}">
-    <title>📈 Stock Financial Dashboard (Single File Flask)</title>
+    <title>📈 Stock Financial Dashboard</title>
     <style>
         body {{
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -334,18 +350,8 @@ def dashboard():
 </body>
 </html>
 """
-    # Return the generated HTML string
     return html_content
 
 
-# app.py (Modified end section)
-
-# ... [All your stock data functions and Flask routes] ...
-
 if __name__ == "__main__":
-    # --- IMPORTANT ---
-    # Render will not use this block; it will use the command in your
-    # web service settings (gunicorn app:app).
-    # This block is only for local testing.
-    # Set debug=False for local testing stability.
     app.run(debug=False, host='0.0.0.0', port=5000)
