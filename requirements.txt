@@ -1,6 +1,5 @@
 flask
 pandas
-yfinance
 apscheduler
 curl_cffi
 gunicorn
