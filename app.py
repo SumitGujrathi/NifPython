@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+import random
 import threading
 from datetime import datetime
 import pandas as pd
@@ -61,6 +62,13 @@ SYMBOL_MAPPING = {
     "ZEEL": "ZEEL.NS"
 }
 
+# --- PROXY CONFIGURATION ---
+# Add your HTTP/HTTPS proxy URLs here if you use Webshare, Smartproxy, or ScraperAPI.
+# Example format: "http://username:password@proxy.example.com:8080"
+PROXY_POOL = [
+    # os.environ.get("ROTATING_PROXY_URL") # Can also be passed via Render Environment Variables
+]
+
 # Thread-safe Cache
 DATA_CACHE = {
     "data": pd.DataFrame(),
@@ -72,21 +80,43 @@ CACHE_LOCK = threading.Lock()
 def get_yahoo_symbol(stock_name):
     return SYMBOL_MAPPING.get(stock_name, f"{stock_name}.NS")
 
-# --- NON-STOP RETRY FETCH FUNCTION ---
-def fetch_stock_data_with_infinite_retry():
+def set_environment_proxy(proxy_url=None):
+    """Sets or clears proxy environment variables for yfinance/curl_cffi."""
+    if proxy_url:
+        os.environ["HTTP_PROXY"] = proxy_url
+        os.environ["HTTPS_PROXY"] = proxy_url
+        os.environ["http_proxy"] = proxy_url
+        os.environ["https_proxy"] = proxy_url
+    else:
+        os.environ.pop("HTTP_PROXY", None)
+        os.environ.pop("HTTPS_PROXY", None)
+        os.environ.pop("http_proxy", None)
+        os.environ.pop("https_proxy", None)
+
+# --- RESILIENT FETCH LOGIC WITH PROXY ROTATION ---
+def fetch_stock_data_with_proxy_rotation():
     """
-    Tries fetching stock data until successful using yfinance's built-in session.
+    Attempts to download batch stock data.
+    Rotates proxies on failure or rate-limiting without interrupting Flask execution.
     """
     yahoo_symbols = [get_yahoo_symbol(s) for s in STOCK_LIST]
-    
-    max_attempts = 3
-    delay = 2
+    max_attempts = 4
+    delay = 3
     df_batch = pd.DataFrame()
 
     for attempt in range(1, max_attempts + 1):
+        selected_proxy = None
+        
+        # Determine if we should use a proxy for this attempt
+        if PROXY_POOL:
+            selected_proxy = random.choice(PROXY_POOL)
+            set_environment_proxy(selected_proxy)
+            logging.info(f"Attempt {attempt}/{max_attempts}: Fetching via proxy...")
+        else:
+            set_environment_proxy(None)
+            logging.info(f"Attempt {attempt}/{max_attempts}: Fetching via direct connection...")
+
         try:
-            logging.info(f"Downloading batch stock data (Attempt {attempt}/{max_attempts})...")
-            # Removed custom session argument to let yfinance manage requests
             df_batch = yf.download(
                 tickers=yahoo_symbols,
                 period="5d",
@@ -96,20 +126,27 @@ def fetch_stock_data_with_infinite_retry():
                 progress=False,
                 timeout=15
             )
-            if not df_batch.empty:
+            
+            # Check if valid data was received
+            if not df_batch.empty and len(df_batch.columns) > 0:
+                logging.info("Batch download succeeded!")
                 break
+            else:
+                logging.warning(f"Attempt {attempt} returned empty data (Possible IP rate limit).")
+
         except Exception as e:
-            logging.warning(f"Batch fetch attempt {attempt} failed: {e}")
-            time.sleep(delay)
+            logging.warning(f"Attempt {attempt} encountered error: {e}")
+
+        time.sleep(delay)
 
     all_data = []
 
+    # Parse and construct tabular dataset
     for stock_name in STOCK_LIST:
         yahoo_symbol = get_yahoo_symbol(stock_name)
         current_price = open_price = high_price = low_price = prev_close = volume = None
         ticker_df = pd.DataFrame()
 
-        # Parse batch output safely
         try:
             if not df_batch.empty:
                 if isinstance(df_batch.columns, pd.MultiIndex):
@@ -122,14 +159,14 @@ def fetch_stock_data_with_infinite_retry():
         except Exception:
             pass
 
-        # Individual Ticker Fallback
+        # Individual Symbol Fallback
         if ticker_df.empty:
             try:
                 ticker_df = yf.Ticker(yahoo_symbol).history(period="5d").dropna(subset=['Close'])
             except Exception:
                 pass
 
-        # Parse Row Values
+        # Parse final indicators
         try:
             if not ticker_df.empty:
                 latest = ticker_df.iloc[-1]
@@ -140,7 +177,7 @@ def fetch_stock_data_with_infinite_retry():
                 volume = float(latest['Volume']) if 'Volume' in latest and pd.notna(latest['Volume']) else None
                 prev_close = float(ticker_df.iloc[-2]['Close']) if len(ticker_df) >= 2 else open_price
         except Exception as e:
-            logging.error(f"Error parsing row for {stock_name}: {e}")
+            logging.error(f"Error parsing ticker {stock_name}: {e}")
 
         all_data.append({
             "Symbol": stock_name,
@@ -155,29 +192,29 @@ def fetch_stock_data_with_infinite_retry():
     return pd.DataFrame(all_data)
 
 def background_update_job():
-    """Background task triggered by scheduler."""
-    logging.info("Executing background update...")
-    df_new = fetch_stock_data_with_infinite_retry()
+    """Background task managed by APScheduler."""
+    logging.info("Starting scheduled background refresh...")
+    df_new = fetch_stock_data_with_proxy_rotation()
 
     with CACHE_LOCK:
         if not df_new.empty and df_new['Current Price / LTP'].notna().any():
             DATA_CACHE["data"] = df_new
             DATA_CACHE["timestamp"] = datetime.now()
             DATA_CACHE["status"] = "Active"
-            logging.info("Stock cache refreshed successfully.")
+            logging.info("Stock cache successfully updated.")
         else:
             DATA_CACHE["status"] = "Retrying in background..."
-            logging.warning("Data fetch returned empty results; keeping existing cache.")
+            logging.warning("Fetch returned empty values. Retaining existing cache.")
 
-# --- SCHEDULER SETUP ---
+# --- BACKGROUND SCHEDULER INITIALIZATION ---
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(background_update_job, 'interval', seconds=60)
 scheduler.start()
 
-# Initial fetch in background thread so app boots instantly
+# Launch initial background fetch on boot without blocking Flask launch
 threading.Thread(target=background_update_job, daemon=True).start()
 
-# --- FLASK SETUP ---
+# --- FLASK APP ---
 app = Flask(__name__)
 
 def format_dataframe_to_html_table(df):
