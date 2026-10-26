@@ -1,4 +1,4 @@
-Flask
+flask
 pandas
-yfinance>=0.2.30
+yfinance
 gunicorn
