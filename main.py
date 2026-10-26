@@ -1,34 +1,11 @@
 import os
-import json
 import time
 import requests
 import io
 import csv
-from flask import Flask, render_template_string, Response
-import gspread
-from google.oauth2.service_account import Credentials
+from flask import Flask, render_template_string, request, Response
 
 app = Flask(__name__)
-
-# --- CONFIGURATION ---
-SHEET_NAME = os.getenv("SPREADSHEET_NAME", "LIVE_DATA")
-RAW_CREDS = os.getenv("GOOGLE_CREDENTIALS")
-
-# Initialize Google Sheets Client safely
-gc = None
-if RAW_CREDS:
-    try:
-        SERVICE_ACCOUNT_INFO = json.loads(RAW_CREDS)
-        SCOPES = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ]
-        credentials = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPES)
-        gc = gspread.authorize(credentials)
-    except Exception as e:
-        print(f"Error parsing GOOGLE_CREDENTIALS: {e}")
-else:
-    print("WARNING: GOOGLE_CREDENTIALS environment variable is missing or empty.")
 
 def fetch_nse_option_chain(symbol):
     base_url = "https://www.nseindia.com"
@@ -83,26 +60,6 @@ def get_processed_data(symbol):
                 "pe_vol": pe.get("totalTradedVolume", 0),
                 "pe_oi": pe.get("openInterest", 0)
             })
-
-    # Optional: Push to Google Sheets if credentials exist
-    if gc:
-        try:
-            spreadsheet = gc.open(SHEET_NAME)
-            sheet_tab = f"{symbol}_OC"
-            try:
-                worksheet = spreadsheet.worksheet(sheet_tab)
-            except gspread.exceptions.WorksheetNotFound:
-                worksheet = spreadsheet.add_worksheet(title=sheet_tab, rows="100", cols="10")
-
-            sheet_rows = [
-                [f"Symbol: {symbol}", f"Underlying LTP: {underlying_val}", f"Expiry: {current_expiry}", f"Updated: {updated_time}"],
-                ["CALLS OI", "CALLS Vol", "CALLS IV", "CALLS LTP", "STRIKE", "PUTS LTP", "PUTS IV", "PUTS Vol", "PUTS OI"]
-            ] + [[r["ce_oi"], r["ce_vol"], r["ce_iv"], r["ce_ltp"], r["strike"], r["pe_ltp"], r["pe_iv"], r["pe_vol"], r["pe_oi"]] for r in rows]
-
-            worksheet.clear()
-            worksheet.update('A1', sheet_rows)
-        except Exception as e:
-            print(f"GSpread error: {e}")
 
     return rows, underlying_val, current_expiry, updated_time
 
@@ -180,7 +137,6 @@ def index():
 
 @app.route("/download")
 def download_csv():
-    from flask import request
     symbol = request.args.get("symbol", "NIFTY").upper()
     rows, ltp, expiry, updated = get_processed_data(symbol)
 
