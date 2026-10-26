@@ -1,5 +1,3 @@
 flask
 requests
-gspread
-google-auth
 gunicorn
