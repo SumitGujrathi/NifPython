@@ -1,7 +1,8 @@
-import yfinance as yf
-import pandas as pd
+import os
 from datetime import datetime
+import pandas as pd
 from flask import Flask, Response
+import yfinance as yf
 
 # --- CONFIGURATION (Stock Lists) ---
 STOCK_LIST = [
@@ -56,45 +57,42 @@ def get_yahoo_symbol(stock_name):
 
 # --- FLASK CACHING IMPLEMENTATION ---
 CACHE = {'data': None, 'timestamp': datetime.min}
-CACHE_TTL_SECONDS = 60 # Time To Live (1 minute)
+CACHE_TTL_SECONDS = 120  # Increased TTL to reduce rate limiting on Render
 
 def get_all_stocks_data_cached():
     """Checks cache and fetches new data if cache is expired."""
     global CACHE
+    now = datetime.now()
     
-    if CACHE['data'] is not None and \
-       (datetime.now() - CACHE['timestamp']).total_seconds() < CACHE_TTL_SECONDS:
+    if CACHE['data'] is not None and (now - CACHE['timestamp']).total_seconds() < CACHE_TTL_SECONDS:
         return CACHE['data'].copy(), CACHE['timestamp'] 
 
     df = _fetch_stocks_data_yfinance()
-    current_time = datetime.now()
     
     if df is not None and not df.empty:
         CACHE['data'] = df
-        CACHE['timestamp'] = current_time
+        CACHE['timestamp'] = now
     elif CACHE['data'] is not None:
         return CACHE['data'].copy(), CACHE['timestamp']
     
-    return (df.copy() if df is not None else pd.DataFrame()), current_time
+    return (df.copy() if df is not None else pd.DataFrame()), now
 
 
 def _fetch_stocks_data_yfinance():
-    """
-    Core function using yf.download batch requests.
-    Hits Yahoo Chart API, bypassing IP blocks on Render/cloud servers.
-    """
+    """Batch requests stock data without slow fallback loops."""
     all_data = []
     yahoo_symbols = [get_yahoo_symbol(stock) for stock in STOCK_LIST]
     
     try:
-        # Batch download historical price data (5d handles weekends/holidays)
+        # Fast batch download
         df_batch = yf.download(
             tickers=yahoo_symbols,
             period="5d",
             interval="1d",
             group_by="ticker",
             threads=True,
-            progress=False
+            progress=False,
+            timeout=10  # Enforce timeout to prevent 502 Gateway Timeout on Render
         )
     except Exception:
         df_batch = pd.DataFrame()
@@ -102,12 +100,7 @@ def _fetch_stocks_data_yfinance():
     for stock_name in STOCK_LIST:
         yahoo_symbol = get_yahoo_symbol(stock_name)
         
-        current_price = None
-        open_price = None
-        high_price = None
-        low_price = None
-        prev_close = None
-        volume = None
+        current_price = open_price = high_price = low_price = prev_close = volume = None
         
         try:
             ticker_df = pd.DataFrame()
@@ -120,10 +113,6 @@ def _fetch_stocks_data_yfinance():
                 else:
                     ticker_df = df_batch.dropna(subset=['Close'])
 
-            # Fallback to single history query if missing from batch
-            if ticker_df.empty:
-                ticker_df = yf.Ticker(yahoo_symbol).history(period="5d").dropna(subset=['Close'])
-
             if not ticker_df.empty:
                 latest = ticker_df.iloc[-1]
                 current_price = float(latest['Close'])
@@ -132,10 +121,7 @@ def _fetch_stocks_data_yfinance():
                 low_price = float(latest['Low'])
                 volume = float(latest['Volume']) if 'Volume' in latest and pd.notna(latest['Volume']) else None
                 
-                if len(ticker_df) >= 2:
-                    prev_close = float(ticker_df.iloc[-2]['Close'])
-                else:
-                    prev_close = open_price
+                prev_close = float(ticker_df.iloc[-2]['Close']) if len(ticker_df) >= 2 else open_price
 
         except Exception:
             pass
@@ -154,27 +140,22 @@ def _fetch_stocks_data_yfinance():
 
 
 def format_dataframe_to_html_table(df):
-    """Formats the raw DataFrame into an HTML string for display."""
     if df.empty:
         return '<tr><td colspan="7" style="text-align: center; color: red;">No stock data available to display.</td></tr>', []
 
     formatted_df = df.copy()
-
-    # Filter out rows where all numeric data is missing 
     numeric_cols = formatted_df.columns.drop('Symbol')
     formatted_df = formatted_df.dropna(subset=numeric_cols, how='all').reset_index(drop=True)
 
     if formatted_df.empty:
         return '<tr><td colspan="7" style="text-align: center; color: red;">No stock data available to display.</td></tr>', []
 
-    # Format Price Columns
     for col in ["Current Price / LTP", "Open", "High", "Low", "Previous Close"]:
         numeric_col = pd.to_numeric(formatted_df[col], errors='coerce')
         formatted_df[col] = numeric_col.apply(
             lambda x: "N/A" if pd.isna(x) or x == 0 else f"₹{x:,.2f}"
         )
 
-    # Format Volume Column
     numeric_volume = pd.to_numeric(formatted_df["Volume"], errors='coerce')
     formatted_df["Volume"] = numeric_volume.apply(
         lambda x: "N/A" if pd.isna(x) or x == 0 else f"{x:,.0f}"
@@ -189,18 +170,14 @@ def format_dataframe_to_html_table(df):
         rows_html += f"<tr>{row_cells}</tr>"
         
     table_html = f"<thead>{header_html}</thead><tbody>{rows_html}</tbody>"
-
     return table_html, headers
 
 
-# --- FLASK SETUP ---
 app = Flask(__name__)
 
 @app.route("/download_csv")
 def download_csv():
-    """Route to download the raw stock data as a CSV file."""
     df, _ = get_all_stocks_data_cached()
-    
     if df.empty:
         return "Error: No data available for download.", 404
 
@@ -211,7 +188,6 @@ def download_csv():
         return "Error: No data available for download.", 404
 
     csv_data = df_clean.to_csv(index=False)
-    
     return Response(
         csv_data,
         mimetype="text/csv",
@@ -220,7 +196,6 @@ def download_csv():
 
 @app.route("/")
 def dashboard():
-    """Main route to render the dashboard."""
     df_data, last_updated_dt = get_all_stocks_data_cached()
     table_content_html, _ = format_dataframe_to_html_table(df_data)
     last_updated_str = last_updated_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -234,117 +209,40 @@ def dashboard():
     <meta http-equiv="refresh" content="{CACHE_TTL_SECONDS}">
     <title>📈 Stock Financial Dashboard</title>
     <style>
-        body {{
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            margin: 0;
-            padding: 20px;
-            background-color: #f0f2f6; 
-            color: #333;
-        }}
-        .container {{
-            max-width: 1400px;
-            margin: auto;
-            background-color: white;
-            padding: 30px;
-            border-radius: 12px;
-            box-shadow: 0 6px 15px rgba(0, 0, 0, 0.1);
-        }}
-        h1 {{
-            color: #1e88e5;
-            border-bottom: 3px solid #eee;
-            padding-bottom: 10px;
-            text-align: center;
-        }}
-        .header-row {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 20px;
-        }}
-        .info-box {{
-            background-color: #e3f2fd;
-            color: #0d47a1;
-            padding: 10px 15px;
-            border-radius: 6px;
-            font-size: 0.9em;
-            font-weight: bold;
-        }}
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 10px;
-            overflow: hidden; 
-            border-radius: 8px;
-        }}
-        th, td {{
-            border: 1px solid #e0e0e0;
-            padding: 10px 15px;
-            text-align: right;
-        }}
-        th {{
-            background-color: #42a5f5;
-            color: white;
-            font-weight: normal;
-            font-size: 1em;
-            position: sticky;
-            top: 0;
-        }}
-        th:first-child, td:first-child {{
-            text-align: left;
-        }}
-        tr:nth-child(even) {{
-            background-color: #f5f5f5;
-        }}
-        tr:hover {{
-            background-color: #e0f2f1;
-        }}
-        .download-btn {{
-            background-color: #4caf50;
-            color: white;
-            padding: 10px 15px;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            text-decoration: none;
-            font-weight: bold;
-            display: inline-block;
-            transition: background-color 0.3s;
-        }}
-        .download-btn:hover {{
-            background-color: #388e3c;
-        }}
-        .footer {{
-            text-align: center;
-            color: #999;
-            margin-top: 40px;
-            padding-top: 20px;
-            border-top: 1px solid #ddd;
-            font-size: 0.8em;
-        }}
+        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background-color: #f0f2f6; color: #333; }}
+        .container {{ max-width: 1400px; margin: auto; background-color: white; padding: 30px; border-radius: 12px; box-shadow: 0 6px 15px rgba(0, 0, 0, 0.1); }}
+        h1 {{ color: #1e88e5; border-bottom: 3px solid #eee; padding-bottom: 10px; text-align: center; }}
+        .header-row {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }}
+        .info-box {{ background-color: #e3f2fd; color: #0d47a1; padding: 10px 15px; border-radius: 6px; font-size: 0.9em; font-weight: bold; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 10px; overflow: hidden; border-radius: 8px; }}
+        th, td {{ border: 1px solid #e0e0e0; padding: 10px 15px; text-align: right; }}
+        th {{ background-color: #42a5f5; color: white; font-weight: normal; font-size: 1em; position: sticky; top: 0; }}
+        th:first-child, td:first-child {{ text-align: left; }}
+        tr:nth-child(even) {{ background-color: #f5f5f5; }}
+        tr:hover {{ background-color: #e0f2f1; }}
+        .download-btn {{ background-color: #4caf50; color: white; padding: 10px 15px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; font-weight: bold; display: inline-block; transition: background-color 0.3s; }}
+        .download-btn:hover {{ background-color: #388e3c; }}
+        .footer {{ text-align: center; color: #999; margin-top: 40px; padding-top: 20px; border-top: 1px solid #ddd; font-size: 0.8em; }}
     </style>
 </head>
 <body>
     <div class="container">
         <h1>📈 Stock Financial Dashboard</h1>
         <p>Real-time stock data from Yahoo Finance</p>
-        
         <div class="header-row">
             <a href="/download_csv" class="download-btn">📥 Download Raw Data (.csv)</a>
             <div class="info-box">
                 🕐 <strong>Last Updated:</strong> {last_updated_str}
             </div>
         </div>
-
         <h2>📊 Stock Price Data - All Symbols</h2>
-        
         <div style="max-height: 70vh; overflow-y: auto;">
             <table>
                 {table_content_html}
             </table>
         </div>
-
         <div class="footer">
-            <p>Data provided by Yahoo Finance | Dashboard built with Python Flask (Single Script)</p>
+            <p>Data provided by Yahoo Finance | Dashboard built with Python Flask</p>
         </div>
     </div>
 </body>
@@ -352,6 +250,7 @@ def dashboard():
 """
     return html_content
 
-
 if __name__ == "__main__":
-    app.run(debug=False, host='0.0.0.0', port=5000)
+    # Render binds dynamically to PORT environment variable
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
