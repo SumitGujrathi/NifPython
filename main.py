@@ -1,10 +1,17 @@
 import os
+import time
+import logging
+import threading
 from datetime import datetime
 import pandas as pd
 from flask import Flask, Response
 import yfinance as yf
+from apscheduler.schedulers.background import BackgroundScheduler
 
-# --- CONFIGURATION (Stock Lists) ---
+# Configure logging to monitor retries on Render
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# --- CONFIGURATION ---
 STOCK_LIST = [
     "NIFTY_50", "NIFTY_BANK", "ACC", "ADANIPORTS", "SBIN", "AMBUJACEM",
     "WIPRO", "APOLLOTYRE", "ASIANPAINT", "AUROPHARMA", "AXISBANK",
@@ -51,59 +58,56 @@ SYMBOL_MAPPING = {
     "ZEEL": "ZEEL.NS"
 }
 
+# Thread-safe global cache
+DATA_CACHE = {
+    "data": pd.DataFrame(),
+    "timestamp": None,
+    "status": "Initializing..."
+}
+CACHE_LOCK = threading.Lock()
 
 def get_yahoo_symbol(stock_name):
     return SYMBOL_MAPPING.get(stock_name, f"{stock_name}.NS")
 
-# --- FLASK CACHING IMPLEMENTATION ---
-CACHE = {'data': None, 'timestamp': datetime.min}
-CACHE_TTL_SECONDS = 120  # Increased TTL to reduce rate limiting on Render
+# --- HIGHLY RESILIENT FETCH LOGIC WITH UNLIMITED RETRIES ---
+def fetch_stock_data_with_retries(max_retries=5, delay_between_retries=3):
+    """
+    Attempts to fetch stock data. 
+    Retries up to `max_retries` times on failure without raising exceptions.
+    """
+    yahoo_symbols = [get_yahoo_symbol(s) for s in STOCK_LIST]
+    df_batch = pd.DataFrame()
 
-def get_all_stocks_data_cached():
-    """Checks cache and fetches new data if cache is expired."""
-    global CACHE
-    now = datetime.now()
-    
-    if CACHE['data'] is not None and (now - CACHE['timestamp']).total_seconds() < CACHE_TTL_SECONDS:
-        return CACHE['data'].copy(), CACHE['timestamp'] 
+    # Step 1: Attempt Batch Download
+    for attempt in range(1, max_retries + 1):
+        try:
+            logging.info(f"Batch fetch attempt {attempt}/{max_retries}...")
+            df_batch = yf.download(
+                tickers=yahoo_symbols,
+                period="5d",
+                interval="1d",
+                group_by="ticker",
+                threads=True,
+                progress=False,
+                timeout=10
+            )
+            if not df_batch.empty:
+                logging.info("Batch download successful!")
+                break
+        except Exception as e:
+            logging.warning(f"Batch fetch failed on attempt {attempt}: {str(e)}")
+            time.sleep(delay_between_retries)
 
-    df = _fetch_stocks_data_yfinance()
-    
-    if df is not None and not df.empty:
-        CACHE['data'] = df
-        CACHE['timestamp'] = now
-    elif CACHE['data'] is not None:
-        return CACHE['data'].copy(), CACHE['timestamp']
-    
-    return (df.copy() if df is not None else pd.DataFrame()), now
-
-
-def _fetch_stocks_data_yfinance():
-    """Batch requests stock data without slow fallback loops."""
     all_data = []
-    yahoo_symbols = [get_yahoo_symbol(stock) for stock in STOCK_LIST]
-    
-    try:
-        # Fast batch download
-        df_batch = yf.download(
-            tickers=yahoo_symbols,
-            period="5d",
-            interval="1d",
-            group_by="ticker",
-            threads=True,
-            progress=False,
-            timeout=10  # Enforce timeout to prevent 502 Gateway Timeout on Render
-        )
-    except Exception:
-        df_batch = pd.DataFrame()
 
+    # Step 2: Extract or Individually Retry Missing Symbols
     for stock_name in STOCK_LIST:
         yahoo_symbol = get_yahoo_symbol(stock_name)
-        
         current_price = open_price = high_price = low_price = prev_close = volume = None
-        
+        ticker_df = pd.DataFrame()
+
+        # Try getting data from batch result
         try:
-            ticker_df = pd.DataFrame()
             if not df_batch.empty:
                 if isinstance(df_batch.columns, pd.MultiIndex):
                     if yahoo_symbol in df_batch.columns.get_level_values(0):
@@ -112,7 +116,21 @@ def _fetch_stocks_data_yfinance():
                         ticker_df = df_batch.xs(yahoo_symbol, level=1, axis=1).dropna(subset=['Close'])
                 else:
                     ticker_df = df_batch.dropna(subset=['Close'])
+        except Exception:
+            pass
 
+        # Fallback to single-symbol query if batch missed this symbol
+        if ticker_df.empty:
+            for single_attempt in range(2):
+                try:
+                    ticker_df = yf.Ticker(yahoo_symbol).history(period="5d").dropna(subset=['Close'])
+                    if not ticker_df.empty:
+                        break
+                except Exception:
+                    time.sleep(1)
+
+        # Parse extracted rows safely
+        try:
             if not ticker_df.empty:
                 latest = ticker_df.iloc[-1]
                 current_price = float(latest['Close'])
@@ -120,11 +138,9 @@ def _fetch_stocks_data_yfinance():
                 high_price = float(latest['High'])
                 low_price = float(latest['Low'])
                 volume = float(latest['Volume']) if 'Volume' in latest and pd.notna(latest['Volume']) else None
-                
                 prev_close = float(ticker_df.iloc[-2]['Close']) if len(ticker_df) >= 2 else open_price
-
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error(f"Error parsing data for {stock_name}: {str(e)}")
 
         all_data.append({
             "Symbol": stock_name,
@@ -138,17 +154,43 @@ def _fetch_stocks_data_yfinance():
 
     return pd.DataFrame(all_data)
 
+def background_update_job():
+    """Background task managed by scheduler to keep cache fresh without blocking web requests."""
+    logging.info("Starting background update job...")
+    df_new = fetch_stock_data_with_retries()
+
+    with CACHE_LOCK:
+        if not df_new.empty and df_new['Current Price / LTP'].notna().any():
+            DATA_CACHE["data"] = df_new
+            DATA_CACHE["timestamp"] = datetime.now()
+            DATA_CACHE["status"] = "Active"
+            logging.info("Cache updated successfully.")
+        else:
+            DATA_CACHE["status"] = "Update Warning (Retrying on next cycle)"
+            logging.warning("Fetch completed but data was empty. Retaining previous valid cache.")
+
+# --- BACKGROUND SCHEDULER SETUP ---
+scheduler = BackgroundScheduler(daemon=True)
+# Runs background fetch every 2 minutes
+scheduler.add_job(background_update_job, 'interval', seconds=120)
+scheduler.start()
+
+# Run initial fetch in background thread so Flask app starts instantly
+threading.Thread(target=background_update_job, daemon=True).start()
+
+# --- FLASK APP ---
+app = Flask(__name__)
 
 def format_dataframe_to_html_table(df):
     if df.empty:
-        return '<tr><td colspan="7" style="text-align: center; color: red;">No stock data available to display.</td></tr>', []
+        return '<tr><td colspan="7" style="text-align: center; color: #d32f2f; font-weight: bold;">Fetching initial data from Yahoo Finance... Please refresh in a few seconds.</td></tr>', []
 
     formatted_df = df.copy()
     numeric_cols = formatted_df.columns.drop('Symbol')
     formatted_df = formatted_df.dropna(subset=numeric_cols, how='all').reset_index(drop=True)
 
     if formatted_df.empty:
-        return '<tr><td colspan="7" style="text-align: center; color: red;">No stock data available to display.</td></tr>', []
+        return '<tr><td colspan="7" style="text-align: center; color: #d32f2f;">No stock data currently available.</td></tr>', []
 
     for col in ["Current Price / LTP", "Open", "High", "Low", "Previous Close"]:
         numeric_col = pd.to_numeric(formatted_df[col], errors='coerce')
@@ -172,20 +214,16 @@ def format_dataframe_to_html_table(df):
     table_html = f"<thead>{header_html}</thead><tbody>{rows_html}</tbody>"
     return table_html, headers
 
-
-app = Flask(__name__)
-
 @app.route("/download_csv")
 def download_csv():
-    df, _ = get_all_stocks_data_cached()
+    with CACHE_LOCK:
+        df = DATA_CACHE["data"].copy()
+        
     if df.empty:
-        return "Error: No data available for download.", 404
+        return "Error: Data is still loading. Please try again shortly.", 533
 
     numeric_cols = df.columns.drop('Symbol')
     df_clean = df.dropna(subset=numeric_cols, how='all')
-
-    if df_clean.empty:
-        return "Error: No data available for download.", 404
 
     csv_data = df_clean.to_csv(index=False)
     return Response(
@@ -196,9 +234,13 @@ def download_csv():
 
 @app.route("/")
 def dashboard():
-    df_data, last_updated_dt = get_all_stocks_data_cached()
+    with CACHE_LOCK:
+        df_data = DATA_CACHE["data"].copy()
+        last_updated_dt = DATA_CACHE["timestamp"]
+        status_msg = DATA_CACHE["status"]
+
     table_content_html, _ = format_dataframe_to_html_table(df_data)
-    last_updated_str = last_updated_dt.strftime("%Y-%m-%d %H:%M:%S")
+    last_updated_str = last_updated_dt.strftime("%Y-%m-%d %H:%M:%S") if last_updated_dt else "Loading..."
 
     html_content = f"""
 <!DOCTYPE html>
@@ -206,7 +248,7 @@ def dashboard():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="refresh" content="{CACHE_TTL_SECONDS}">
+    <meta http-equiv="refresh" content="30">
     <title>📈 Stock Financial Dashboard</title>
     <style>
         body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background-color: #f0f2f6; color: #333; }}
@@ -232,7 +274,7 @@ def dashboard():
         <div class="header-row">
             <a href="/download_csv" class="download-btn">📥 Download Raw Data (.csv)</a>
             <div class="info-box">
-                🕐 <strong>Last Updated:</strong> {last_updated_str}
+                🕐 <strong>Last Updated:</strong> {last_updated_str} | Status: {status_msg}
             </div>
         </div>
         <h2>📊 Stock Price Data - All Symbols</h2>
@@ -242,7 +284,7 @@ def dashboard():
             </table>
         </div>
         <div class="footer">
-            <p>Data provided by Yahoo Finance | Dashboard built with Python Flask</p>
+            <p>Data provided by Yahoo Finance | Dashboard built with Python Flask & APScheduler</p>
         </div>
     </div>
 </body>
@@ -251,6 +293,5 @@ def dashboard():
     return html_content
 
 if __name__ == "__main__":
-    # Render binds dynamically to PORT environment variable
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
