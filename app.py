@@ -1,169 +1,122 @@
 import os
+import json
 import time
-import logging
-import threading
-from datetime import datetime
-import pandas as pd
-from flask import Flask, Response
-from apscheduler.schedulers.background import BackgroundScheduler
-import upstox_client
-from upstox_client.rest import ApiException
+import requests
+import schedule
+import gspread
+from google.oauth2.service_account import Credentials
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# --- CONFIGURATION ---
+SHEET_NAME = os.getenv("SPREADSHEET_NAME", "LIVE_DATA")
 
-# Upstox API Configuration
-UPSTOX_API_KEY = os.environ.get("UPSTOX_API_KEY", "YOUR_UPSTOX_API_KEY")
-UPSTOX_ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN", "YOUR_ACCESS_TOKEN")
+# Load Google Credentials from Environment Variable
+SERVICE_ACCOUNT_INFO = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
 
-# Upstox Instrument Keys for your tickers
-UPSTOX_INSTRUMENTS = {
-    "NIFTY_50": "NSE_INDEX|Nifty 50",
-    "NIFTY_BANK": "NSE_INDEX|Nifty Bank",
-    "SBIN": "NSE_EQ|INE062A01020",
-    "HDFCBANK": "NSE_EQ|INE040A01034",
-    "INFY": "NSE_EQ|INE009A01021",
-    "ICICIBANK": "NSE_EQ|INE090A01021",
-    "AXISBANK": "NSE_EQ|INE238A01034",
-    "WIPRO": "NSE_EQ|INE075A01022",
-    "ASIANPAINT": "ASIANPAINT",
-    "ADANIPORTS": "NSE_EQ|INE742F01042"
-}
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
 
-STOCK_LIST = list(UPSTOX_INSTRUMENTS.keys())
+credentials = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPES)
+gc = gspread.authorize(credentials)
 
-DATA_CACHE = {"data": pd.DataFrame(), "timestamp": None, "status": "Initializing..."}
-CACHE_LOCK = threading.Lock()
+def fetch_nse_option_chain(symbol):
+    base_url = "https://www.nseindia.com"
+    api_url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
 
-def fetch_upstox_market_quote():
-    """Fetches clean real-time quotes directly from Upstox official servers."""
-    if not UPSTOX_ACCESS_TOKEN or UPSTOX_ACCESS_TOKEN == "YOUR_ACCESS_TOKEN":
-        logging.warning("Upstox Access Token missing. Set UPSTOX_ACCESS_TOKEN environment variable.")
-        return pd.DataFrame()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Referer": "https://www.nseindia.com/option-chain"
+    }
 
-    configuration = upstox_client.Configuration()
-    configuration.access_token = UPSTOX_ACCESS_TOKEN
-    api_instance = upstox_client.MarketQuoteApi(upstox_client.ApiClient(configuration))
-
-    instrument_keys = ",".join(UPSTOX_INSTRUMENTS.values())
+    session = requests.Session()
+    session.headers.update(headers)
 
     try:
-        api_response = api_instance.get_full_market_quote(instrument_keys, "2.0")
-        quotes = api_response.data
-        
-        all_rows = []
-        for stock_name, key in UPSTOX_INSTRUMENTS.items():
-            # Match returned instrument key
-            formatted_key = key.replace("|", ":")
-            quote_data = quotes.get(formatted_key) or quotes.get(key)
-            
-            if quote_data:
-                ohlc = quote_data.ohlc or {}
-                all_rows.append({
-                    "Symbol": stock_name,
-                    "Current Price / LTP": quote_data.last_price,
-                    "Open": ohlc.open,
-                    "High": ohlc.high,
-                    "Low": ohlc.low,
-                    "Previous Close": ohlc.close,
-                    "Volume": quote_data.volume
-                })
-            else:
-                all_rows.append({
-                    "Symbol": stock_name, "Current Price / LTP": None, "Open": None,
-                    "High": None, "Low": None, "Previous Close": None, "Volume": None
-                })
-        return pd.DataFrame(all_rows)
+        # Step 1: Establish session and retrieve cookies
+        session.get(base_url, timeout=10)
+        time.sleep(1)
 
-    except ApiException as e:
-        logging.error(f"Upstox API Exception: {e}")
-    except Exception as e:
-        logging.error(f"Error fetching Upstox data: {e}")
+        # Step 2: Request option chain data with established session
+        response = session.get(api_url, timeout=10)
 
-    return pd.DataFrame()
-
-def background_update_job():
-    logging.info("Fetching market data via Upstox API...")
-    df_new = fetch_upstox_market_quote()
-
-    with CACHE_LOCK:
-        if not df_new.empty and df_new['Current Price / LTP'].notna().any():
-            DATA_CACHE["data"] = df_new
-            DATA_CACHE["timestamp"] = datetime.now()
-            DATA_CACHE["status"] = "Active (Upstox Official)"
-            logging.info("Cache updated successfully.")
+        if response.status_code == 200:
+            return response.json()
         else:
-            DATA_CACHE["status"] = "Waiting for valid API token..."
+            print(f"[{symbol}] Failed with HTTP Status: {response.status_code}")
+            return None
+    except Exception as e:
+        print(f"[{symbol}] Exception during fetch: {e}")
+        return None
 
-scheduler = BackgroundScheduler(daemon=True)
-scheduler.add_job(background_update_job, 'interval', seconds=60)
-scheduler.start()
+def process_and_update_sheet(symbol, sheet_tab_name):
+    data = fetch_nse_option_chain(symbol)
+    if not data or "records" not in data:
+        print(f"No valid data retrieved for {symbol}")
+        return
 
-threading.Thread(target=background_update_job, daemon=True).start()
+    underlying_val = data["records"].get("underlyingValue", 0)
+    expiry_dates = data["records"].get("expiryDates", [])
+    if not expiry_dates:
+        print(f"No expiry dates found for {symbol}")
+        return
 
-app = Flask(__name__)
+    current_expiry = expiry_dates[0]
+    updated_time = time.strftime("%m/%d/%Y %H:%M:%S")
 
-def format_dataframe_to_html_table(df):
-    if df.empty:
-        return '<tr><td colspan="7" style="text-align: center; color: #1976d2; font-weight: bold;">Connecting to Upstox API... Please verify your Access Token.</td></tr>', []
+    output_rows = [
+        [f"Symbol: {symbol}", f"Underlying LTP: {underlying_val}", f"Expiry: {current_expiry}", f"Updated: {updated_time}"],
+        ["CALLS OI", "CALLS Vol", "CALLS IV", "CALLS LTP", "STRIKE", "PUTS LTP", "PUTS IV", "PUTS Vol", "PUTS OI"]
+    ]
 
-    formatted_df = df.copy()
-    numeric_cols = formatted_df.columns.drop('Symbol')
-    formatted_df = formatted_df.dropna(subset=numeric_cols, how='all').reset_index(drop=True)
+    range_limit = 1200 if symbol == "BANKNIFTY" else 600
+    filtered_data = [d for d in data["records"]["data"] if d.get("expiryDate") == current_expiry]
 
-    for col in ["Current Price / LTP", "Open", "High", "Low", "Previous Close"]:
-        numeric_col = pd.to_numeric(formatted_df[col], errors='coerce')
-        formatted_df[col] = numeric_col.apply(lambda x: "N/A" if pd.isna(x) or x == 0 else f"₹{x:,.2f}")
+    for item in filtered_data:
+        strike = item.get("strikePrice", 0)
+        if abs(strike - underlying_val) <= range_limit:
+            ce = item.get("CE", {})
+            pe = item.get("PE", {})
 
-    numeric_volume = pd.to_numeric(formatted_df["Volume"], errors='coerce')
-    formatted_df["Volume"] = numeric_volume.apply(lambda x: "N/A" if pd.isna(x) or x == 0 else f"{x:,.0f}")
+            output_rows.append([
+                ce.get("openInterest", 0),
+                ce.get("totalTradedVolume", 0),
+                ce.get("impliedVolatility", 0),
+                ce.get("lastPrice", 0),
+                strike,
+                pe.get("lastPrice", 0),
+                pe.get("impliedVolatility", 0),
+                pe.get("totalTradedVolume", 0),
+                pe.get("openInterest", 0)
+            ])
 
-    headers = formatted_df.columns.tolist()
-    header_html = "<tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr>"
-    rows_html = "".join(f"<tr>" + "".join(f"<td>{row[col]}</td>" for col in headers) + "</tr>" for _, row in formatted_df.iterrows())
+    try:
+        spreadsheet = gc.open(SHEET_NAME)
+        try:
+            worksheet = spreadsheet.worksheet(sheet_tab_name)
+        except gspread.exceptions.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title=sheet_tab_name, rows="100", cols="10")
 
-    return f"<thead>{header_html}</thead><tbody>{rows_html}</tbody>", headers
+        worksheet.clear()
+        worksheet.update('A1', output_rows)
+        print(f"[{updated_time}] Successfully updated {sheet_tab_name} in Google Sheet!")
+    except Exception as e:
+        print(f"Error updating Google Sheet: {e}")
 
-@app.route("/")
-def dashboard():
-    with CACHE_LOCK:
-        df_data = DATA_CACHE["data"].copy()
-        last_updated_dt = DATA_CACHE["timestamp"]
-        status_msg = DATA_CACHE["status"]
-
-    table_content_html, _ = format_dataframe_to_html_table(df_data)
-    last_updated_str = last_updated_dt.strftime("%Y-%m-%d %H:%M:%S") if last_updated_dt else "Loading..."
-
-    return f"""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta http-equiv="refresh" content="60">
-    <title>📈 Live Stock Financial Dashboard</title>
-    <style>
-        body {{ font-family: 'Segoe UI', Tahoma, sans-serif; margin: 0; padding: 20px; background-color: #f0f2f6; }}
-        .container {{ max-width: 1400px; margin: auto; background-color: white; padding: 30px; border-radius: 12px; box-shadow: 0 6px 15px rgba(0,0,0,0.1); }}
-        h1 {{ color: #1e88e5; text-align: center; }}
-        .info-box {{ background-color: #e3f2fd; color: #0d47a1; padding: 10px; border-radius: 6px; font-weight: bold; float: right; }}
-        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-        th, td {{ border: 1px solid #e0e0e0; padding: 10px; text-align: right; }}
-        th {{ background-color: #42a5f5; color: white; }}
-        th:first-child, td:first-child {{ text-align: left; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>📈 Live Stock Financial Dashboard</h1>
-        <div class="info-box">🕐 Last Updated: {last_updated_str} | Status: {status_msg}</div>
-        <div style="clear: both;"></div>
-        <div style="max-height: 70vh; overflow-y: auto;">
-            <table>{table_content_html}</table>
-        </div>
-    </div>
-</body>
-</html>
-"""
+def job():
+    print("Starting scheduled sync...")
+    process_and_update_sheet("NIFTY", "NIFTY_OC")
+    process_and_update_sheet("BANKNIFTY", "BANKNIFTY_OC")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    # Run initial sync on startup
+    job()
+
+    # Schedule sync every 1 minute
+    schedule.every(1).minutes.do(job)
+
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
