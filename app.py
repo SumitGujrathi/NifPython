@@ -4,7 +4,6 @@ import logging
 import threading
 from datetime import datetime
 import pandas as pd
-import requests
 from flask import Flask, Response
 import yfinance as yf
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -73,24 +72,12 @@ CACHE_LOCK = threading.Lock()
 def get_yahoo_symbol(stock_name):
     return SYMBOL_MAPPING.get(stock_name, f"{stock_name}.NS")
 
-def get_yfinance_session():
-    """Generates realistic headers to prevent IP/User-Agent blocking."""
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-    })
-    return session
-
 # --- NON-STOP RETRY FETCH FUNCTION ---
 def fetch_stock_data_with_infinite_retry():
     """
-    Tries fetching stock data until successful.
-    If errors occur, it logs, waits, and retries automatically without throwing an unhandled exception.
+    Tries fetching stock data until successful using yfinance's built-in session.
     """
     yahoo_symbols = [get_yahoo_symbol(s) for s in STOCK_LIST]
-    session = get_yfinance_session()
     
     max_attempts = 3
     delay = 2
@@ -99,6 +86,7 @@ def fetch_stock_data_with_infinite_retry():
     for attempt in range(1, max_attempts + 1):
         try:
             logging.info(f"Downloading batch stock data (Attempt {attempt}/{max_attempts})...")
+            # Removed custom session argument to let yfinance manage requests
             df_batch = yf.download(
                 tickers=yahoo_symbols,
                 period="5d",
@@ -106,8 +94,7 @@ def fetch_stock_data_with_infinite_retry():
                 group_by="ticker",
                 threads=True,
                 progress=False,
-                timeout=12,
-                session=session
+                timeout=15
             )
             if not df_batch.empty:
                 break
@@ -138,7 +125,7 @@ def fetch_stock_data_with_infinite_retry():
         # Individual Ticker Fallback
         if ticker_df.empty:
             try:
-                ticker_df = yf.Ticker(yahoo_symbol, session=session).history(period="5d").dropna(subset=['Close'])
+                ticker_df = yf.Ticker(yahoo_symbol).history(period="5d").dropna(subset=['Close'])
             except Exception:
                 pass
 
@@ -173,7 +160,6 @@ def background_update_job():
     df_new = fetch_stock_data_with_infinite_retry()
 
     with CACHE_LOCK:
-        # Verify valid price values were retrieved
         if not df_new.empty and df_new['Current Price / LTP'].notna().any():
             DATA_CACHE["data"] = df_new
             DATA_CACHE["timestamp"] = datetime.now()
@@ -188,7 +174,7 @@ scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(background_update_job, 'interval', seconds=60)
 scheduler.start()
 
-# Run immediate initial fetch in background thread so app boots instantly
+# Initial fetch in background thread so app boots instantly
 threading.Thread(target=background_update_job, daemon=True).start()
 
 # --- FLASK SETUP ---
