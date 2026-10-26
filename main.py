@@ -1,39 +1,68 @@
 import os
 import time
-import requests
 import io
 import csv
+import cloudscraper
 from flask import Flask, render_template_string, request, Response
 
 app = Flask(__name__)
 
 def fetch_nse_option_chain(symbol):
+    """
+    Fetches Option Chain JSON from NSE India using Cloudscraper to bypass Akamai bot detection.
+    """
     base_url = "https://www.nseindia.com"
     api_url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
 
+    # Initialize cloudscraper session to mimic real browser TLS fingerprints
+    scraper = cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'windows',
+            'desktop': True
+        }
+    )
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": "https://www.nseindia.com/option-chain"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive"
     }
 
-    session = requests.Session()
-    session.headers.update(headers)
-
     try:
-        session.get(base_url, timeout=10)
-        time.sleep(1)
-        response = session.get(api_url, timeout=10)
+        # Step 1: Establish base session & acquire Akamai cookies
+        init_res = scraper.get(base_url, headers=headers, timeout=12)
+        if init_res.status_code != 200:
+            print(f"[{symbol}] Base connection failed with status: {init_res.status_code}")
+            return None
+
+        time.sleep(1)  # Brief pause to allow session cookie initialization
+
+        # Step 2: Set API headers with Referer
+        api_headers = headers.copy()
+        api_headers["Accept"] = "application/json, text/plain, */*"
+        api_headers["Referer"] = "https://www.nseindia.com/option-chain"
+
+        # Step 3: Fetch Option Chain JSON
+        response = scraper.get(api_url, headers=api_headers, timeout=12)
+        
         if response.status_code == 200:
             return response.json()
+        else:
+            print(f"[{symbol}] API request failed with status code: {response.status_code}")
+
     except Exception as e:
-        print(f"[{symbol}] Fetch error: {e}")
+        print(f"[{symbol}] Exception during fetch: {e}")
+
     return None
 
 def get_processed_data(symbol):
     data = fetch_nse_option_chain(symbol)
-    if not data or "records" not in data:
-        return [], 0, "N/A", time.strftime("%m/%d/%Y %H:%M:%S")
+    
+    if not data or "records" not in data or "data" not in data["records"]:
+        return [], 0, "N/A (NSE Request Blocked)", time.strftime("%m/%d/%Y %H:%M:%S")
 
     underlying_val = data["records"].get("underlyingValue", 0)
     expiry_dates = data["records"].get("expiryDates", [])
@@ -41,6 +70,7 @@ def get_processed_data(symbol):
     updated_time = time.strftime("%m/%d/%Y %H:%M:%S")
 
     rows = []
+    # Dynamic range limit: +/- 1200 for BANKNIFTY, +/- 600 for NIFTY
     range_limit = 1200 if symbol == "BANKNIFTY" else 600
     filtered_data = [d for d in data["records"]["data"] if d.get("expiryDate") == current_expiry]
 
@@ -68,23 +98,27 @@ HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>NSE Option Chain Viewer</title>
+    <title>NSE Option Chain Live Dashboard</title>
     <meta http-equiv="refresh" content="60">
     <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f6f9; }
-        h2 { color: #333; }
-        .info-box { background: #fff; padding: 15px; border-radius: 5px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        .btn { display: inline-block; padding: 8px 15px; color: #fff; background-color: #007bff; text-decoration: none; border-radius: 4px; margin-right: 10px; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #f4f6f9; }
+        h2 { color: #222; }
+        .info-box { background: #fff; padding: 15px; border-radius: 6px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.08); }
+        .btn { display: inline-block; padding: 9px 18px; color: #fff; background-color: #007bff; text-decoration: none; border-radius: 4px; margin-right: 10px; font-weight: 500; }
         .btn-success { background-color: #28a745; }
-        table { width: 100%; border-collapse: collapse; background: #fff; }
-        th, td { border: 1px solid #ddd; padding: 8px; text-align: center; }
+        .btn:hover { opacity: 0.9; }
+        table { width: 100%; border-collapse: collapse; background: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        th, td { border: 1px solid #e0e0e0; padding: 10px; text-align: center; font-size: 14px; }
         th { background-color: #007bff; color: white; }
-        tr:nth-child(even){ background-color: #f9f9f9; }
-        .atm { background-color: #fff3cd !important; font-weight: bold; }
+        tr:nth-child(even){ background-color: #f8f9fa; }
+        .atm { background-color: #fff3cd !important; font-weight: bold; color: #856404; }
+        .ce-header { background-color: #28a745 !important; }
+        .pe-header { background-color: #dc3545 !important; }
+        .error-msg { color: #dc3545; font-weight: bold; margin-top: 10px; }
     </style>
 </head>
 <body>
-    <h2>NSE Option Chain Dashboard</h2>
+    <h2>NSE Option Chain Live Dashboard</h2>
     <div class="info-box">
         <strong>Symbol:</strong> {{ symbol }} | 
         <strong>Underlying Price:</strong> {{ ltp }} | 
@@ -96,12 +130,17 @@ HTML_TEMPLATE = """
         <a href="/download?symbol={{ symbol }}" class="btn btn-success">Download CSV</a>
     </div>
 
+    {% if not rows %}
+        <div class="info-box error-msg">
+            Unable to pull data from NSE at this moment. The session challenge may be refreshing. Click 'View {{ symbol }}' above to retry.
+        </div>
+    {% else %}
     <table>
         <thead>
             <tr>
-                <th colspan="4" style="background-color: #28a745;">CALLS</th>
+                <th colspan="4" class="ce-header">CALLS</th>
                 <th>STRIKE</th>
-                <th colspan="4" style="background-color: #dc3545;">PUTS</th>
+                <th colspan="4" class="pe-header">PUTS</th>
             </tr>
             <tr>
                 <th>OI</th><th>Volume</th><th>IV</th><th>LTP</th>
@@ -125,6 +164,7 @@ HTML_TEMPLATE = """
             {% endfor %}
         </tbody>
     </table>
+    {% endif %}
 </body>
 </html>
 """
