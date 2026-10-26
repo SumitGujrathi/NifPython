@@ -6,6 +6,7 @@ from datetime import datetime
 import pandas as pd
 from flask import Flask, Response
 import yfinance as yf
+import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from curl_cffi import requests as curl_requests
 
@@ -15,7 +16,9 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-# --- CONFIGURATION (Stock Lists) ---
+# --- CONFIGURATION (Stock Lists & API Keys) ---
+ALPHA_VANTAGE_API_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY", "YOUR_FREE_ALPHA_VANTAGE_KEY")
+
 STOCK_LIST = [
     "NIFTY_50", "NIFTY_BANK", "ACC", "ADANIPORTS", "SBIN", "AMBUJACEM",
     "WIPRO", "APOLLOTYRE", "ASIANPAINT", "AUROPHARMA", "AXISBANK",
@@ -62,7 +65,6 @@ SYMBOL_MAPPING = {
     "ZEEL": "ZEEL.NS"
 }
 
-# Thread-safe Cache
 DATA_CACHE = {
     "data": pd.DataFrame(),
     "timestamp": None,
@@ -73,23 +75,24 @@ CACHE_LOCK = threading.Lock()
 def get_yahoo_symbol(stock_name):
     return SYMBOL_MAPPING.get(stock_name, f"{stock_name}.NS")
 
-# --- DIRECT YAHOO API SCRAPER (FAILSAFE) ---
+def get_alpha_vantage_symbol(stock_name):
+    # Alpha Vantage uses BSE/NSE suffixes like ACC.BSE or INFY.BSE for Indian equities
+    yahoo_sym = get_yahoo_symbol(stock_name)
+    if yahoo_sym.endswith(".NS"):
+        return yahoo_sym.replace(".NS", ".BSE")
+    return yahoo_sym
+
+# --- TIER 2: DIRECT YAHOO API SCRAPER ---
 def fetch_direct_yahoo_chart_data(yahoo_symbol):
-    """
-    Direct HTTPS query endpoint to bypass yfinance wrapper limits using curl_cffi.
-    """
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}?range=5d&interval=1d"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    
     try:
-        response = curl_requests.get(url, headers=headers, impersonate="chrome", timeout=10)
+        response = curl_requests.get(url, headers=headers, impersonate="chrome", timeout=8)
         if response.status_code == 200:
-            json_data = response.json()
-            result = json_data['chart']['result'][0]
+            result = response.json()['chart']['result'][0]
             quote = result['indicators']['quote'][0]
-            
             closes = [c for c in quote.get('close', []) if c is not None]
             opens = [o for o in quote.get('open', []) if o is not None]
             highs = [h for h in quote.get('high', []) if h is not None]
@@ -108,45 +111,69 @@ def fetch_direct_yahoo_chart_data(yahoo_symbol):
                     "Volume": volumes[-1] if volumes else None
                 }
     except Exception as e:
-        logging.warning(f"Direct API call failed for {yahoo_symbol}: {e}")
-        
+        logging.warning(f"Yahoo Direct API failed for {yahoo_symbol}: {e}")
     return None
 
-# --- RESILIENT MULTI-STRATEGY FETCH ENGINE ---
+# --- TIER 3: ALPHA VANTAGE FALLBACK ---
+def fetch_alpha_vantage_quote(stock_name):
+    if not ALPHA_VANTAGE_API_KEY or ALPHA_VANTAGE_API_KEY == "YOUR_FREE_ALPHA_VANTAGE_KEY":
+        return None
+
+    av_symbol = get_alpha_vantage_symbol(stock_name)
+    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={av_symbol}&apikey={ALPHA_VANTAGE_API_KEY}"
+    
+    try:
+        logging.info(f"Triggering Alpha Vantage Fallback for {av_symbol}...")
+        resp = requests.get(url, timeout=8)
+        if resp.status_code == 200:
+            data = resp.json().get("Global Quote", {})
+            if data:
+                return {
+                    "Current Price / LTP": float(data.get("05. price", 0)),
+                    "Open": float(data.get("02. open", 0)),
+                    "High": float(data.get("03. high", 0)),
+                    "Low": float(data.get("04. low", 0)),
+                    "Previous Close": float(data.get("08. previous close", 0)),
+                    "Volume": float(data.get("06. volume", 0))
+                }
+    except Exception as e:
+        logging.warning(f"Alpha Vantage API error for {stock_name}: {e}")
+    return None
+
+# --- RESILIENT MULTI-TIER FETCH ENGINE ---
 def fetch_stock_data_failsafe():
     yahoo_symbols = [get_yahoo_symbol(s) for s in STOCK_LIST]
     df_batch = pd.DataFrame()
 
-    # Strategy 1: Fast yfinance Single-Threaded Download
+    # Tier 1: yfinance Batch Download
     try:
-        logging.info("Attempting Batch Download via yfinance...")
+        logging.info("Tier 1: Attempting Batch Download via yfinance...")
         df_batch = yf.download(
             tickers=yahoo_symbols,
             period="5d",
             interval="1d",
             group_by="ticker",
-            threads=False,  # Single-threading prevents deadlocks on cloud hosting
+            threads=False,
             progress=False,
-            timeout=15
+            timeout=12
         )
     except Exception as e:
-        logging.warning(f"yfinance batch download failed: {e}")
+        logging.warning(f"yfinance batch failed: {e}")
 
     all_data = []
 
-    # Strategy 2: Extract or Fallback to Direct Query API Per Symbol
     for stock_name in STOCK_LIST:
         yahoo_symbol = get_yahoo_symbol(stock_name)
         current_price = open_price = high_price = low_price = prev_close = volume = None
         ticker_df = pd.DataFrame()
 
-        # Parse batch output if available
+        # Parse Tier 1 results
         try:
             if not df_batch.empty:
                 if isinstance(df_batch.columns, pd.MultiIndex):
                     if yahoo_symbol in df_batch.columns.get_level_values(0):
                         ticker_df = df_batch[yahoo_symbol].dropna(subset=['Close'])
-                    elif yahoo_symbol in df_batch.columns.get_level_values(1):
+                    elif yahoo_symbol in df_symbol.columns.get_level_values(1):
                         ticker_df = df_batch.xs(yahoo_symbol, level=1, axis=1).dropna(subset=['Close'])
                 else:
                     ticker_df = df_batch.dropna(subset=['Close'])
@@ -162,7 +189,7 @@ def fetch_stock_data_failsafe():
             volume = float(latest['Volume']) if 'Volume' in latest and pd.notna(latest['Volume']) else None
             prev_close = float(ticker_df.iloc[-2]['Close']) if len(ticker_df) >= 2 else open_price
         else:
-            # Trigger Direct API Fallback if yfinance failed
+            # Tier 2: Yahoo Direct Chart Endpoint
             direct_data = fetch_direct_yahoo_chart_data(yahoo_symbol)
             if direct_data:
                 current_price = direct_data["Current Price / LTP"]
@@ -171,6 +198,16 @@ def fetch_stock_data_failsafe():
                 low_price = direct_data["Low"]
                 prev_close = direct_data["Previous Close"]
                 volume = direct_data["Volume"]
+            else:
+                # Tier 3: Alpha Vantage Fallback
+                av_data = fetch_alpha_vantage_quote(stock_name)
+                if av_data:
+                    current_price = av_data["Current Price / LTP"]
+                    open_price = av_data["Open"]
+                    high_price = av_data["High"]
+                    low_price = av_data["Low"]
+                    prev_close = av_data["Previous Close"]
+                    volume = av_data["Volume"]
 
         all_data.append({
             "Symbol": stock_name,
@@ -185,8 +222,7 @@ def fetch_stock_data_failsafe():
     return pd.DataFrame(all_data)
 
 def background_update_job():
-    """Background execution scheduler task."""
-    logging.info("Executing background stock refresh...")
+    logging.info("Executing background update...")
     df_new = fetch_stock_data_failsafe()
 
     with CACHE_LOCK:
@@ -194,17 +230,16 @@ def background_update_job():
             DATA_CACHE["data"] = df_new
             DATA_CACHE["timestamp"] = datetime.now()
             DATA_CACHE["status"] = "Active"
-            logging.info("Data successfully loaded into cache.")
+            logging.info("Stock cache refreshed successfully.")
         else:
             DATA_CACHE["status"] = "Retrying in background..."
-            logging.warning("Data load incomplete. Retaining last valid cache.")
+            logging.warning("Data load returned empty results; preserving existing cache.")
 
-# --- BACKGROUND SCHEDULER INITIALIZATION ---
+# --- BACKGROUND SCHEDULER SETUP ---
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(background_update_job, 'interval', seconds=60)
 scheduler.start()
 
-# Trigger initial background fetch on boot
 threading.Thread(target=background_update_job, daemon=True).start()
 
 # --- FLASK APP ---
@@ -212,14 +247,14 @@ app = Flask(__name__)
 
 def format_dataframe_to_html_table(df):
     if df.empty:
-        return '<tr><td colspan="7" style="text-align: center; color: #1976d2; font-weight: bold;">Loading initial data from Yahoo Finance... Please refresh in a few seconds.</td></tr>', []
+        return '<tr><td colspan="7" style="text-align: center; color: #1976d2; font-weight: bold;">Loading initial data... Please refresh in a few seconds.</td></tr>', []
 
     formatted_df = df.copy()
     numeric_cols = formatted_df.columns.drop('Symbol')
     formatted_df = formatted_df.dropna(subset=numeric_cols, how='all').reset_index(drop=True)
 
     if formatted_df.empty:
-        return '<tr><td colspan="7" style="text-align: center; color: red;">No stock data currently available.</td></tr>', []
+        return '<tr><td colspan="7" style="text-align: center; color: red;">No stock data available.</td></tr>', []
 
     for col in ["Current Price / LTP", "Open", "High", "Low", "Previous Close"]:
         numeric_col = pd.to_numeric(formatted_df[col], errors='coerce')
@@ -299,7 +334,7 @@ def dashboard():
 <body>
     <div class="container">
         <h1>📈 Stock Financial Dashboard</h1>
-        <p>Real-time stock data from Yahoo Finance</p>
+        <p>Real-time stock data from Multi-Source Financial APIs</p>
         <div class="header-row">
             <a href="/download_csv" class="download-btn">📥 Download Raw Data (.csv)</a>
             <div class="info-box">
@@ -313,7 +348,7 @@ def dashboard():
             </table>
         </div>
         <div class="footer">
-            <p>Data provided by Yahoo Finance | Dashboard built with Python Flask & APScheduler</p>
+            <p>Data provided by Yahoo Finance & Alpha Vantage | Dashboard built with Python Flask & APScheduler</p>
         </div>
     </div>
 </body>
