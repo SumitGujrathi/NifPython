@@ -1,5 +1,5 @@
 flask
 pandas
 apscheduler
-curl_cffi
+upstox-python-sdk
 gunicorn
