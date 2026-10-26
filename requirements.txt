@@ -1,5 +1,4 @@
-flask
-pandas
-apscheduler
-upstox-python-sdk
-gunicorn
+requests
+gspread
+google-auth
+schedule
