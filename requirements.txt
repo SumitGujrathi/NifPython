@@ -2,4 +2,5 @@ flask
 pandas
 yfinance
 apscheduler
+requests
 gunicorn
