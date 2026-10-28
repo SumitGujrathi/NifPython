@@ -30,10 +30,8 @@ TOKEN_CACHE = {
 }
 
 # --- AUTOMATED TOKEN GENERATION FLOW ---
+# --- AUTOMATED TOKEN GENERATION FLOW ---
 def generate_upstox_token():
-    """
-    Automates Upstox OAuth2 login using TOTP to generate a fresh Access Token.
-    """
     if not all([CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, USER_ID, PIN, TOTP_KEY]):
         print("Error: Missing one or more required Upstox Environment Variables!")
         return None
@@ -44,9 +42,9 @@ def generate_upstox_token():
 
         session = requests.Session()
         session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/json",
+            "Api-Version": "2.0"
         })
 
         # Step 1: Request OTP
@@ -55,6 +53,7 @@ def generate_upstox_token():
             json={"user_id": USER_ID},
             timeout=10
         )
+        print(f"[Auth Step 1] OTP Request Status: {res_otp.status_code}")
         
         # Step 2: Verify PIN and TOTP
         res_verify = session.post(
@@ -62,6 +61,10 @@ def generate_upstox_token():
             json={"user_id": USER_ID, "pin": PIN, "otp": totp_code},
             timeout=10
         )
+        print(f"[Auth Step 2] Verify Status: {res_verify.status_code}")
+        if res_verify.status_code != 200:
+            print(f"[Auth Step 2 Error] {res_verify.text}")
+            return None
 
         # Step 3: Call Authorization Dialog
         encoded_redirect = urllib.parse.quote(REDIRECT_URI, safe='')
@@ -69,11 +72,15 @@ def generate_upstox_token():
         res_dialog = session.get(dialog_url, allow_redirects=False, timeout=10)
 
         location_header = res_dialog.headers.get("Location", "")
+        if not location_header:
+            print(f"[Auth Step 3 Error] No Location header. Dialog response: {res_dialog.status_code} - {res_dialog.text}")
+            return None
+
         parsed_url = urlparse(location_header)
         auth_code = parse_qs(parsed_url.query).get("code", [None])[0]
 
         if not auth_code:
-            print(f"[Auth Error] Failed to extract auth code. Location header: {location_header}")
+            print(f"[Auth Error] Failed to extract auth code from: {location_header}")
             return None
 
         # Step 4: Exchange Auth Code for Access Token
@@ -94,7 +101,7 @@ def generate_upstox_token():
             print("[Auth Success] Fresh Upstox Access Token generated!")
             return token
         else:
-            print(f"[Auth Error] Token Exchange failed ({res_token.status_code}): {res_token.text}")
+            print(f"[Auth Step 4 Error] Token Exchange failed: {res_token.text}")
 
     except Exception as e:
         print(f"[Auth Exception] Error during automated login: {e}")
@@ -102,20 +109,18 @@ def generate_upstox_token():
     return None
 
 def get_valid_token():
-    """
-    Returns existing cached token if valid, otherwise generates a fresh one.
-    """
-    # Tokens expire daily at 3:30 AM IST (max valid for 12 hours here before auto-refresh)
     if TOKEN_CACHE["access_token"] and (time.time() - TOKEN_CACHE["generated_at"] < 43200):
         return TOKEN_CACHE["access_token"]
-    
     return generate_upstox_token()
 
 # --- UPSTOX DATA FETCHING ---
 def fetch_option_chain(symbol):
+    """
+    Must ALWAYS return exactly 3 values: (chain_data, current_expiry, error_message)
+    """
     token = get_valid_token()
     if not token:
-        return None, 0, "N/A", "Failed to generate Upstox access token."
+        return None, None, "Failed to generate Upstox access token. Check Render logs for Auth errors."
 
     instrument_key = INSTRUMENT_KEYS.get(symbol, "NSE_INDEX|Nifty 50")
     headers = {
@@ -124,45 +129,45 @@ def fetch_option_chain(symbol):
     }
 
     try:
-        # Step 1: Get Expiry Dates
         expiry_url = f"https://api.upstox.com/v2/option/contract?instrument_key={urllib.parse.quote(instrument_key)}"
         exp_res = requests.get(expiry_url, headers=headers, timeout=10)
 
-        # Handle token expiration (HTTP 401) by force-regenerating once
         if exp_res.status_code == 401:
             print("[Auth] Token invalid/expired. Forcing regeneration...")
             token = generate_upstox_token()
+            if not token:
+                return None, None, "Token expired and regeneration failed."
             headers["Authorization"] = f"Bearer {token}"
             exp_res = requests.get(expiry_url, headers=headers, timeout=10)
 
         if exp_res.status_code != 200:
-            return None, 0, "N/A", f"Expiry contract lookup failed ({exp_res.status_code})"
+            return None, None, f"Expiry lookup failed: {exp_res.text}"
 
         expiries = sorted(list(set(item["expiry"] for item in exp_res.json().get("data", []))))
         if not expiries:
-            return None, 0, "N/A", "No option contract expiries found."
+            return None, None, "No option contract expiries found."
 
         current_expiry = expiries[0]
 
-        # Step 2: Fetch Option Chain
         chain_url = f"https://api.upstox.com/v2/option/chain?instrument_key={urllib.parse.quote(instrument_key)}&expiry_date={current_expiry}"
         chain_res = requests.get(chain_url, headers=headers, timeout=10)
 
         if chain_res.status_code != 200:
-            return None, 0, current_expiry, f"Option Chain fetch failed ({chain_res.status_code})"
+            return None, current_expiry, f"Option Chain fetch failed: {chain_res.text}"
 
         chain_data = chain_res.json().get("data", [])
         return chain_data, current_expiry, None
 
     except Exception as e:
-        return None, 0, "N/A", f"Exception during fetch: {e}"
+        return None, None, f"Exception during fetch: {e}"
 
 def process_option_data(symbol):
     chain_data, current_expiry, error = fetch_option_chain(symbol)
     updated_time = time.strftime("%m/%d/%Y %H:%M:%S")
 
+    # If there's an error, return empty rows but don't crash
     if error or not chain_data:
-        return [], 0, current_expiry, updated_time, error or "No option chain data available."
+        return [], 0, current_expiry or "N/A", updated_time, error or "No option chain data available."
 
     spot_price = chain_data[0].get("underlying_spot_price", 0) if chain_data else 0
     range_limit = 1200 if symbol == "BANKNIFTY" else 600
