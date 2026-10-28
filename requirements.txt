@@ -1,3 +1,6 @@
-flask
-playwright
-gunicorn
+requests
+pyotp
+gspread
+google-auth
+schedule
+urllib3
