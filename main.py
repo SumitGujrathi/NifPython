@@ -3,124 +3,76 @@ import time
 import io
 import csv
 import urllib.parse
-from urllib.parse import parse_qs, urlparse
 import requests
-import pyotp
-from flask import Flask, render_template_string, request, Response
+from flask import Flask, render_template_string, request, Response, redirect
 
 app = Flask(__name__)
 
 # --- ENVIRONMENT CONFIGURATION FROM RENDER ---
 CLIENT_ID = os.getenv("UPSTOX_CLIENT_ID")
 CLIENT_SECRET = os.getenv("UPSTOX_CLIENT_SECRET")
-REDIRECT_URI = os.getenv("UPSTOX_REDIRECT_URI", "http://127.0.0.1:5000/")
-USER_ID = os.getenv("UPSTOX_USER_ID")
-PIN = os.getenv("UPSTOX_PIN")
-TOTP_KEY = os.getenv("UPSTOX_TOTP_KEY")
+REDIRECT_URI = os.getenv("UPSTOX_REDIRECT_URI", "https://nifsumit.onrender.com/callback")
 
 INSTRUMENT_KEYS = {
     "NIFTY": "NSE_INDEX|Nifty 50",
     "BANKNIFTY": "NSE_INDEX|Nifty Bank"
 }
 
-# In-memory token cache
+# In-memory token storage
 TOKEN_CACHE = {
     "access_token": None,
     "generated_at": 0
 }
 
-# --- AUTOMATED TOKEN GENERATION FLOW ---
-# --- AUTOMATED TOKEN GENERATION FLOW ---
-def generate_upstox_token():
-    if not all([CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, USER_ID, PIN, TOTP_KEY]):
-        print("Error: Missing one or more required Upstox Environment Variables!")
-        return None
+# --- OAUTH AUTHENTICATION FLOW ---
+def get_login_url():
+    """Generates the official Upstox OAuth authorization URL."""
+    encoded_redirect = urllib.parse.quote(REDIRECT_URI, safe='')
+    return f"https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id={CLIENT_ID}&redirect_uri={encoded_redirect}"
+
+@app.route("/login")
+def login():
+    """Redirects user to official Upstox OAuth login screen."""
+    return redirect(get_login_url())
+
+@app.route("/callback")
+def callback():
+    """Handles callback from Upstox, exchanging code for Access Token."""
+    auth_code = request.args.get("code")
+    if not auth_code:
+        return "Authorization failed: No code provided in callback.", 400
+
+    token_url = "https://api.upstox.com/v2/login/authorization/token"
+    headers = {
+        "accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    payload = {
+        "code": auth_code,
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "redirect_uri": REDIRECT_URI,
+        "grant_type": "authorization_code"
+    }
 
     try:
-        print("[Auth] Generating TOTP code...")
-        totp_code = pyotp.TOTP(TOTP_KEY).now()
-
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "application/json",
-            "Api-Version": "2.0"
-        })
-
-        # Step 1: Request OTP
-        res_otp = session.post(
-            "https://api.upstox.com/v2/login/auth/token/request/otp",
-            json={"user_id": USER_ID},
-            timeout=10
-        )
-        print(f"[Auth Step 1] OTP Request Status: {res_otp.status_code}")
-        
-        # Step 2: Verify PIN and TOTP
-        res_verify = session.post(
-            "https://api.upstox.com/v2/login/auth/token/verify",
-            json={"user_id": USER_ID, "pin": PIN, "otp": totp_code},
-            timeout=10
-        )
-        print(f"[Auth Step 2] Verify Status: {res_verify.status_code}")
-        if res_verify.status_code != 200:
-            print(f"[Auth Step 2 Error] {res_verify.text}")
-            return None
-
-        # Step 3: Call Authorization Dialog
-        encoded_redirect = urllib.parse.quote(REDIRECT_URI, safe='')
-        dialog_url = f"https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id={CLIENT_ID}&redirect_uri={encoded_redirect}"
-        res_dialog = session.get(dialog_url, allow_redirects=False, timeout=10)
-
-        location_header = res_dialog.headers.get("Location", "")
-        if not location_header:
-            print(f"[Auth Step 3 Error] No Location header. Dialog response: {res_dialog.status_code} - {res_dialog.text}")
-            return None
-
-        parsed_url = urlparse(location_header)
-        auth_code = parse_qs(parsed_url.query).get("code", [None])[0]
-
-        if not auth_code:
-            print(f"[Auth Error] Failed to extract auth code from: {location_header}")
-            return None
-
-        # Step 4: Exchange Auth Code for Access Token
-        token_url = "https://api.upstox.com/v2/login/auth/token"
-        token_payload = {
-            "code": auth_code,
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "redirect_uri": REDIRECT_URI,
-            "grant_type": "authorization_code"
-        }
-
-        res_token = session.post(token_url, data=token_payload, timeout=10)
-        if res_token.status_code == 200:
-            token = res_token.json().get("access_token")
+        response = requests.post(token_url, headers=headers, data=payload, timeout=10)
+        if response.status_code == 200:
+            token = response.json().get("access_token")
             TOKEN_CACHE["access_token"] = token
             TOKEN_CACHE["generated_at"] = time.time()
-            print("[Auth Success] Fresh Upstox Access Token generated!")
-            return token
+            print("[Auth Success] Access token successfully cached!")
+            return redirect("/")
         else:
-            print(f"[Auth Step 4 Error] Token Exchange failed: {res_token.text}")
-
+            return f"Token exchange failed ({response.status_code}): {response.text}", 400
     except Exception as e:
-        print(f"[Auth Exception] Error during automated login: {e}")
+        return f"Callback Exception: {e}", 500
 
-    return None
-
-def get_valid_token():
-    if TOKEN_CACHE["access_token"] and (time.time() - TOKEN_CACHE["generated_at"] < 43200):
-        return TOKEN_CACHE["access_token"]
-    return generate_upstox_token()
-
-# --- UPSTOX DATA FETCHING ---
+# --- DATA FETCHING ---
 def fetch_option_chain(symbol):
-    """
-    Must ALWAYS return exactly 3 values: (chain_data, current_expiry, error_message)
-    """
-    token = get_valid_token()
+    token = TOKEN_CACHE.get("access_token")
     if not token:
-        return None, None, "Failed to generate Upstox access token. Check Render logs for Auth errors."
+        return None, None, "Token missing. Click 'Login with Upstox' to authenticate."
 
     instrument_key = INSTRUMENT_KEYS.get(symbol, "NSE_INDEX|Nifty 50")
     headers = {
@@ -133,19 +85,15 @@ def fetch_option_chain(symbol):
         exp_res = requests.get(expiry_url, headers=headers, timeout=10)
 
         if exp_res.status_code == 401:
-            print("[Auth] Token invalid/expired. Forcing regeneration...")
-            token = generate_upstox_token()
-            if not token:
-                return None, None, "Token expired and regeneration failed."
-            headers["Authorization"] = f"Bearer {token}"
-            exp_res = requests.get(expiry_url, headers=headers, timeout=10)
+            TOKEN_CACHE["access_token"] = None
+            return None, None, "Session expired. Click 'Login with Upstox' to re-authenticate."
 
         if exp_res.status_code != 200:
-            return None, None, f"Expiry lookup failed: {exp_res.text}"
+            return None, None, f"Expiry lookup failed ({exp_res.status_code}): {exp_res.text}"
 
         expiries = sorted(list(set(item["expiry"] for item in exp_res.json().get("data", []))))
         if not expiries:
-            return None, None, "No option contract expiries found."
+            return None, None, "No active option contract expiries found."
 
         current_expiry = expiries[0]
 
@@ -155,17 +103,15 @@ def fetch_option_chain(symbol):
         if chain_res.status_code != 200:
             return None, current_expiry, f"Option Chain fetch failed: {chain_res.text}"
 
-        chain_data = chain_res.json().get("data", [])
-        return chain_data, current_expiry, None
+        return chain_res.json().get("data", []), current_expiry, None
 
     except Exception as e:
-        return None, None, f"Exception during fetch: {e}"
+        return None, None, f"Exception during data fetch: {e}"
 
 def process_option_data(symbol):
     chain_data, current_expiry, error = fetch_option_chain(symbol)
     updated_time = time.strftime("%m/%d/%Y %H:%M:%S")
 
-    # If there's an error, return empty rows but don't crash
     if error or not chain_data:
         return [], 0, current_expiry or "N/A", updated_time, error or "No option chain data available."
 
@@ -211,6 +157,7 @@ HTML_TEMPLATE = """
         .info-box { background: #fff; padding: 16px; border-radius: 6px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.08); }
         .btn { display: inline-block; padding: 9px 18px; color: #fff; background-color: #007bff; text-decoration: none; border-radius: 4px; margin-right: 10px; font-weight: 500; }
         .btn-success { background-color: #28a745; }
+        .btn-warning { background-color: #ffc107; color: #212529; }
         .btn:hover { opacity: 0.9; }
         table { width: 100%; border-collapse: collapse; background: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
         th, td { border: 1px solid #e0e0e0; padding: 9px; text-align: center; font-size: 14px; }
@@ -219,7 +166,7 @@ HTML_TEMPLATE = """
         .atm { background-color: #fff3cd !important; font-weight: bold; color: #856404; }
         .ce-header { background-color: #28a745 !important; }
         .pe-header { background-color: #dc3545 !important; }
-        .error-msg { color: #dc3545; font-weight: bold; padding: 12px; background: #f8d7da; border-radius: 4px; }
+        .error-msg { color: #856404; font-weight: bold; padding: 12px; background: #fff3cd; border: 1px solid #ffeeba; border-radius: 4px; margin-top: 15px; }
     </style>
 </head>
 <body>
@@ -233,10 +180,14 @@ HTML_TEMPLATE = """
         <a href="/?symbol=NIFTY" class="btn">View NIFTY</a>
         <a href="/?symbol=BANKNIFTY" class="btn">View BANKNIFTY</a>
         <a href="/download?symbol={{ symbol }}" class="btn btn-success">Download CSV</a>
+        <a href="/login" class="btn btn-warning">Login with Upstox</a>
     </div>
 
     {% if error %}
-        <div class="error-msg">Error: {{ error }}</div>
+        <div class="error-msg">
+            {{ error }}<br><br>
+            <a href="/login" class="btn btn-warning">Click Here to Login & Activate Token</a>
+        </div>
     {% else %}
     <table>
         <thead>
@@ -302,8 +253,4 @@ def download_csv():
             cw.writerow([r["ce_oi"], r["ce_vol"], r["ce_iv"], r["ce_ltp"], r["strike"], r["pe_ltp"], r["pe_iv"], r["pe_vol"], r["pe_oi"]])
 
     output = Response(si.getvalue(), mimetype="text/csv")
-    output.headers["Content-Disposition"] = f"attachment; filename={symbol}_Option_Chain.csv"
-    return output
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    output.headers["Content-Disposition"] =
