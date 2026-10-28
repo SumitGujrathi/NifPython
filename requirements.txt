@@ -1,6 +1,4 @@
+flask
 requests
 pyotp
-gspread
-google-auth
-schedule
-urllib3
+gunicorn
