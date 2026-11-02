@@ -3,7 +3,6 @@ import time
 import io
 import csv
 import urllib.parse
-from urllib.parse import parse_qs, urlparse
 import requests
 import pyotp
 from flask import Flask, render_template_string, request, Response
@@ -11,48 +10,44 @@ from flask import Flask, render_template_string, request, Response
 # --- FLASK APP INITIALIZATION ---
 app = Flask(__name__)
 
-# --- ENVIRONMENT CONFIGURATION (RENDER / LOCAL FALLBACK) ---
-# Environment variables take precedence on Render. Replace fallbacks only for local testing.
-CLIENT_ID = os.getenv("UPSTOX_CLIENT_ID", "77d6182d-2b30-4aed-9f32-0759c5507d04")
-CLIENT_SECRET = os.getenv("UPSTOX_CLIENT_SECRET", "6be1bsmlph")
+# --- ENVIRONMENT CONFIGURATION FROM RENDER ---
+CLIENT_ID = os.getenv("UPSTOX_CLIENT_ID")
+CLIENT_SECRET = os.getenv("UPSTOX_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("UPSTOX_REDIRECT_URI", "http://127.0.0.1:5000/")
-USER_ID = os.getenv("UPSTOX_USER_ID", "865921")
-PIN = os.getenv("UPSTOX_PIN", "860045")
-TOTP_KEY = os.getenv("UPSTOX_TOTP_KEY", "2NEAOZERWFTBDVJ5RV2D7MOJCABR35FC")
+USER_ID = os.getenv("UPSTOX_USER_ID")
+PIN = os.getenv("UPSTOX_PIN")
+TOTP_KEY = os.getenv("UPSTOX_TOTP_KEY")
 
 INSTRUMENT_KEYS = {
     "NIFTY": "NSE_INDEX|Nifty 50",
     "BANKNIFTY": "NSE_INDEX|Nifty Bank"
 }
 
+# In-memory token cache
 TOKEN_CACHE = {
     "access_token": None,
     "generated_at": 0
 }
 
+# --- AUTOMATED DIRECT TOTP TOKEN GENERATION ---
 def generate_upstox_token():
     """
-    Automates Upstox login using the dedicated TOTP API endpoint.
-    Includes full variable sanitization for CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, PIN, and TOTP_KEY.
+    Generates Upstox Access Token directly in a single request using TOTP and PIN.
     """
-    if not all([CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, USER_ID, PIN, TOTP_KEY]):
-        print("[Auth Error] Missing required Upstox configuration credentials.")
+    if not all([CLIENT_ID, USER_ID, PIN, TOTP_KEY]):
+        print("[Auth Error] Missing one or more required Upstox Environment Variables!")
         return None
 
     try:
-        # Strict string sanitization to eliminate space/newline issues
-        clean_client_id = str(CLIENT_ID).strip()
-        clean_client_secret = str(CLIENT_SECRET).strip()
-        clean_redirect_uri = str(REDIRECT_URI).strip()
+        # Format clean Base32 TOTP secret and 6-digit PIN
         clean_totp_key = str(TOTP_KEY).strip().upper().replace(" ", "").replace("-", "")
-        clean_pin = str(PIN).strip()
-
         totp_code = str(pyotp.TOTP(clean_totp_key).now()).zfill(6)
-        print(f"[Auth Diagnostic] Generated 6-Digit TOTP Code: {totp_code}")
+        clean_pin = str(PIN).strip()
+        clean_client_id = str(CLIENT_ID).strip()
 
-        session = requests.Session()
+        print(f"[Auth Diagnostic] Calculated TOTP: {totp_code}")
 
-        # Step 1: Submit TOTP & PIN directly to Upstox TOTP API
+        # Single Direct TOTP Login Request
         totp_url = "https://api.upstox.com/v2/totp-login/authorization/token"
         headers = {
             "accept": "application/json",
@@ -64,61 +59,27 @@ def generate_upstox_token():
             "pin": clean_pin
         }
 
-        print("[Auth Step 1] Submitting TOTP and PIN to Upstox...")
-        res_totp = session.post(totp_url, json=payload, headers=headers, timeout=10)
-        print(f"[Auth Step 1 Response] Status Code: {res_totp.status_code}")
+        print("[Auth] Submitting TOTP and PIN directly to Upstox...")
+        res = requests.post(totp_url, json=payload, headers=headers, timeout=10)
+        print(f"[Auth Response] Status Code: {res.status_code}")
 
-        if res_totp.status_code != 200:
-            print(f"[Auth Step 1 Error] Verification failed: {res_totp.text}")
-            return None
-
-        # Step 2: Request Authorization Code
-        encoded_redirect = urllib.parse.quote(clean_redirect_uri, safe='')
-        dialog_url = f"https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id={clean_client_id}&redirect_uri={encoded_redirect}"
-
-        print(f"[Auth Step 2] Requesting Authorization Dialog using Redirect URI: '{clean_redirect_uri}'...")
-        res_dialog = session.get(dialog_url, allow_redirects=False, timeout=10)
-        
-        location_header = res_dialog.headers.get("Location", "")
-        if not location_header:
-            print(f"[Auth Step 2 Error] No Location header returned ({res_dialog.status_code}): {res_dialog.text}")
-            return None
-
-        parsed_url = urlparse(location_header)
-        auth_code = parse_qs(parsed_url.query).get("code", [None])[0]
-
-        if not auth_code:
-            print(f"[Auth Step 2 Error] Failed to extract auth code from Location header: {location_header}")
-            return None
-
-        # Step 3: Exchange Auth Code for Access Token
-        token_url = "https://api.upstox.com/v2/login/authorization/token"
-        token_headers = {
-            "accept": "application/json",
-            "Content-Type": "application/x-www-form-urlencoded"
-        }
-        token_payload = {
-            "code": auth_code,
-            "client_id": clean_client_id,
-            "client_secret": clean_client_secret,
-            "redirect_uri": clean_redirect_uri,
-            "grant_type": "authorization_code"
-        }
-
-        print("[Auth Step 3] Exchanging Auth Code for Access Token...")
-        res_token = session.post(token_url, data=token_payload, headers=token_headers, timeout=10)
-
-        if res_token.status_code == 200:
-            token = res_token.json().get("access_token")
-            TOKEN_CACHE["access_token"] = token
-            TOKEN_CACHE["generated_at"] = time.time()
-            print("[Auth Success] Fresh Upstox Access Token generated successfully!")
-            return token
+        if res.status_code == 200:
+            json_data = res.json()
+            # Upstox returns access_token directly in response
+            token = json_data.get("access_token") or json_data.get("data", {}).get("access_token")
+            
+            if token:
+                TOKEN_CACHE["access_token"] = token
+                TOKEN_CACHE["generated_at"] = time.time()
+                print("[Auth Success] Fresh Upstox Access Token obtained directly!")
+                return token
+            else:
+                print(f"[Auth Error] Status 200 but access_token missing in JSON: {res.text}")
         else:
-            print(f"[Auth Step 3 Error] Token Exchange failed ({res_token.status_code}): {res_token.text}")
+            print(f"[Auth Error] TOTP login failed ({res.status_code}): {res.text}")
 
     except Exception as e:
-        print(f"[Auth Exception] Exception during automated login: {e}")
+        print(f"[Auth Exception] Error during automated TOTP login: {e}")
 
     return None
 
