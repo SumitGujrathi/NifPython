@@ -30,32 +30,34 @@ TOKEN_CACHE = {
     "generated_at": 0
 }
 
-# --- AUTOMATED TOKEN GENERATION FLOW ---
 def generate_upstox_token():
     """
     Automates Upstox login using the dedicated TOTP API endpoint.
-    Sanitizes PIN and TOTP Key strings to prevent formatting mismatch.
+    Includes full variable sanitization for CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, PIN, and TOTP_KEY.
     """
     if not all([CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, USER_ID, PIN, TOTP_KEY]):
         print("[Auth Error] Missing required Upstox configuration credentials.")
         return None
 
     try:
-        # Sanitize Base32 TOTP Key (remove spaces/dashes, uppercase)
+        # Strict string sanitization to eliminate space/newline issues
+        clean_client_id = str(CLIENT_ID).strip()
+        clean_client_secret = str(CLIENT_SECRET).strip()
+        clean_redirect_uri = str(REDIRECT_URI).strip()
         clean_totp_key = str(TOTP_KEY).strip().upper().replace(" ", "").replace("-", "")
-        totp_code = str(pyotp.TOTP(clean_totp_key).now()).zfill(6)
         clean_pin = str(PIN).strip()
 
+        totp_code = str(pyotp.TOTP(clean_totp_key).now()).zfill(6)
         print(f"[Auth Diagnostic] Generated 6-Digit TOTP Code: {totp_code}")
 
         session = requests.Session()
 
-        # Step 1: Submit TOTP & PIN directly to Upstox TOTP Login API
+        # Step 1: Submit TOTP & PIN directly to Upstox TOTP API
         totp_url = "https://api.upstox.com/v2/totp-login/authorization/token"
         headers = {
             "accept": "application/json",
             "Content-Type": "application/json",
-            "x-api-key": str(CLIENT_ID).strip()
+            "x-api-key": clean_client_id
         }
         payload = {
             "totp": totp_code,
@@ -71,10 +73,10 @@ def generate_upstox_token():
             return None
 
         # Step 2: Request Authorization Code
-        encoded_redirect = urllib.parse.quote(REDIRECT_URI, safe='')
-        dialog_url = f"https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id={CLIENT_ID}&redirect_uri={encoded_redirect}"
+        encoded_redirect = urllib.parse.quote(clean_redirect_uri, safe='')
+        dialog_url = f"https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id={clean_client_id}&redirect_uri={encoded_redirect}"
 
-        print("[Auth Step 2] Requesting Authorization Dialog...")
+        print(f"[Auth Step 2] Requesting Authorization Dialog using Redirect URI: '{clean_redirect_uri}'...")
         res_dialog = session.get(dialog_url, allow_redirects=False, timeout=10)
         
         location_header = res_dialog.headers.get("Location", "")
@@ -97,9 +99,9 @@ def generate_upstox_token():
         }
         token_payload = {
             "code": auth_code,
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "redirect_uri": REDIRECT_URI,
+            "client_id": clean_client_id,
+            "client_secret": clean_client_secret,
+            "redirect_uri": clean_redirect_uri,
             "grant_type": "authorization_code"
         }
 
