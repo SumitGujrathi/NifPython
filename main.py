@@ -15,12 +15,12 @@ app = Flask(__name__)
 # HARDCODED TEST CONFIGURATION
 # Replace the placeholder values inside the quotes with your actual credentials.
 # ==============================================================================
-CLIENT_ID = "YOUR_UPSTOX_API_KEY_HERE"        # Your Upstox API Key
-CLIENT_SECRET = "YOUR_UPSTOX_API_SECRET_HERE"  # Your Upstox API Secret
+CLIENT_ID = "77d6182d-2b30-4aed-9f32-0759c5507d04"        # Your Upstox API Key
+CLIENT_SECRET = "6be1bsmlph"  # Your Upstox API Secret
 REDIRECT_URI = "http://127.0.0.1:5000/"        # Must match Upstox app settings exactly
-USER_ID = "YOUR_UPSTOX_USER_ID_HERE"           # Your Upstox UCC / Client ID
-PIN = "YOUR_UPSTOX_6_DIGIT_PIN_HERE"           # Your 6-digit Upstox PIN
-TOTP_KEY = "YOUR_32_CHAR_TOTP_KEY_HERE"        # 32-char secret key from Upstox 2FA setup (NOT 6-digit OTP)
+USER_ID = "8983685228"           # Your Upstox UCC / Client ID
+PIN = "860045"           # Your 6-digit Upstox PIN
+TOTP_KEY = "3SRLS4DV7PP3TVXAXWIQ6WIOB6Z3YF7F"        # 32-char secret key from Upstox 2FA setup (NOT 6-digit OTP)
 # ==============================================================================
 
 INSTRUMENT_KEYS = {
