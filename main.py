@@ -11,17 +11,14 @@ from flask import Flask, render_template_string, request, Response
 # --- FLASK APP INITIALIZATION ---
 app = Flask(__name__)
 
-# ==============================================================================
-# HARDCODED TEST CONFIGURATION
-# Replace the placeholder values inside the quotes with your actual credentials.
-# ==============================================================================
-CLIENT_ID = "77d6182d-2b30-4aed-9f32-0759c5507d04"        # Your Upstox API Key
-CLIENT_SECRET = "6be1bsmlph"  # Your Upstox API Secret
-REDIRECT_URI = "http://127.0.0.1:5000/"        # Must match Upstox app settings exactly
-USER_ID = "8983685228"           # Your Upstox UCC / Client ID
-PIN = "860045"           # Your 6-digit Upstox PIN
-TOTP_KEY = "3SRLS4DV7PP3TVXAXWIQ6WIOB6Z3YF7F"        # 32-char secret key from Upstox 2FA setup (NOT 6-digit OTP)
-# ==============================================================================
+# --- ENVIRONMENT CONFIGURATION (RENDER / LOCAL FALLBACK) ---
+# Environment variables take precedence on Render. Replace fallbacks only for local testing.
+CLIENT_ID = os.getenv("UPSTOX_CLIENT_ID", "77d6182d-2b30-4aed-9f32-0759c5507d04")
+CLIENT_SECRET = os.getenv("UPSTOX_CLIENT_SECRET", "6be1bsmlph")
+REDIRECT_URI = os.getenv("UPSTOX_REDIRECT_URI", "http://127.0.0.1:5000/")
+USER_ID = os.getenv("UPSTOX_USER_ID", "865921")
+PIN = os.getenv("UPSTOX_PIN", "860045")
+TOTP_KEY = os.getenv("UPSTOX_TOTP_KEY", "3SRLS4DV7PP3TVXAXWIQ6WIOB6Z3YF7F")
 
 INSTRUMENT_KEYS = {
     "NIFTY": "NSE_INDEX|Nifty 50",
@@ -33,25 +30,27 @@ TOKEN_CACHE = {
     "generated_at": 0
 }
 
+# --- AUTOMATED TOKEN GENERATION FLOW ---
 def generate_upstox_token():
     """
     Automates Upstox login using the dedicated TOTP API endpoint.
+    Sanitizes PIN and TOTP Key strings to prevent formatting mismatch.
     """
-    if "YOUR_" in CLIENT_ID or "YOUR_" in TOTP_KEY:
-        print("[Auth Error] Please update the hardcoded credentials in main.py!")
+    if not all([CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, USER_ID, PIN, TOTP_KEY]):
+        print("[Auth Error] Missing required Upstox configuration credentials.")
         return None
 
     try:
-        # Sanitize TOTP key string and calculate current 6-digit TOTP code
-        clean_totp_key = str(TOTP_KEY).strip().upper().replace(" ", "")
+        # Sanitize Base32 TOTP Key (remove spaces/dashes, uppercase)
+        clean_totp_key = str(TOTP_KEY).strip().upper().replace(" ", "").replace("-", "")
         totp_code = str(pyotp.TOTP(clean_totp_key).now()).zfill(6)
         clean_pin = str(PIN).strip()
 
-        print(f"[Auth Diagnostic] Calculated 6-Digit TOTP Code: {totp_code}")
+        print(f"[Auth Diagnostic] Generated 6-Digit TOTP Code: {totp_code}")
 
         session = requests.Session()
 
-        # Step 1: Submit TOTP & PIN directly to Upstox TOTP API
+        # Step 1: Submit TOTP & PIN directly to Upstox TOTP Login API
         totp_url = "https://api.upstox.com/v2/totp-login/authorization/token"
         headers = {
             "accept": "application/json",
@@ -63,12 +62,12 @@ def generate_upstox_token():
             "pin": clean_pin
         }
 
-        print("[Auth Step 1] Submitting TOTP and PIN...")
+        print("[Auth Step 1] Submitting TOTP and PIN to Upstox...")
         res_totp = session.post(totp_url, json=payload, headers=headers, timeout=10)
         print(f"[Auth Step 1 Response] Status Code: {res_totp.status_code}")
 
         if res_totp.status_code != 200:
-            print(f"[Auth Step 1 Error] TOTP verification failed: {res_totp.text}")
+            print(f"[Auth Step 1 Error] Verification failed: {res_totp.text}")
             return None
 
         # Step 2: Request Authorization Code
