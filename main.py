@@ -34,18 +34,20 @@ TOKEN_CACHE = {
 def generate_upstox_token():
     """
     Automates Upstox login using the dedicated TOTP API endpoint.
-    Includes explicit sanitization and string formatting for PIN and TOTP.
+    Includes Base32 cleaning for pyotp and diagnostic logging.
     """
     if not all([CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, USER_ID, PIN, TOTP_KEY]):
         print("[Auth Error] Missing one or more required Upstox Environment Variables!")
         return None
 
     try:
-        print("[Auth] Generating TOTP code...")
-        # Sanitize TOTP key string and force 6-digit TOTP format
-        clean_totp_key = str(TOTP_KEY).strip().replace(" ", "")
-        totp_code = str(pyotp.TOTP(clean_totp_key).now()).zfill(6)
+        # Clean Base32 TOTP secret string and force 6-digit zero-padded TOTP code
+        clean_totp_key = str(TOTP_KEY).strip().upper().replace(" ", "")
+        totp_gen = pyotp.TOTP(clean_totp_key)
+        totp_code = str(totp_gen.now()).zfill(6)
         clean_pin = str(PIN).strip()
+
+        print(f"[Auth Diagnostic] Generated 6-Digit TOTP Code: {totp_code}")
 
         session = requests.Session()
 
@@ -54,16 +56,16 @@ def generate_upstox_token():
         headers = {
             "accept": "application/json",
             "Content-Type": "application/json",
-            "x-api-key": CLIENT_ID
+            "x-api-key": str(CLIENT_ID).strip()
         }
         payload = {
             "totp": totp_code,
             "pin": clean_pin
         }
 
-        print("[Auth Step 1] Submitting TOTP and PIN...")
+        print("[Auth Step 1] Submitting TOTP and PIN to Upstox...")
         res_totp = session.post(totp_url, json=payload, headers=headers, timeout=10)
-        print(f"[Auth Step 1] Status Code: {res_totp.status_code}")
+        print(f"[Auth Step 1 Response] Status Code: {res_totp.status_code}")
 
         if res_totp.status_code != 200:
             print(f"[Auth Step 1 Error] TOTP verification failed: {res_totp.text}")
