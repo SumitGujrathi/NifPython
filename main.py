@@ -34,6 +34,7 @@ TOKEN_CACHE = {
 def generate_upstox_token():
     """
     Automates Upstox login using the dedicated TOTP API endpoint.
+    Includes explicit sanitization and string formatting for PIN and TOTP.
     """
     if not all([CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, USER_ID, PIN, TOTP_KEY]):
         print("[Auth Error] Missing one or more required Upstox Environment Variables!")
@@ -41,7 +42,10 @@ def generate_upstox_token():
 
     try:
         print("[Auth] Generating TOTP code...")
-        totp_code = pyotp.TOTP(TOTP_KEY).now()
+        # Sanitize TOTP key string and force 6-digit TOTP format
+        clean_totp_key = str(TOTP_KEY).strip().replace(" ", "")
+        totp_code = str(pyotp.TOTP(clean_totp_key).now()).zfill(6)
+        clean_pin = str(PIN).strip()
 
         session = requests.Session()
 
@@ -54,7 +58,7 @@ def generate_upstox_token():
         }
         payload = {
             "totp": totp_code,
-            "pin": PIN
+            "pin": clean_pin
         }
 
         print("[Auth Step 1] Submitting TOTP and PIN...")
