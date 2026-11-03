@@ -2,6 +2,7 @@ import os
 import time
 import io
 import csv
+import json
 import urllib.parse
 import requests
 import pyotp
@@ -18,23 +19,56 @@ USER_ID = os.getenv("UPSTOX_USER_ID")
 PIN = os.getenv("UPSTOX_PIN")
 TOTP_KEY = os.getenv("UPSTOX_TOTP_KEY")
 
+CACHE_FILE_PATH = "/tmp/upstox_token_cache.json"
+
 INSTRUMENT_KEYS = {
     "NIFTY": "NSE_INDEX|Nifty 50",
     "BANKNIFTY": "NSE_INDEX|Nifty Bank"
 }
 
-TOKEN_CACHE = {
-    "access_token": None,
-    "generated_at": 0
+# Failure Guardrail: Memory lock to prevent rapid retries if auth fails
+AUTH_COOLDOWN = {
+    "last_failure_time": 0,
+    "cooldown_duration": 900  # 15 minutes lockout on failure
 }
 
-# --- AUTOMATED DIRECT TOTP TOKEN GENERATION ---
+def load_cached_token():
+    """Reads access token from disk cache to persist across Render restarts."""
+    try:
+        if os.path.exists(CACHE_FILE_PATH):
+            with open(CACHE_FILE_PATH, "r") as f:
+                data = json.load(f)
+                # Check if token is less than 12 hours old
+                if time.time() - data.get("generated_at", 0) < 43200:
+                    return data.get("access_token")
+    except Exception as e:
+        print(f"[Cache Warning] Failed to read token cache: {e}")
+    return None
+
+def save_token_to_cache(token):
+    """Saves access token to disk cache."""
+    try:
+        with open(CACHE_FILE_PATH, "w") as f:
+            json.dump({
+                "access_token": token,
+                "generated_at": time.time()
+            }, f)
+    except Exception as e:
+        print(f"[Cache Warning] Failed to write token cache: {e}")
+
 def generate_upstox_token():
     """
-    Generates Upstox Access Token directly in a single request using TOTP and PIN.
+    Automates TOTP login with strict security circuit breaker to prevent account locks.
     """
+    # Check circuit breaker cooldown
+    current_time = time.time()
+    if current_time - AUTH_COOLDOWN["last_failure_time"] < AUTH_COOLDOWN["cooldown_duration"]:
+        remaining = int(AUTH_COOLDOWN["cooldown_duration"] - (current_time - AUTH_COOLDOWN["last_failure_time"]))
+        print(f"[Auth Security Lock] Cooldown active! Skipping login attempt. Retry in {remaining} seconds.")
+        return None
+
     if not all([CLIENT_ID, USER_ID, PIN, TOTP_KEY]):
-        print("[Auth Error] Missing one or more required Upstox Environment Variables!")
+        print("[Auth Error] Missing required environment variables.")
         return None
 
     try:
@@ -54,30 +88,38 @@ def generate_upstox_token():
             "pin": clean_pin
         }
 
+        print("[Auth Attempt] Submitting TOTP and PIN to Upstox...")
         res = requests.post(totp_url, json=payload, headers=headers, timeout=10)
 
         if res.status_code == 200:
             json_data = res.json()
             token = json_data.get("access_token") or json_data.get("data", {}).get("access_token")
             if token:
-                TOKEN_CACHE["access_token"] = token
-                TOKEN_CACHE["generated_at"] = time.time()
+                save_token_to_cache(token)
+                print("[Auth Success] Token obtained and saved to persistent cache.")
                 return token
+        
+        # Log failure and trigger 15-minute security cooldown
+        print(f"[Auth Failed] Upstox returned status {res.status_code}: {res.text}")
+        AUTH_COOLDOWN["last_failure_time"] = time.time()
+
     except Exception as e:
-        print(f"[Auth Exception] Error during automated login: {e}")
+        print(f"[Auth Exception] Login error: {e}")
+        AUTH_COOLDOWN["last_failure_time"] = time.time()
 
     return None
 
 def get_valid_token():
-    if TOKEN_CACHE["access_token"] and (time.time() - TOKEN_CACHE["generated_at"] < 43200):
-        return TOKEN_CACHE["access_token"]
+    cached = load_cached_token()
+    if cached:
+        return cached
     return generate_upstox_token()
 
 # --- UPSTOX DATA FETCHING ---
 def fetch_option_chain(symbol):
     token = get_valid_token()
     if not token:
-        return None, None, "Failed to generate Upstox access token. Check server logs for details."
+        return None, None, "Authentication paused to protect account from lockout. Check server logs or wait 15 mins."
 
     instrument_key = INSTRUMENT_KEYS.get(symbol, "NSE_INDEX|Nifty 50")
     headers = {
@@ -90,9 +132,12 @@ def fetch_option_chain(symbol):
         exp_res = requests.get(expiry_url, headers=headers, timeout=10)
 
         if exp_res.status_code == 401:
+            print("[Auth] Token rejected (401). Invalidating cache and attempting single re-auth...")
+            if os.path.exists(CACHE_FILE_PATH):
+                os.remove(CACHE_FILE_PATH)
             token = generate_upstox_token()
             if not token:
-                return None, None, "Token expired and regeneration failed."
+                return None, None, "Token expired and re-authentication paused for safety."
             headers["Authorization"] = f"Bearer {token}"
             exp_res = requests.get(expiry_url, headers=headers, timeout=10)
 
@@ -142,7 +187,6 @@ def process_option_data(symbol):
         pe_mkt = pe.get("market_data", {}) or {}
         pe_greek = pe.get("option_greeks", {}) or {}
 
-        # Accumulate total OI for global PCR calculation
         c_oi = ce_mkt.get("oi", 0) or 0
         p_oi = pe_mkt.get("oi", 0) or 0
         total_ce_oi += c_oi
@@ -151,7 +195,6 @@ def process_option_data(symbol):
         if abs(strike - spot_price) <= range_limit:
             rows.append({
                 "strike": strike,
-                # CE Data
                 "ce_oi": c_oi,
                 "ce_vol": ce_mkt.get("volume", 0) or 0,
                 "ce_iv": round(ce_greek.get("iv", 0) or 0, 2),
@@ -162,7 +205,6 @@ def process_option_data(symbol):
                 "ce_theta": round(ce_greek.get("theta", 0) or 0, 2),
                 "ce_vega": round(ce_greek.get("vega", 0) or 0, 2),
                 "ce_gamma": round(ce_greek.get("gamma", 0) or 0, 4),
-                # PE Data
                 "pe_ltp": pe_mkt.get("ltp", 0) or 0,
                 "pe_bid": pe_mkt.get("bid_price", 0) or 0,
                 "pe_ask": pe_mkt.get("ask_price", 0) or 0,
@@ -175,12 +217,10 @@ def process_option_data(symbol):
                 "pe_gamma": round(pe_greek.get("gamma", 0) or 0, 4),
             })
 
-    # Calculate Put-Call Ratio (PCR)
     pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 0
-
     return rows, spot_price, current_expiry, updated_time, pcr, total_ce_oi, total_pe_oi, None
 
-# --- ENHANCED HTML DASHBOARD TEMPLATE ---
+# --- HTML TEMPLATE ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
