@@ -8,10 +8,8 @@ import requests
 import pyotp
 from flask import Flask, render_template_string, request, Response
 
-# --- FLASK APP INITIALIZATION ---
 app = Flask(__name__)
 
-# --- ENVIRONMENT CONFIGURATION FROM RENDER ---
 CLIENT_ID = os.getenv("UPSTOX_CLIENT_ID")
 CLIENT_SECRET = os.getenv("UPSTOX_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("UPSTOX_REDIRECT_URI", "http://127.0.0.1:5000/")
@@ -26,27 +24,23 @@ INSTRUMENT_KEYS = {
     "BANKNIFTY": "NSE_INDEX|Nifty Bank"
 }
 
-# Failure Guardrail: Memory lock to prevent rapid retries if auth fails
 AUTH_COOLDOWN = {
     "last_failure_time": 0,
-    "cooldown_duration": 900  # 15 minutes lockout on failure
+    "cooldown_duration": 900
 }
 
 def load_cached_token():
-    """Reads access token from disk cache to persist across Render restarts."""
     try:
         if os.path.exists(CACHE_FILE_PATH):
             with open(CACHE_FILE_PATH, "r") as f:
                 data = json.load(f)
-                # Check if token is less than 12 hours old
                 if time.time() - data.get("generated_at", 0) < 43200:
                     return data.get("access_token")
     except Exception as e:
-        print(f"[Cache Warning] Failed to read token cache: {e}")
+        print(f"[Cache Warning] Read error: {e}")
     return None
 
 def save_token_to_cache(token):
-    """Saves access token to disk cache."""
     try:
         with open(CACHE_FILE_PATH, "w") as f:
             json.dump({
@@ -54,28 +48,36 @@ def save_token_to_cache(token):
                 "generated_at": time.time()
             }, f)
     except Exception as e:
-        print(f"[Cache Warning] Failed to write token cache: {e}")
+        print(f"[Cache Warning] Write error: {e}")
 
-def generate_upstox_token():
+def run_diagnostic_auth(force_test=False):
     """
-    Automates TOTP login with strict security circuit breaker to prevent account locks.
+    Executes TOTP Auth and logs precise diagnostic information.
     """
-    # Check circuit breaker cooldown
     current_time = time.time()
-    if current_time - AUTH_COOLDOWN["last_failure_time"] < AUTH_COOLDOWN["cooldown_duration"]:
+    
+    if not force_test and (current_time - AUTH_COOLDOWN["last_failure_time"] < AUTH_COOLDOWN["cooldown_duration"]):
         remaining = int(AUTH_COOLDOWN["cooldown_duration"] - (current_time - AUTH_COOLDOWN["last_failure_time"]))
-        print(f"[Auth Security Lock] Cooldown active! Skipping login attempt. Retry in {remaining} seconds.")
-        return None
+        print(f"[Auth Safety] Cooldown active. Skipping request. Retry in {remaining}s or visit /test-auth.")
+        return None, f"Cooldown active ({remaining}s remaining). Visit /test-auth to bypass."
 
     if not all([CLIENT_ID, USER_ID, PIN, TOTP_KEY]):
-        print("[Auth Error] Missing required environment variables.")
-        return None
+        msg = "[Auth Error] One or more Render environment variables are missing."
+        print(msg)
+        return None, msg
 
     try:
         clean_totp_key = str(TOTP_KEY).strip().upper().replace(" ", "").replace("-", "")
         totp_code = str(pyotp.TOTP(clean_totp_key).now()).zfill(6)
         clean_pin = str(PIN).strip()
         clean_client_id = str(CLIENT_ID).strip()
+
+        print("=" * 60)
+        print("[AUTH DIAGNOSTICS]")
+        print(f"Client ID: {clean_client_id[:4]}...{clean_client_id[-4:] if len(clean_client_id)>8 else ''}")
+        print(f"Calculated TOTP Code: {totp_code}")
+        print(f"PIN Length: {len(clean_pin)} digits")
+        print("=" * 60)
 
         totp_url = "https://api.upstox.com/v2/totp-login/authorization/token"
         headers = {
@@ -88,45 +90,35 @@ def generate_upstox_token():
             "pin": clean_pin
         }
 
-        print("[Auth Attempt] Submitting TOTP and PIN to Upstox...")
         res = requests.post(totp_url, json=payload, headers=headers, timeout=10)
+        print(f"[Upstox Response] Status: {res.status_code} | Body: {res.text}")
 
         if res.status_code == 200:
             json_data = res.json()
             token = json_data.get("access_token") or json_data.get("data", {}).get("access_token")
             if token:
                 save_token_to_cache(token)
-                print("[Auth Success] Token obtained and saved to persistent cache.")
-                return token
-        
-        # Log failure and trigger 15-minute security cooldown
-        print(f"[Auth Failed] Upstox returned status {res.status_code}: {res.text}")
+                AUTH_COOLDOWN["last_failure_time"] = 0
+                return token, "SUCCESS"
+
         AUTH_COOLDOWN["last_failure_time"] = time.time()
+        return None, f"Status {res.status_code}: {res.text}"
 
     except Exception as e:
-        print(f"[Auth Exception] Login error: {e}")
         AUTH_COOLDOWN["last_failure_time"] = time.time()
-
-    return None
+        return None, f"Exception: {e}"
 
 def get_valid_token():
-    # 1. Manual environment variable override (bypasses TOTP login entirely)
-    manual_token = os.getenv("UPSTOX_MANUAL_TOKEN")
-    if manual_token and len(manual_token.strip()) > 10:
-        return manual_token.strip()
-
-    # 2. Check disk cache
     cached = load_cached_token()
     if cached:
         return cached
+    token, _ = run_diagnostic_auth(force_test=False)
+    return token
 
-    # 3. Automated TOTP Login
-    return generate_upstox_token()
-# --- UPSTOX DATA FETCHING ---
 def fetch_option_chain(symbol):
     token = get_valid_token()
     if not token:
-        return None, None, "Authentication paused to protect account from lockout. Check server logs or wait 15 mins."
+        return None, None, "Authentication paused. Check server logs or visit /test-auth."
 
     instrument_key = INSTRUMENT_KEYS.get(symbol, "NSE_INDEX|Nifty 50")
     headers = {
@@ -139,12 +131,11 @@ def fetch_option_chain(symbol):
         exp_res = requests.get(expiry_url, headers=headers, timeout=10)
 
         if exp_res.status_code == 401:
-            print("[Auth] Token rejected (401). Invalidating cache and attempting single re-auth...")
             if os.path.exists(CACHE_FILE_PATH):
                 os.remove(CACHE_FILE_PATH)
-            token = generate_upstox_token()
+            token, _ = run_diagnostic_auth(force_test=True)
             if not token:
-                return None, None, "Token expired and re-authentication paused for safety."
+                return None, None, "Token invalid and re-auth failed."
             headers["Authorization"] = f"Bearer {token}"
             exp_res = requests.get(expiry_url, headers=headers, timeout=10)
 
@@ -153,39 +144,35 @@ def fetch_option_chain(symbol):
 
         expiries = sorted(list(set(item["expiry"] for item in exp_res.json().get("data", []))))
         if not expiries:
-            return None, None, "No option contract expiries found."
+            return None, None, "No contract expiries found."
 
         current_expiry = expiries[0]
-
         chain_url = f"https://api.upstox.com/v2/option/chain?instrument_key={urllib.parse.quote(instrument_key)}&expiry_date={current_expiry}"
         chain_res = requests.get(chain_url, headers=headers, timeout=10)
 
         if chain_res.status_code != 200:
             return None, current_expiry, f"Option Chain fetch failed: {chain_res.text}"
 
-        chain_data = chain_res.json().get("data", [])
-        return chain_data, current_expiry, None
+        return chain_res.json().get("data", []), current_expiry, None
 
     except Exception as e:
-        return None, None, f"Exception during fetch: {e}"
+        return None, None, f"Exception: {e}"
 
 def process_option_data(symbol):
     chain_data, current_expiry, error = fetch_option_chain(symbol)
     updated_time = time.strftime("%m/%d/%Y %H:%M:%S")
 
     if error or not chain_data:
-        return [], 0, current_expiry or "N/A", updated_time, 0, 0, 0, error or "No option chain data available."
+        return [], 0, current_expiry or "N/A", updated_time, 0, 0, 0, error or "No data."
 
     spot_price = chain_data[0].get("underlying_spot_price", 0) if chain_data else 0
     range_limit = 1200 if symbol == "BANKNIFTY" else 600
     rows = []
-
     total_ce_oi = 0
     total_pe_oi = 0
 
     for item in chain_data:
         strike = item.get("strike_price", 0)
-
         ce = item.get("call_options", {}) or {}
         pe = item.get("put_options", {}) or {}
 
@@ -227,12 +214,11 @@ def process_option_data(symbol):
     pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 0
     return rows, spot_price, current_expiry, updated_time, pcr, total_ce_oi, total_pe_oi, None
 
-# --- HTML TEMPLATE ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Upstox Pro Option Chain & Greeks Dashboard</title>
+    <title>Upstox Pro Option Chain</title>
     <meta http-equiv="refresh" content="60">
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 15px; background-color: #f4f6f9; }
@@ -244,7 +230,6 @@ HTML_TEMPLATE = """
         .pcr-bearish { border-left-color: #dc3545; color: #bd2130; }
         .btn { display: inline-block; padding: 8px 16px; color: #fff; background-color: #007bff; text-decoration: none; border-radius: 4px; margin-right: 10px; font-weight: 500; }
         .btn-success { background-color: #28a745; }
-        .btn:hover { opacity: 0.9; }
         .table-container { overflow-x: auto; background: #fff; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.06); }
         table { width: 100%; border-collapse: collapse; min-width: 1200px; }
         th, td { border: 1px solid #e9ecef; padding: 7px 9px; text-align: center; font-size: 13px; }
@@ -259,7 +244,7 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-    <h2>Upstox Pro Option Chain & Greeks Dashboard made by Sumit Gujrathi</h2>
+    <h2>Upstox Pro Option Chain & Greeks Dashboard</h2>
     <div class="info-box">
         <div class="metrics-grid">
             <div class="metric-card"><strong>Symbol:</strong> {{ symbol }}</div>
@@ -276,6 +261,7 @@ HTML_TEMPLATE = """
             <a href="/?symbol=NIFTY" class="btn">View NIFTY</a>
             <a href="/?symbol=BANKNIFTY" class="btn">View BANKNIFTY</a>
             <a href="/download?symbol={{ symbol }}" class="btn btn-success">Download Full CSV</a>
+            <a href="/test-auth" class="btn" style="background-color:#6c757d;">Test Auth Direct</a>
         </div>
     </div>
 
@@ -309,9 +295,7 @@ HTML_TEMPLATE = """
                     <td class="order-col">{{ row.ce_bid }}</td>
                     <td class="order-col">{{ row.ce_ask }}</td>
                     <td><strong>{{ row.ce_ltp }}</strong></td>
-                    
                     <td class="atm">{{ row.strike }}</td>
-                    
                     <td><strong>{{ row.pe_ltp }}</strong></td>
                     <td class="order-col">{{ row.pe_bid }}</td>
                     <td class="order-col">{{ row.pe_ask }}</td>
@@ -332,18 +316,19 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# --- ROUTES ---
-# @app.route("/")
-# --- ROUTES ---
 @app.route("/health")
 def health():
-    """Dedicated lightweight health check endpoint for Render/monitors."""
     return "OK", 200
+
+@app.route("/test-auth")
+def test_auth():
+    token, status_msg = run_diagnostic_auth(force_test=True)
+    if token:
+        return f"<h3>AUTH SUCCESS!</h3><p>Access Token: {token[:15]}...</p><a href='/'>Go to Dashboard</a>"
+    return f"<h3>AUTH FAILED</h3><p>{status_msg}</p><p>Check Render logs for calculated TOTP code vs Google Authenticator.</p>"
 
 @app.route("/", methods=["GET", "HEAD"])
 def index():
-    # Instantly return 200 for HEAD requests (Render health checks / uptime pings)
-    # This prevents automated pinging services from triggering Upstox authentication.
     if request.method == "HEAD":
         return Response(status=200)
 
@@ -361,7 +346,7 @@ def index():
         total_pe_oi=total_pe_oi,
         error=error
     )
-    
+
 @app.route("/download")
 def download_csv():
     symbol = request.args.get("symbol", "NIFTY").upper()
