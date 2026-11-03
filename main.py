@@ -326,8 +326,20 @@ HTML_TEMPLATE = """
 """
 
 # --- ROUTES ---
-@app.route("/")
+# @app.route("/")
+# --- ROUTES ---
+@app.route("/health")
+def health():
+    """Dedicated lightweight health check endpoint for Render/monitors."""
+    return "OK", 200
+
+@app.route("/", methods=["GET", "HEAD"])
 def index():
+    # Instantly return 200 for HEAD requests (Render health checks / uptime pings)
+    # This prevents automated pinging services from triggering Upstox authentication.
+    if request.method == "HEAD":
+        return Response(status=200)
+
     symbol = request.args.get("symbol", "NIFTY").upper()
     rows, spot_price, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
     return render_template_string(
@@ -342,7 +354,7 @@ def index():
         total_pe_oi=total_pe_oi,
         error=error
     )
-
+    
 @app.route("/download")
 def download_csv():
     symbol = request.args.get("symbol", "NIFTY").upper()
