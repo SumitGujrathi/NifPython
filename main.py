@@ -110,11 +110,18 @@ def generate_upstox_token():
     return None
 
 def get_valid_token():
+    # 1. Manual environment variable override (bypasses TOTP login entirely)
+    manual_token = os.getenv("UPSTOX_MANUAL_TOKEN")
+    if manual_token and len(manual_token.strip()) > 10:
+        return manual_token.strip()
+
+    # 2. Check disk cache
     cached = load_cached_token()
     if cached:
         return cached
-    return generate_upstox_token()
 
+    # 3. Automated TOTP Login
+    return generate_upstox_token()
 # --- UPSTOX DATA FETCHING ---
 def fetch_option_chain(symbol):
     token = get_valid_token()
