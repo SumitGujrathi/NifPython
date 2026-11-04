@@ -7,7 +7,7 @@ import threading
 import urllib.parse
 import requests
 import pyotp
-from flask import Flask, render_template_string, request, Response
+from flask import Flask, render_template_string, request, Response, jsonify
 
 # --- FLASK APP INITIALIZATION ---
 app = Flask(__name__)
@@ -193,7 +193,6 @@ def process_option_data(symbol):
         c_oi = ce_mkt.get("oi", 0) or 0
         p_oi = pe_mkt.get("oi", 0) or 0
         
-        # Extract Change in OI and Quantity Depth
         c_oi_chg = ce_mkt.get("poi", 0) or (c_oi - ce_mkt.get("prev_oi", c_oi))
         p_oi_chg = pe_mkt.get("poi", 0) or (p_oi - pe_mkt.get("prev_oi", p_oi))
         
@@ -208,7 +207,6 @@ def process_option_data(symbol):
         if abs(strike - spot_price) <= range_limit:
             rows.append({
                 "strike": strike,
-                # CE Data
                 "ce_oi": c_oi,
                 "ce_oi_chg": c_oi_chg,
                 "ce_vol": ce_mkt.get("volume", 0) or 0,
@@ -222,7 +220,6 @@ def process_option_data(symbol):
                 "ce_theta": round(ce_greek.get("theta", 0) or 0, 2),
                 "ce_vega": round(ce_greek.get("vega", 0) or 0, 2),
                 "ce_gamma": round(ce_greek.get("gamma", 0) or 0, 4),
-                # PE Data
                 "pe_ltp": pe_mkt.get("ltp", 0) or 0,
                 "pe_bid": pe_mkt.get("bid_price", 0) or 0,
                 "pe_ask": pe_mkt.get("ask_price", 0) or 0,
@@ -241,7 +238,7 @@ def process_option_data(symbol):
     pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 0
     return rows, spot_price, current_expiry, updated_time, pcr, total_ce_oi, total_pe_oi, None
 
-# --- ORIGINAL UNTOUCHED HTML DASHBOARD TEMPLATE ---
+# --- ORIGINAL UNTOUCHED HTML MAIN TABLE TEMPLATE ---
 MAIN_HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -348,13 +345,12 @@ MAIN_HTML_TEMPLATE = """
 </html>
 """
 
-# --- NEW ANALYSIS DASHBOARD WITH CHANGE IN OI & BID/ASK QUANTITY ---
+# --- ENHANCED ANALYSIS DASHBOARD TEMPLATE (AJAX LIVE AUTO-FETCH & PERSISTENT DROPDOWN) ---
 ANALYSIS_HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
     <title>{{ symbol }} Option Chain Analysis Dashboard</title>
-    <meta http-equiv="refresh" content="60">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #0f172a; color: #f8fafc; }
@@ -369,8 +365,10 @@ ANALYSIS_HTML_TEMPLATE = """
         .card { background: #1e293b; padding: 16px; border-radius: 10px; border-left: 5px solid #3b82f6; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
         .card-title { font-size: 12px; color: #94a3b8; text-transform: uppercase; font-weight: bold; margin-bottom: 6px; }
         .card-value { font-size: 22px; font-weight: bold; color: #f8fafc; }
-        .sentiment-bar-container { background: #334155; height: 14px; border-radius: 7px; overflow: hidden; margin-top: 10px; }
-        .sentiment-bar { height: 100%; transition: width 0.5s ease-in-out; }
+        .sentiment-bar-container { background: #1e293b; border: 1px solid #334155; padding: 15px; border-radius: 10px; margin-bottom: 25px; }
+        .gauge-flex { display: flex; height: 24px; border-radius: 12px; overflow: hidden; margin-top: 10px; }
+        .gauge-ce { background-color: #ef4444; height: 100%; transition: width 0.4s ease; }
+        .gauge-pe { background-color: #22c55e; height: 100%; transition: width 0.4s ease; }
         .chart-box { background: #1e293b; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); margin-bottom: 30px; }
         .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
         .chart-title { font-size: 18px; font-weight: bold; color: #f8fafc; }
@@ -380,44 +378,41 @@ ANALYSIS_HTML_TEMPLATE = """
 </head>
 <body>
     <h2>📊 {{ symbol }} Intraday Options Analysis Dashboard</h2>
-    <div class="subtitle">Real-time institutional liquidity, sentiment, Change in OI, and Bid/Ask Quantities analyzer</div>
+    <div class="subtitle">Live background auto-sync — Zero page reloads & zero scroll loss</div>
 
     <div class="nav-bar">
-        <form method="GET" action="/analysis" style="display: flex; gap: 12px; align-items: center; margin: 0;">
-            <label style="color: #94a3b8; font-weight: bold;">Symbol:</label>
-            <select name="symbol" onchange="this.form.submit()">
-                <option value="NIFTY" {% if symbol == 'NIFTY' %}selected{% endif %}>NIFTY 50</option>
-                <option value="BANKNIFTY" {% if symbol == 'BANKNIFTY' %}selected{% endif %}>BANK NIFTY</option>
-            </select>
+        <label style="color: #94a3b8; font-weight: bold;">Symbol:</label>
+        <select id="symbolSelector" onchange="switchSymbol(this.value)">
+            <option value="NIFTY" {% if symbol == 'NIFTY' %}selected{% endif %}>NIFTY 50</option>
+            <option value="BANKNIFTY" {% if symbol == 'BANKNIFTY' %}selected{% endif %}>BANK NIFTY</option>
+        </select>
 
-            <label style="color: #94a3b8; font-weight: bold; margin-left: 15px;">Metric View:</label>
-            <select id="metricSelector" onchange="updateChartMetric()">
-                <option value="oi">Open Interest (CE vs PE)</option>
-                <option value="oi_chg">Change in Open Interest (Chg in OI)</option>
-                <option value="vol">Trading Volume</option>
-                <option value="depth_qty">Order Book Depth (Bid Quantity vs Ask Quantity)</option>
-                <option value="delta">Delta Exposure</option>
-                <option value="theta">Theta Time Decay</option>
-            </select>
-        </form>
+        <label style="color: #94a3b8; font-weight: bold; margin-left: 15px;">Metric View:</label>
+        <select id="metricSelector" onchange="updateChartMetric()">
+            <option value="oi">Open Interest (CE vs PE)</option>
+            <option value="oi_chg">Change in Open Interest (Chg in OI)</option>
+            <option value="vol">Trading Volume</option>
+            <option value="depth_qty">Order Book Depth (Bid Quantity vs Ask Quantity)</option>
+            <option value="delta">Delta Exposure</option>
+            <option value="theta">Theta Time Decay</option>
+        </select>
 
         <div style="margin-left: auto; display: flex; align-items: center; gap: 12px;">
-            <span class="timer-badge">Auto Refresh: <span id="countdown">60</span>s</span>
+            <span class="timer-badge">Auto Sync: <span id="countdown">10</span>s</span>
             <a href="/?symbol={{ symbol }}" class="btn btn-table">📋 Back to Table View</a>
         </div>
     </div>
 
-    {% if error %}
-        <div class="error-msg">Error: {{ error }}</div>
-    {% else %}
+    <div id="errorContainer" class="error-msg" style="display: none;"></div>
+
     <div class="metrics-grid">
         <div class="card" style="border-left-color: #38bdf8;">
             <div class="card-title">Spot Price</div>
-            <div class="card-value">{{ spot_price }}</div>
+            <div class="card-value" id="cardSpot">{{ spot_price }}</div>
         </div>
-        <div class="card" style="border-left-color: {% if pcr >= 1.0 %}#22c55e{% else %}#ef4444{% endif %};">
+        <div class="card" id="cardPcrBox">
             <div class="card-title">Put-Call Ratio (PCR)</div>
-            <div class="card-value">{{ pcr }} {% if pcr >= 1.0 %}<span style="color:#22c55e; font-size:14px;">(Bullish)</span>{% else %}<span style="color:#ef4444; font-size:14px;">(Bearish)</span>{% endif %}</div>
+            <div class="card-value" id="cardPcr">{{ pcr }}</div>
         </div>
         <div class="card" style="border-left-color: #ef4444;">
             <div class="card-title">Major Resistance (Max Call OI)</div>
@@ -429,20 +424,25 @@ ANALYSIS_HTML_TEMPLATE = """
         </div>
         <div class="card" style="border-left-color: #a855f7;">
             <div class="card-title">Last Updated</div>
-            <div class="card-value" style="font-size: 16px;">{{ updated }}</div>
+            <div class="card-value" id="cardUpdated" style="font-size: 16px;">{{ updated }}</div>
         </div>
     </div>
 
-    <!-- INTRADAY TREND METER -->
-    <div class="chart-box">
-        <div class="chart-title">Intraday Bullish / Bearish Sentiment Gauge</div>
-        <div class="sentiment-bar-container">
-            <div id="sentimentBar" class="sentiment-bar" style="width: {{ pcr_percent }}%; background-color: {% if pcr >= 1.0 %}#22c55e{% else %}#ef4444{% endif %};"></div>
+    <!-- DYNAMIC METRIC SENTIMENT GAUGE (CE VS PE SUM & AVG) -->
+    <div class="sentiment-bar-container">
+        <div style="display: flex; justify-content: space-between; font-weight: bold; margin-bottom: 8px;">
+            <span style="color: #ef4444;" id="gaugeCeLabel">CALL (CE) TOTAL: -</span>
+            <span style="color: #38bdf8;" id="gaugeMetricName">SELECTED METRIC COMPARISON</span>
+            <span style="color: #22c55e;" id="gaugePeLabel">PUT (PE) TOTAL: -</span>
+        </div>
+        <div class="gauge-flex">
+            <div id="gaugeCeBar" class="gauge-ce" style="width: 50%;"></div>
+            <div id="gaugePeBar" class="gauge-pe" style="width: 50%;"></div>
         </div>
         <div style="display: flex; justify-content: space-between; color: #94a3b8; font-size: 12px; margin-top: 6px;">
-            <span>0.0 Bearish</span>
-            <span>PCR Bias: {{ pcr }}</span>
-            <span>2.0+ Bullish</span>
+            <span id="gaugeCeAvg">Call Avg: -</span>
+            <span id="gaugeRatioText">Ratio: 1.00</span>
+            <span id="gaugePeAvg">Put Avg: -</span>
         </div>
     </div>
 
@@ -455,221 +455,86 @@ ANALYSIS_HTML_TEMPLATE = """
     </div>
 
     <script>
-        // 60-Second Auto Refresh Timer
-        let seconds = 60;
-        setInterval(() => {
-            seconds--;
-            if (seconds <= 0) {
-                location.reload();
+        let currentSymbol = "{{ symbol }}";
+        let rawRows = {{ rows | tojson }};
+        let myChart = null;
+
+        // Restore selected metric from localStorage if present
+        const savedMetric = localStorage.getItem("selected_option_metric");
+        if (savedMetric) {
+            const selector = document.getElementById("metricSelector");
+            if (selector.querySelector(`option[value="${savedMetric}"]`)) {
+                selector.value = savedMetric;
+            }
+        }
+
+        function switchSymbol(newSym) {
+            window.location.href = `/analysis?symbol=${newSym}`;
+        }
+
+        function renderPageData(data) {
+            if (data.error) {
+                document.getElementById("errorContainer").style.display = "block";
+                document.getElementById("errorContainer").innerText = "Error: " + data.error;
+                return;
+            }
+            document.getElementById("errorContainer").style.display = "none";
+
+            rawRows = data.rows || [];
+            document.getElementById("cardSpot").innerText = data.spot_price || 0;
+            document.getElementById("cardUpdated").innerText = data.updated || "";
+            
+            const pcrVal = data.pcr || 0;
+            const pcrBox = document.getElementById("cardPcrBox");
+            if (pcrVal >= 1.0) {
+                pcrBox.style.borderLeftColor = "#22c55e";
+                document.getElementById("cardPcr").innerHTML = `${pcrVal} <span style="color:#22c55e; font-size:14px;">(Bullish)</span>`;
             } else {
-                document.getElementById("countdown").innerText = seconds;
+                pcrBox.style.borderLeftColor = "#ef4444";
+                document.getElementById("cardPcr").innerHTML = `${pcrVal} <span style="color:#ef4444; font-size:14px;">(Bearish)</span>`;
             }
-        }, 1000);
 
-        const rawRows = {{ rows | tojson }};
-        const strikes = rawRows.map(r => r.strike);
-        
-        let maxCE = -1, resStrike = 0;
-        let maxPE = -1, supStrike = 0;
-        rawRows.forEach(r => {
-            if (r.ce_oi > maxCE) { maxCE = r.ce_oi; resStrike = r.strike; }
-            if (r.pe_oi > maxPE) { maxPE = r.pe_oi; supStrike = r.strike; }
-        });
+            // Resistance & Support strikes
+            let maxCE = -1, resStrike = 0;
+            let maxPE = -1, supStrike = 0;
+            rawRows.forEach(r => {
+                if (r.ce_oi > maxCE) { maxCE = r.ce_oi; resStrike = r.strike; }
+                if (r.pe_oi > maxPE) { maxPE = r.pe_oi; supStrike = r.strike; }
+            });
+            document.getElementById("maxCallStrike").innerText = resStrike;
+            document.getElementById("maxPutStrike").innerText = supStrike;
 
-        document.getElementById("maxCallStrike").innerText = resStrike;
-        document.getElementById("maxPutStrike").innerText = supStrike;
+            updateChartMetric();
+        }
 
-        const ctx = document.getElementById('analysisChart').getContext('2d');
-        
-        let chartData = {
-            labels: strikes,
-            datasets: [
-                {
-                    label: 'Call Options (CE)',
-                    backgroundColor: 'rgba(239, 68, 68, 0.85)',
-                    borderColor: '#ef4444',
-                    borderWidth: 1,
-                    data: rawRows.map(r => r.ce_oi)
+        function initChart() {
+            const ctx = document.getElementById('analysisChart').getContext('2d');
+            myChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: rawRows.map(r => r.strike),
+                    datasets: [
+                        { label: 'Calls', data: [], backgroundColor: 'rgba(239, 68, 68, 0.85)' },
+                        { label: 'Puts', data: [], backgroundColor: 'rgba(34, 197, 94, 0.85)' }
+                    ]
                 },
-                {
-                    label: 'Put Options (PE)',
-                    backgroundColor: 'rgba(34, 197, 94, 0.85)',
-                    borderColor: '#22c55e',
-                    borderWidth: 1,
-                    data: rawRows.map(r => r.pe_oi)
-                }
-            ]
-        };
-
-        const config = {
-            type: 'bar',
-            data: chartData,
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                scales: {
-                    x: {
-                        ticks: { color: '#94a3b8', font: { weight: 'bold' } },
-                        grid: { color: '#334155' }
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: { ticks: { color: '#94a3b8', font: { weight: 'bold' } }, grid: { color: '#334155' } },
+                        y: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } }
                     },
-                    y: {
-                        ticks: { color: '#94a3b8' },
-                        grid: { color: '#334155' }
+                    plugins: {
+                        legend: { labels: { color: '#f8fafc', font: { size: 14 } } },
+                        tooltip: { mode: 'index', intersect: false }
                     }
-                },
-                plugins: {
-                    legend: { labels: { color: '#f8fafc', font: { size: 14 } } },
-                    tooltip: { mode: 'index', intersect: false }
                 }
-            }
-        };
-
-        let myChart = new Chart(ctx, config);
+            });
+        }
 
         function updateChartMetric() {
             const selected = document.getElementById("metricSelector").value;
-            const titleEl = document.getElementById("chartHeaderTitle");
+            localStorage.setItem("selected_option_metric", selected);
 
-            if (selected === "oi") {
-                titleEl.innerText = "Strike-Wise Open Interest (Call vs Put)";
-                myChart.data.datasets[0].label = "Call OI";
-                myChart.data.datasets[0].data = rawRows.map(r => r.ce_oi);
-                myChart.data.datasets[0].backgroundColor = 'rgba(239, 68, 68, 0.85)';
-                
-                myChart.data.datasets[1].label = "Put OI";
-                myChart.data.datasets[1].data = rawRows.map(r => r.pe_oi);
-                myChart.data.datasets[1].backgroundColor = 'rgba(34, 197, 94, 0.85)';
-            }
-            else if (selected === "oi_chg") {
-                titleEl.innerText = "Strike-Wise Change in Open Interest (Chg in OI)";
-                myChart.data.datasets[0].label = "Call Chg in OI";
-                myChart.data.datasets[0].data = rawRows.map(r => r.ce_oi_chg);
-                myChart.data.datasets[0].backgroundColor = 'rgba(225, 29, 72, 0.85)';
-                
-                myChart.data.datasets[1].label = "Put Chg in OI";
-                myChart.data.datasets[1].data = rawRows.map(r => r.pe_oi_chg);
-                myChart.data.datasets[1].backgroundColor = 'rgba(16, 185, 129, 0.85)';
-            }
-            else if (selected === "vol") {
-                titleEl.innerText = "Strike-Wise Volume Analysis";
-                myChart.data.datasets[0].label = "Call Volume";
-                myChart.data.datasets[0].data = rawRows.map(r => r.ce_vol);
-                myChart.data.datasets[0].backgroundColor = 'rgba(249, 115, 22, 0.85)';
-                
-                myChart.data.datasets[1].label = "Put Volume";
-                myChart.data.datasets[1].data = rawRows.map(r => r.pe_vol);
-                myChart.data.datasets[1].backgroundColor = 'rgba(14, 165, 233, 0.85)';
-            }
-            else if (selected === "depth_qty") {
-                titleEl.innerText = "Order Book Depth Quantity (Call Ask Qty vs Put Bid Qty)";
-                myChart.data.datasets[0].label = "Call Ask Quantity (Sell Pressure)";
-                myChart.data.datasets[0].data = rawRows.map(r => r.ce_ask_qty);
-                myChart.data.datasets[0].backgroundColor = 'rgba(236, 72, 153, 0.85)';
-                
-                myChart.data.datasets[1].label = "Put Bid Quantity (Buy Support)";
-                myChart.data.datasets[1].data = rawRows.map(r => r.pe_bid_qty);
-                myChart.data.datasets[1].backgroundColor = 'rgba(168, 85, 247, 0.85)';
-            }
-            else if (selected === "delta") {
-                titleEl.innerText = "Option Delta Exposure across Strikes";
-                myChart.data.datasets[0].label = "Call Delta";
-                myChart.data.datasets[0].data = rawRows.map(r => r.ce_delta);
-                myChart.data.datasets[0].backgroundColor = 'rgba(239, 68, 68, 0.85)';
-                
-                myChart.data.datasets[1].label = "Put Delta";
-                myChart.data.datasets[1].data = rawRows.map(r => r.pe_delta);
-                myChart.data.datasets[1].backgroundColor = 'rgba(34, 197, 94, 0.85)';
-            }
-            else if (selected === "theta") {
-                titleEl.innerText = "Theta Decay Rate across Strikes";
-                myChart.data.datasets[0].label = "Call Theta";
-                myChart.data.datasets[0].data = rawRows.map(r => r.ce_theta);
-                myChart.data.datasets[0].backgroundColor = 'rgba(234, 179, 8, 0.85)';
-                
-                myChart.data.datasets[1].label = "Put Theta";
-                myChart.data.datasets[1].data = rawRows.map(r => r.pe_theta);
-                myChart.data.datasets[1].backgroundColor = 'rgba(168, 85, 247, 0.85)';
-            }
-
-            myChart.update();
-        }
-    </script>
-    {% endif %}
-</body>
-</html>
-"""
-
-# --- ROUTES ---
-@app.route("/health")
-def health():
-    return "OK", 200
-
-@app.route("/", methods=["GET", "HEAD"])
-def index():
-    if request.method == "HEAD":
-        return Response(status=200)
-
-    symbol = request.args.get("symbol", "NIFTY").upper()
-    rows, spot_price, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
-    return render_template_string(
-        MAIN_HTML_TEMPLATE,
-        rows=rows,
-        symbol=symbol,
-        spot_price=spot_price,
-        expiry=expiry,
-        updated=updated,
-        pcr=pcr,
-        total_ce_oi=total_ce_oi,
-        total_pe_oi=total_pe_oi,
-        error=error
-    )
-
-@app.route("/analysis", methods=["GET"])
-def analysis_dashboard():
-    symbol = request.args.get("symbol", "NIFTY").upper()
-    rows, spot_price, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
-    
-    pcr_percent = min(max(int((pcr / 2.0) * 100), 5), 100)
-
-    return render_template_string(
-        ANALYSIS_HTML_TEMPLATE,
-        rows=rows,
-        symbol=symbol,
-        spot_price=spot_price,
-        expiry=expiry,
-        updated=updated,
-        pcr=pcr,
-        pcr_percent=pcr_percent,
-        total_ce_oi=total_ce_oi,
-        total_pe_oi=total_pe_oi,
-        error=error
-    )
-
-@app.route("/download")
-def download_csv():
-    symbol = request.args.get("symbol", "NIFTY").upper()
-    rows, spot_price, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
-
-    si = io.StringIO()
-    cw = csv.writer(si)
-    cw.writerow([f"Symbol: {symbol}", f"Spot Price: {spot_price}", f"Expiry: {expiry}", f"PCR: {pcr}", f"Updated: {updated}"])
-    cw.writerow([
-        "CE OI", "CE Vol", "CE IV", "CE Delta", "CE Theta", "CE Vega", "CE Gamma", "CE Bid", "CE Ask", "CE LTP",
-        "STRIKE",
-        "PE LTP", "PE Bid", "PE Ask", "PE Delta", "PE Theta", "PE Vega", "PE Gamma", "PE IV", "PE Vol", "PE OI"
-    ])
-
-    if not error:
-        for r in rows:
-            cw.writerow([
-                r["ce_oi"], r["ce_vol"], r["ce_iv"], r["ce_delta"], r["ce_theta"], r["ce_vega"], r["ce_gamma"], r["ce_bid"], r["ce_ask"], r["ce_ltp"],
-                r["strike"],
-                r["pe_ltp"], r["pe_bid"], r["pe_ask"], r["pe_delta"], r["pe_theta"], r["pe_vega"], r["pe_gamma"], r["pe_iv"], r["pe_vol"], r["pe_oi"]
-            ])
-
-    output = Response(si.getvalue(), mimetype="text/csv")
-    output.headers["Content-Disposition"] = f"attachment; filename={symbol}_Advanced_Option_Chain.csv"
-    return output
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+            const titleEl =
