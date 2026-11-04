@@ -3,6 +3,7 @@ import time
 import io
 import csv
 import json
+import sys
 import threading
 import urllib.parse
 from datetime import datetime, timezone, timedelta
@@ -34,6 +35,43 @@ AUTH_COOLDOWN = {
     "last_failure_time": 0,
     "cooldown_duration": 1500  # 25 minutes safety lockout
 }
+
+# --- IN-MEMORY HISTORICAL SNAPSHOT STORAGE ---
+HISTORICAL_SNAPSHOTS = []  # In-memory buffer for 5-minute snapshot time series
+SNAPSHOT_LOCK = threading.Lock()
+
+# --- MARKET HOURS & MEMORY MANAGEMENT ---
+def is_market_open():
+    """Checks if current IST time is within Indian stock market hours (Mon-Fri, 9:15 AM - 3:30 PM)."""
+    ist_tz = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(ist_tz)
+    # Check weekday: Mon(0) to Fri(4). Sat(5) & Sun(6) are closed.
+    if now_ist.weekday() >= 5:
+        return False
+    start_time = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    end_time = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+    return start_time <= now_ist <= end_time
+
+def trim_memory_if_needed():
+    """Ensures in-memory historical snapshot buffer does not exceed 50 MB, trimming down to ~30 MB."""
+    global HISTORICAL_SNAPSHOTS
+    with SNAPSHOT_LOCK:
+        try:
+            raw_bytes = len(json.dumps(HISTORICAL_SNAPSHOTS).encode('utf-8'))
+            max_limit = 50 * 1024 * 1024   # 50 MB threshold
+            target_limit = 30 * 1024 * 1024  # 30 MB target
+
+            if raw_bytes > max_limit:
+                print(f"[Memory Trim] Buffer size {raw_bytes / (1024*1024):.2f} MB exceeds 50MB limit. Trimming down to ~30MB...")
+                while len(HISTORICAL_SNAPSHOTS) > 20:
+                    current_size = len(json.dumps(HISTORICAL_SNAPSHOTS).encode('utf-8'))
+                    if current_size <= target_limit:
+                        break
+                    trim_count = max(1, len(HISTORICAL_SNAPSHOTS) // 10)
+                    HISTORICAL_SNAPSHOTS = HISTORICAL_SNAPSHOTS[trim_count:]
+                print(f"[Memory Trim Complete] New buffer size: {len(json.dumps(HISTORICAL_SNAPSHOTS).encode('utf-8')) / (1024*1024):.2f} MB ({len(HISTORICAL_SNAPSHOTS)} records retained)")
+        except Exception as e:
+            print(f"[Memory Trim Exception]: {e}")
 
 # --- PERSISTENT SESSION MANAGEMENT ---
 def load_session_token():
@@ -122,6 +160,111 @@ def get_valid_token():
         return token
     return perform_single_auth()
 
+# --- TECHNICAL ANALYSIS (EMA CALCULATOR) ---
+def calculate_ema(prices, period):
+    """Calculates Exponential Moving Average (EMA) for a price series."""
+    if len(prices) < period:
+        return [None] * len(prices)
+    
+    ema = [None] * len(prices)
+    sma = sum(prices[:period]) / period
+    ema[period - 1] = round(sma, 2)
+    multiplier = 2 / (period + 1)
+    
+    for i in range(period, len(prices)):
+        val = (prices[i] - ema[i - 1]) * multiplier + ema[i - 1]
+        ema[i] = round(val, 2)
+    return ema
+
+# --- UPSTOX HISTORICAL CANDLE DATA FETCHING ---
+def fetch_historical_candles(symbol, timeframe="5minute", days=60):
+    token = get_valid_token()
+    if not token:
+        return {"candles": [], "ema8": [], "ema24": []}, "Authentication required."
+
+    instrument_key = INSTRUMENT_KEYS.get(symbol, "NSE_INDEX|Nifty 50")
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+
+    ist_tz = timezone(timedelta(hours=5, minutes=30))
+    to_date = datetime.now(ist_tz).strftime("%Y-%m-%d")
+    from_date = (datetime.now(ist_tz) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    tf_map = {
+        "5minute": "5minute",
+        "15minute": "15minute",
+        "30minute": "30minute",
+        "60minute": "60minute",
+        "day": "day"
+    }
+    interval = tf_map.get(timeframe, "5minute")
+
+    try:
+        url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/{interval}/{to_date}/{from_date}"
+        res = requests.get(url, headers=headers, timeout=10)
+
+        if res.status_code != 200:
+            return {"candles": [], "ema8": [], "ema24": []}, f"Candle API status {res.status_code}: {res.text}"
+
+        raw_candles = res.json().get("data", {}).get("candles", [])
+        if not raw_candles:
+            return {"candles": [], "ema8": [], "ema24": []}, "No candle data returned."
+
+        raw_candles.reverse()
+
+        seen_times = set()
+        parsed_candles = []
+        close_prices = []
+
+        for c in raw_candles:
+            ts_str = c[0]
+            try:
+                dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                unix_ts = int(dt.timestamp())
+            except Exception:
+                continue
+
+            if unix_ts in seen_times:
+                continue
+            seen_times.add(unix_ts)
+
+            close_p = round(float(c[4]), 2)
+            parsed_candles.append({
+                "time": unix_ts,
+                "open": round(float(c[1]), 2),
+                "high": round(float(c[2]), 2),
+                "low": round(float(c[3]), 2),
+                "close": close_p,
+                "volume": int(c[5])
+            })
+            close_prices.append(close_p)
+
+        parsed_candles.sort(key=lambda x: x["time"])
+
+        ema8_list = calculate_ema(close_prices, 8)
+        ema24_list = calculate_ema(close_prices, 24)
+
+        ema8_data = []
+        ema24_data = []
+
+        for i in range(len(parsed_candles)):
+            t = parsed_candles[i]["time"]
+            if ema8_list[i] is not None:
+                ema8_data.append({"time": t, "value": ema8_list[i]})
+            if ema24_list[i] is not None:
+                ema24_data.append({"time": t, "value": ema24_list[i]})
+
+        return {
+            "candles": parsed_candles,
+            "ema8": ema8_data,
+            "ema24": ema24_data
+        }, None
+
+    except Exception as e:
+        return {"candles": [], "ema8": [], "ema24": []}, f"Exception fetching candles: {e}"
+
 # --- UPSTOX CONCURRENT DATA FETCHING ---
 def fetch_single_expiry_chain(instrument_key, expiry_date, headers):
     try:
@@ -163,10 +306,8 @@ def fetch_option_chain(symbol, selected_expiry=None):
         if not expiries:
             return None, None, [], "No option contract expiries found."
 
-        # Consolidated Expiry Handling
         if selected_expiry == "ALL":
             combined_chain = []
-            # Fetch up to 6 active expiries in parallel
             target_expiries = expiries[:6]
             with ThreadPoolExecutor(max_workers=5) as executor:
                 futures = [executor.submit(fetch_single_expiry_chain, instrument_key, exp, headers) for exp in target_expiries]
@@ -177,7 +318,6 @@ def fetch_option_chain(symbol, selected_expiry=None):
             
             return combined_chain, "ALL EXPIRIES (CONSOLIDATED)", expiries, None
 
-        # Single Expiry Handling
         target_expiry = selected_expiry if (selected_expiry and selected_expiry in expiries) else expiries[0]
         _, chain_data = fetch_single_expiry_chain(instrument_key, target_expiry, headers)
         return chain_data, target_expiry, expiries, None
@@ -188,7 +328,6 @@ def fetch_option_chain(symbol, selected_expiry=None):
 def process_option_data(symbol, selected_expiry=None):
     chain_data, current_expiry, expiries, error = fetch_option_chain(symbol, selected_expiry)
     
-    # IST Timezone Formatting
     ist_tz = timezone(timedelta(hours=5, minutes=30))
     updated_time = datetime.now(ist_tz).strftime("%d/%m/%Y %H:%M:%S IST")
 
@@ -197,7 +336,6 @@ def process_option_data(symbol, selected_expiry=None):
 
     spot_price = chain_data[0].get("underlying_spot_price", 0) if chain_data else 0
 
-    # Grid Stabilization: Calculate fixed ATM strike and symmetric strike range
     step = 100 if symbol == "BANKNIFTY" else 50
     atm_strike = round(spot_price / step) * step if step > 0 else spot_price
 
@@ -205,7 +343,6 @@ def process_option_data(symbol, selected_expiry=None):
     min_strike = atm_strike - (num_strikes_each_side * step)
     max_strike = atm_strike + (num_strikes_each_side * step)
 
-    # Consolidated Aggregation Map across Expiries
     strike_map = {}
 
     for item in chain_data:
@@ -237,7 +374,6 @@ def process_option_data(symbol, selected_expiry=None):
         c_oi = ce_mkt.get("oi", 0) or 0
         p_oi = pe_mkt.get("oi", 0) or 0
 
-        # Accumulate / Sum Volume and Open Interest Metrics
         rec["ce_oi"] += c_oi
         rec["pe_oi"] += p_oi
         rec["ce_oi_chg"] += ce_mkt.get("poi", 0) or (c_oi - ce_mkt.get("prev_oi", c_oi))
@@ -249,7 +385,6 @@ def process_option_data(symbol, selected_expiry=None):
         rec["pe_bid_qty"] += pe_mkt.get("bid_qty", 0) or 0
         rec["pe_ask_qty"] += pe_mkt.get("ask_qty", 0) or 0
 
-        # Preserve LTP & Greeks from the primary / nearest expiry
         if not rec["_has_pricing"]:
             rec["ce_ltp"] = ce_mkt.get("ltp", 0) or 0
             rec["ce_bid"] = ce_mkt.get("bid_price", 0) or 0
@@ -277,6 +412,93 @@ def process_option_data(symbol, selected_expiry=None):
     pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 0
 
     return rows, spot_price, atm_strike, current_expiry, expiries, updated_time, pcr, total_ce_oi, total_pe_oi, None
+
+# --- BACKGROUND 5-MINUTE SNAPSHOT RECORDER ---
+def record_snapshot(symbol):
+    """Computes strike-wide aggregated CE/PE metrics & spot price and records a 5-minute snapshot."""
+    try:
+        rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry="ALL")
+        if error or not rows:
+            return
+
+        ist_tz = timezone(timedelta(hours=5, minutes=30))
+        now_ist = datetime.now(ist_tz)
+        ts_unix = int(now_ist.timestamp())
+        formatted_ts = now_ist.strftime("%H:%M")
+        full_dt_str = now_ist.strftime("%Y-%m-%d %H:%M:%S IST")
+
+        num_strikes = len(rows) or 1
+        ce_vol_sum = sum(r["ce_vol"] for r in rows)
+        pe_vol_sum = sum(r["pe_vol"] for r in rows)
+        ce_iv_avg = round(sum(r["ce_iv"] for r in rows) / num_strikes, 2)
+        pe_iv_avg = round(sum(r["pe_iv"] for r in rows) / num_strikes, 2)
+        ce_delta_sum = round(sum(r["ce_delta"] for r in rows), 2)
+        pe_delta_sum = round(sum(r["pe_delta"] for r in rows), 2)
+        ce_theta_sum = round(sum(r["ce_theta"] for r in rows), 2)
+        pe_theta_sum = round(sum(r["pe_theta"] for r in rows), 2)
+        ce_vega_sum = round(sum(r["ce_vega"] for r in rows), 2)
+        pe_vega_sum = round(sum(r["pe_vega"] for r in rows), 2)
+        ce_gamma_sum = round(sum(r["ce_gamma"] for r in rows), 4)
+        pe_gamma_sum = round(sum(r["pe_gamma"] for r in rows), 4)
+        ce_bid_qty_sum = sum(r["ce_bid_qty"] for r in rows)
+        ce_ask_qty_sum = sum(r["ce_ask_qty"] for r in rows)
+        pe_bid_qty_sum = sum(r["pe_bid_qty"] for r in rows)
+        pe_ask_qty_sum = sum(r["pe_ask_qty"] for r in rows)
+
+        snapshot = {
+            "timestamp": ts_unix,
+            "datetime": full_dt_str,
+            "formatted_time": formatted_ts,
+            "symbol": symbol,
+            "spot_price": spot_price,
+            "atm_strike": atm_strike,
+            "pcr": pcr,
+            "ce_oi": total_ce_oi,
+            "pe_oi": total_pe_oi,
+            "ce_vol": ce_vol_sum,
+            "pe_vol": pe_vol_sum,
+            "ce_iv": ce_iv_avg,
+            "pe_iv": pe_iv_avg,
+            "ce_delta": ce_delta_sum,
+            "pe_delta": pe_delta_sum,
+            "ce_theta": ce_theta_sum,
+            "pe_theta": pe_theta_sum,
+            "ce_vega": ce_vega_sum,
+            "pe_vega": pe_vega_sum,
+            "ce_gamma": ce_gamma_sum,
+            "pe_gamma": pe_gamma_sum,
+            "ce_bid_qty": ce_bid_qty_sum,
+            "ce_ask_qty": ce_ask_qty_sum,
+            "pe_bid_qty": pe_bid_qty_sum,
+            "pe_ask_qty": pe_ask_qty_sum
+        }
+
+        with SNAPSHOT_LOCK:
+            HISTORICAL_SNAPSHOTS.append(snapshot)
+            print(f"[Recorder Thread] Recorded snapshot for {symbol} at {formatted_ts}. Total stored: {len(HISTORICAL_SNAPSHOTS)}")
+    except Exception as e:
+        print(f"[Snapshot Error] Exception recording {symbol}: {e}")
+
+def background_5min_recorder():
+    """Background daemon loop that triggers snapshot recording every 5 minutes during market hours."""
+    time.sleep(5)
+    print("[Recorder Thread] Background 5-minute snapshot thread active.")
+    while True:
+        try:
+            if is_market_open():
+                print("[Recorder Thread] Market is OPEN. Executing 5-min snapshot sweep...")
+                for sym in ["NIFTY", "BANKNIFTY"]:
+                    record_snapshot(sym)
+                trim_memory_if_needed()
+            else:
+                print("[Recorder Thread] Market is CLOSED. Skipping snapshot recording.")
+        except Exception as e:
+            print(f"[Recorder Thread Exception]: {e}")
+        time.sleep(300)
+
+def start_background_recorder():
+    thread = threading.Thread(target=background_5min_recorder, daemon=True)
+    thread.start()
 
 # --- MAIN TABLE TEMPLATE ---
 MAIN_HTML_TEMPLATE = """
@@ -405,13 +627,14 @@ MAIN_HTML_TEMPLATE = """
 </html>
 """
 
-# --- ANALYSIS DASHBOARD TEMPLATE ---
+# --- ANALYSIS DASHBOARD TEMPLATE WITH HISTORICAL TREND CHART & CANDLESTICKS ---
 ANALYSIS_HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>{{ symbol }} Option Chain Analysis Dashboard</title>
+    <title>{{ symbol }} Option Chain & Technical Chart Analysis</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@3.8.0/dist/lightweight-charts.standalone.production.js"></script>
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #0f172a; color: #f8fafc; }
         h2 { color: #38bdf8; margin-bottom: 5px; }
@@ -430,15 +653,17 @@ ANALYSIS_HTML_TEMPLATE = """
         .gauge-ce { background-color: #ef4444; height: 100%; transition: width 0.4s ease; }
         .gauge-pe { background-color: #22c55e; height: 100%; transition: width 0.4s ease; }
         .chart-box { background: #1e293b; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); margin-bottom: 30px; }
-        .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+        .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px; }
         .chart-title { font-size: 18px; font-weight: bold; color: #f8fafc; }
         .timer-badge { background: #0284c7; color: #ffffff; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
+        .legend-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: bold; margin-left: 15px; }
         .error-msg { color: #f87171; font-weight: bold; padding: 15px; background: #450a0a; border-radius: 8px; }
+        #candleContainer { width: 100%; height: 440px; border-radius: 8px; overflow: hidden; }
     </style>
 </head>
 <body>
-    <h2>📊 {{ symbol }} Intraday Options Analysis Dashboard</h2>
-    <div class="subtitle">Live background auto-sync — Zero page reloads & zero scroll loss</div>
+    <h2>📊 {{ symbol }} Advanced Analytics & Historical Trend Dashboard</h2>
+    <div class="subtitle">Live background auto-sync — Historical memory snapshots, candlestick charts, 8/24 EMAs, and option sentiment</div>
 
     <div class="nav-bar">
         <label style="color: #94a3b8; font-weight: bold;">Symbol:</label>
@@ -455,7 +680,7 @@ ANALYSIS_HTML_TEMPLATE = """
             {% endfor %}
         </select>
 
-        <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Metric View:</label>
+        <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Option Metric:</label>
         <select id="metricSelector" onchange="updateChartMetric()">
             <option value="oi">Open Interest (CE vs PE)</option>
             <option value="oi_chg">Change in Open Interest (Chg in OI)</option>
@@ -472,6 +697,62 @@ ANALYSIS_HTML_TEMPLATE = """
     </div>
 
     <div id="errorContainer" class="error-msg" style="display: none;"></div>
+
+    <!-- 1. NEW HISTORICAL TREND ANALYTICS CHART (FROM IN-MEMORY SNAPSHOTS) -->
+    <div class="chart-box">
+        <div class="chart-header">
+            <div style="display: flex; align-items: center; gap: 15px;">
+                <span class="chart-title">📈 Historical Snapshot Trend (5-Min Market Memory)</span>
+            </div>
+            <div style="display: flex; gap: 12px; align-items: center;">
+                <label style="color: #94a3b8; font-weight: bold;">Trend Metric:</label>
+                <select id="historyMetricSelector" onchange="loadHistoricalChart()">
+                    <option value="spot_price">Live Spot Price (Index)</option>
+                    <option value="oi" selected>Open Interest (CE vs PE)</option>
+                    <option value="vol">Trading Volume (CE vs PE)</option>
+                    <option value="pcr">Put-Call Ratio (PCR)</option>
+                    <option value="iv">Implied Volatility (IV CE vs PE)</option>
+                    <option value="delta">Delta Exposure (CE vs PE)</option>
+                    <option value="theta">Theta Decay (CE vs PE)</option>
+                    <option value="vega">Vega Exposure (CE vs PE)</option>
+                    <option value="gamma">Gamma Exposure (CE vs PE)</option>
+                    <option value="depth_qty">Order Book Depth (Ask Qty vs Bid Qty)</option>
+                </select>
+
+                <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Interval:</label>
+                <select id="historyTimeframeSelector" onchange="loadHistoricalChart()">
+                    <option value="5minute" selected>5 Min</option>
+                    <option value="15minute">15 Min</option>
+                    <option value="30minute">30 Min</option>
+                    <option value="60minute">1 Hour</option>
+                    <option value="day">1 Day</option>
+                </select>
+            </div>
+        </div>
+        <canvas id="historyChart" style="max-height: 420px;"></canvas>
+    </div>
+
+    <!-- 2. CANDLESTICK TECHNICAL ANALYSIS SECTION -->
+    <div class="chart-box">
+        <div class="chart-header">
+            <div style="display: flex; align-items: center; gap: 15px;">
+                <span class="chart-title">📊 60-Day Technical Price Chart (Candlestick & EMAs)</span>
+                <span class="legend-badge" style="color: #facc15;">🟡 8 EMA</span>
+                <span class="legend-badge" style="color: #38bdf8;">🔵 24 EMA</span>
+            </div>
+            <div>
+                <label style="color: #94a3b8; font-weight: bold; margin-right: 8px;">Chart Timeframe:</label>
+                <select id="candleTimeframeSelector" onchange="loadCandleChart()">
+                    <option value="5minute" selected>5 Min</option>
+                    <option value="15minute">15 Min</option>
+                    <option value="30minute">30 Min</option>
+                    <option value="60minute">1 Hour</option>
+                    <option value="day">1 Day</option>
+                </select>
+            </div>
+        </div>
+        <div id="candleContainer"></div>
+    </div>
 
     <div class="metrics-grid">
         <div class="card" style="border-left-color: #facc15;">
@@ -514,7 +795,7 @@ ANALYSIS_HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- MAIN GRAPHICAL BAR CHART -->
+    <!-- 3. MAIN STRIKE-WISE OPTION CHAIN BAR CHART -->
     <div class="chart-box">
         <div class="chart-header">
             <div class="chart-title" id="chartHeaderTitle">Strike-Wise Open Interest (Call vs Put)</div>
@@ -529,14 +810,13 @@ ANALYSIS_HTML_TEMPLATE = """
         let rawRows = {{ rows | tojson }};
         let currentAtmStrike = {{ atm_strike }};
         let myChart = null;
+        let historyChartObj = null;
 
-        const savedMetric = localStorage.getItem("selected_option_metric");
-        if (savedMetric) {
-            const selector = document.getElementById("metricSelector");
-            if (selector.querySelector(`option[value="${savedMetric}"]`)) {
-                selector.value = savedMetric;
-            }
-        }
+        // Lightweight Charts References
+        let tvChart = null;
+        let candleSeries = null;
+        let ema8Series = null;
+        let ema24Series = null;
 
         function switchSymbol(newSym) {
             window.location.href = `/analysis?symbol=${newSym}`;
@@ -563,6 +843,208 @@ ANALYSIS_HTML_TEMPLATE = """
             const intercept = (sumY - slope * sumX) / n;
 
             return data.map((_, i) => Number((slope * i + intercept).toFixed(2)));
+        }
+
+        // --- TRADINGVIEW LIGHTWEIGHT CHARTS INITIALIZATION ---
+        function initCandleChart() {
+            const container = document.getElementById('candleContainer');
+            if (!container || typeof LightweightCharts === 'undefined') return;
+
+            tvChart = LightweightCharts.createChart(container, {
+                layout: {
+                    backgroundColor: '#0f172a',
+                    textColor: '#94a3b8'
+                },
+                grid: {
+                    vertLines: { color: '#1e293b' },
+                    horzLines: { color: '#1e293b' }
+                },
+                crosshair: {
+                    mode: LightweightCharts.CrosshairMode.Normal
+                },
+                rightPriceScale: {
+                    borderColor: '#334155'
+                },
+                timeScale: {
+                    borderColor: '#334155',
+                    timeVisible: true,
+                    secondsVisible: false
+                }
+            });
+
+            candleSeries = tvChart.addCandlestickSeries({
+                upColor: '#22c55e',
+                downColor: '#ef4444',
+                borderVisible: false,
+                wickUpColor: '#22c55e',
+                wickDownColor: '#ef4444'
+            });
+
+            ema8Series = tvChart.addLineSeries({
+                color: '#facc15',
+                lineWidth: 2,
+                title: '8 EMA'
+            });
+
+            ema24Series = tvChart.addLineSeries({
+                color: '#38bdf8',
+                lineWidth: 2,
+                title: '24 EMA'
+            });
+
+            loadCandleChart();
+        }
+
+        function loadCandleChart() {
+            const tf = document.getElementById('candleTimeframeSelector').value;
+            fetch(`/api/candles?symbol=${currentSymbol}&timeframe=${tf}`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.error || !data.candles || data.candles.length === 0) return;
+                    try {
+                        if (candleSeries) candleSeries.setData(data.candles);
+                        if (ema8Series && data.ema8) ema8Series.setData(data.ema8);
+                        if (ema24Series && data.ema24) ema24Series.setData(data.ema24);
+                        if (tvChart) tvChart.timeScale().fitContent();
+                    } catch (e) {
+                        console.error("Error populating candle series:", e);
+                    }
+                })
+                .catch(err => console.error("Error fetching candle data:", err));
+        }
+
+        // --- HISTORICAL SNAPSHOT TREND CHART (FROM MEMORY) ---
+        function initHistoryChart() {
+            const ctx = document.getElementById('historyChart').getContext('2d');
+            historyChartObj = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: []
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } },
+                        y: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } }
+                    },
+                    plugins: {
+                        legend: { labels: { color: '#f8fafc', font: { size: 13 } } },
+                        tooltip: { mode: 'index', intersect: false }
+                    }
+                }
+            });
+            loadHistoricalChart();
+        }
+
+        function loadHistoricalChart() {
+            const metric = document.getElementById('historyMetricSelector').value;
+            const timeframe = document.getElementById('historyTimeframeSelector').value;
+
+            fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&metric=${metric}`)
+                .then(res => res.json())
+                .then(data => {
+                    const snapshots = data.history || [];
+                    const times = snapshots.map(s => s.formatted_time || s.datetime);
+
+                    let datasets = [];
+
+                    if (metric === "spot_price") {
+                        const spotVals = snapshots.map(s => s.spot_price);
+                        datasets.push({
+                            label: 'Spot Price',
+                            data: spotVals,
+                            borderColor: '#facc15',
+                            backgroundColor: 'rgba(250, 204, 21, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.2,
+                            fill: true
+                        });
+                        datasets.push({
+                            label: 'Spot Linear Trend',
+                            data: computeLinearTrend(spotVals),
+                            borderColor: '#ca8a04',
+                            borderDash: [6, 4],
+                            borderWidth: 2,
+                            pointRadius: 0,
+                            fill: false
+                        });
+                    }
+                    else if (metric === "pcr") {
+                        const pcrVals = snapshots.map(s => s.pcr);
+                        datasets.push({
+                            label: 'Put-Call Ratio (PCR)',
+                            data: pcrVals,
+                            borderColor: '#38bdf8',
+                            borderWidth: 2,
+                            tension: 0.2
+                        });
+                        datasets.push({
+                            label: 'PCR Linear Trend',
+                            data: computeLinearTrend(pcrVals),
+                            borderColor: '#0284c7',
+                            borderDash: [6, 4],
+                            borderWidth: 2,
+                            pointRadius: 0,
+                            fill: false
+                        });
+                    }
+                    else {
+                        let keyCe = `ce_${metric}`, keyPe = `pe_${metric}`;
+                        let titleCe = `Call (CE) ${metric.toUpperCase()}`, titlePe = `Put (PE) ${metric.toUpperCase()}`;
+
+                        if (metric === "depth_qty") {
+                            keyCe = "ce_ask_qty"; keyPe = "pe_bid_qty";
+                            titleCe = "Call Ask Qty (Sell Vol)"; titlePe = "Put Bid Qty (Buy Vol)";
+                        }
+
+                        const ceVals = snapshots.map(s => s[keyCe] || 0);
+                        const peVals = snapshots.map(s => s[keyPe] || 0);
+
+                        datasets.push({
+                            label: titleCe,
+                            data: ceVals,
+                            borderColor: '#ef4444',
+                            backgroundColor: 'rgba(239, 68, 68, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.2
+                        });
+                        datasets.push({
+                            label: titlePe,
+                            data: peVals,
+                            borderColor: '#22c55e',
+                            backgroundColor: 'rgba(34, 197, 94, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.2
+                        });
+
+                        // Add Linear Trendlines
+                        datasets.push({
+                            label: `${titleCe} Trend`,
+                            data: computeLinearTrend(ceVals),
+                            borderColor: '#f87171',
+                            borderDash: [6, 4],
+                            borderWidth: 2,
+                            pointRadius: 0,
+                            fill: false
+                        });
+                        datasets.push({
+                            label: `${titlePe} Trend`,
+                            data: computeLinearTrend(peVals),
+                            borderColor: '#4ade80',
+                            borderDash: [6, 4],
+                            borderWidth: 2,
+                            pointRadius: 0,
+                            fill: false
+                        });
+                    }
+
+                    historyChartObj.data.labels = times;
+                    historyChartObj.data.datasets = datasets;
+                    historyChartObj.update();
+                })
+                .catch(err => console.error("Historical chart error:", err));
         }
 
         const spotLinePlugin = {
@@ -779,7 +1261,7 @@ ANALYSIS_HTML_TEMPLATE = """
                 });
         }
 
-        initChart();
+        try { initChart(); } catch(e) { console.error("Bar Chart Init Error:", e); }
         renderPageData({
             rows: rawRows,
             spot_price: {{ spot_price }},
@@ -788,6 +1270,9 @@ ANALYSIS_HTML_TEMPLATE = """
             updated: "{{ updated }}",
             pcr: {{ pcr }}
         });
+        try { initHistoryChart(); } catch(e) { console.error("History Chart Init Error:", e); }
+        try { initCandleChart(); } catch(e) { console.error("Candle Chart Init Error:", e); }
+
         startAutoSync();
     </script>
 </body>
@@ -798,6 +1283,50 @@ ANALYSIS_HTML_TEMPLATE = """
 @app.route("/health")
 def health():
     return "OK", 200
+
+@app.route("/api/history")
+def api_history():
+    """Returns stored in-memory 5-minute snapshots filtered by symbol & resampled by timeframe."""
+    symbol = request.args.get("symbol", "NIFTY").upper()
+    timeframe = request.args.get("timeframe", "5minute")
+
+    with SNAPSHOT_LOCK:
+        filtered = [s for s in HISTORICAL_SNAPSHOTS if s.get("symbol") == symbol]
+
+    if timeframe == "5minute" or not filtered:
+        return jsonify({"history": filtered, "count": len(filtered)})
+
+    sec_map = {
+        "15minute": 15 * 60,
+        "30minute": 30 * 60,
+        "60minute": 60 * 60,
+        "day": 24 * 60 * 60
+    }
+    interval_sec = sec_map.get(timeframe, 300)
+
+    grouped = {}
+    for item in filtered:
+        bucket = (item["timestamp"] // interval_sec) * interval_sec
+        grouped[bucket] = item
+
+    resampled = [grouped[b] for b in sorted(grouped.keys())]
+    return jsonify({"history": resampled, "count": len(resampled)})
+
+@app.route("/api/candles")
+def api_candles():
+    """Returns 60 days of historical candle OHLC data with 8 EMA and 24 EMA."""
+    symbol = request.args.get("symbol", "NIFTY").upper()
+    timeframe = request.args.get("timeframe", "5minute")
+    data, error = fetch_historical_candles(symbol, timeframe, days=60)
+    
+    if error:
+        return jsonify({"candles": [], "ema8": [], "ema24": [], "error": error})
+    return jsonify({
+        "candles": data["candles"],
+        "ema8": data["ema8"],
+        "ema24": data["ema24"],
+        "error": None
+    })
 
 @app.route("/api/data")
 def api_data():
@@ -890,4 +1419,5 @@ def download_csv():
     return output
 
 if __name__ == "__main__":
+    start_background_recorder()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
