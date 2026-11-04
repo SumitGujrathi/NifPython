@@ -537,4 +537,216 @@ ANALYSIS_HTML_TEMPLATE = """
             const selected = document.getElementById("metricSelector").value;
             localStorage.setItem("selected_option_metric", selected);
 
-            const titleEl =
+            const titleEl = document.getElementById("chartHeaderTitle");
+            const strikes = rawRows.map(r => r.strike);
+
+            let ceData = [], peData = [];
+            let ceLabel = "", peLabel = "";
+            let ceColor = "", peColor = "";
+            let metricTitle = "";
+
+            if (selected === "oi") {
+                metricTitle = "Open Interest (CE vs PE)";
+                ceLabel = "Call OI"; peLabel = "Put OI";
+                ceColor = 'rgba(239, 68, 68, 0.85)'; peColor = 'rgba(34, 197, 94, 0.85)';
+                ceData = rawRows.map(r => r.ce_oi);
+                peData = rawRows.map(r => r.pe_oi);
+            }
+            else if (selected === "oi_chg") {
+                metricTitle = "Change in Open Interest (Chg in OI)";
+                ceLabel = "Call Chg in OI"; peLabel = "Put Chg in OI";
+                ceColor = 'rgba(225, 29, 72, 0.85)'; peColor = 'rgba(16, 185, 129, 0.85)';
+                ceData = rawRows.map(r => r.ce_oi_chg);
+                peData = rawRows.map(r => r.pe_oi_chg);
+            }
+            else if (selected === "vol") {
+                metricTitle = "Trading Volume";
+                ceLabel = "Call Volume"; peLabel = "Put Volume";
+                ceColor = 'rgba(249, 115, 22, 0.85)'; peColor = 'rgba(14, 165, 233, 0.85)';
+                ceData = rawRows.map(r => r.ce_vol);
+                peData = rawRows.map(r => r.pe_vol);
+            }
+            else if (selected === "depth_qty") {
+                metricTitle = "Order Book Depth Quantity (Call Ask Qty vs Put Bid Qty)";
+                ceLabel = "Call Ask Qty (Sell Vol)"; peLabel = "Put Bid Qty (Buy Vol)";
+                ceColor = 'rgba(236, 72, 153, 0.85)'; peColor = 'rgba(168, 85, 247, 0.85)';
+                ceData = rawRows.map(r => r.ce_ask_qty);
+                peData = rawRows.map(r => r.pe_bid_qty);
+            }
+            else if (selected === "delta") {
+                metricTitle = "Option Delta Exposure";
+                ceLabel = "Call Delta"; peLabel = "Put Delta";
+                ceColor = 'rgba(239, 68, 68, 0.85)'; peColor = 'rgba(34, 197, 94, 0.85)';
+                ceData = rawRows.map(r => r.ce_delta);
+                peData = rawRows.map(r => r.pe_delta);
+            }
+            else if (selected === "theta") {
+                metricTitle = "Theta Time Decay Rate";
+                ceLabel = "Call Theta"; peLabel = "Put Theta";
+                ceColor = 'rgba(234, 179, 8, 0.85)'; peColor = 'rgba(168, 85, 247, 0.85)';
+                ceData = rawRows.map(r => r.ce_theta);
+                peData = rawRows.map(r => r.pe_theta);
+            }
+
+            titleEl.innerText = metricTitle;
+
+            myChart.data.labels = strikes;
+            myChart.data.datasets[0].label = ceLabel;
+            myChart.data.datasets[0].data = ceData;
+            myChart.data.datasets[0].backgroundColor = ceColor;
+
+            myChart.data.datasets[1].label = peLabel;
+            myChart.data.datasets[1].data = peData;
+            myChart.data.datasets[1].backgroundColor = peColor;
+
+            myChart.update();
+
+            // Calculate Gauge SUM and AVG
+            const count = rawRows.length || 1;
+            const ceSum = ceData.reduce((a, b) => a + Math.abs(b), 0);
+            const peSum = peData.reduce((a, b) => a + Math.abs(b), 0);
+            const ceAvg = (ceSum / count).toFixed(2);
+            const peAvg = (peSum / count).toFixed(2);
+            
+            const totalSum = ceSum + peSum;
+            const cePct = totalSum > 0 ? ((ceSum / totalSum) * 100).toFixed(1) : 50;
+            const pePct = totalSum > 0 ? ((peSum / totalSum) * 100).toFixed(1) : 50;
+            const ratio = ceSum > 0 ? (peSum / ceSum).toFixed(2) : "0.00";
+
+            document.getElementById("gaugeMetricName").innerText = metricTitle.toUpperCase();
+            document.getElementById("gaugeCeLabel").innerText = `CALL (CE) TOTAL: ${ceSum.toLocaleString()} (${cePct}%)`;
+            document.getElementById("gaugePeLabel").innerText = `PUT (PE) TOTAL: ${peSum.toLocaleString()} (${pePct}%)`;
+            document.getElementById("gaugeCeAvg").innerText = `Call Avg: ${Number(ceAvg).toLocaleString()}`;
+            document.getElementById("gaugePeAvg").innerText = `Put Avg: ${Number(peAvg).toLocaleString()}`;
+            document.getElementById("gaugeRatioText").innerText = `Put/Call Ratio: ${ratio}`;
+
+            document.getElementById("gaugeCeBar").style.width = `${cePct}%`;
+            document.getElementById("gaugePeBar").style.width = `${pePct}%`;
+        }
+
+        // --- BACKGROUND AJAX POLLING (10s TIMER) ---
+        let timerSeconds = 10;
+        function startAutoSync() {
+            setInterval(() => {
+                timerSeconds--;
+                if (timerSeconds <= 0) {
+                    timerSeconds = 10;
+                    fetchDataInBackground();
+                }
+                document.getElementById("countdown").innerText = timerSeconds;
+            }, 1000);
+        }
+
+        function fetchDataInBackground() {
+            fetch(`/api/data?symbol=${currentSymbol}`)
+                .then(res => res.json())
+                .then(data => {
+                    renderPageData(data);
+                })
+                .catch(err => {
+                    console.error("Auto Sync Error:", err);
+                });
+        }
+
+        // Initialize page
+        initChart();
+        renderPageData({
+            rows: rawRows,
+            spot_price: {{ spot_price }},
+            expiry: "{{ expiry }}",
+            updated: "{{ updated }}",
+            pcr: {{ pcr }}
+        });
+        startAutoSync();
+    </script>
+</body>
+</html>
+"""
+
+# --- ROUTES ---
+@app.route("/health")
+def health():
+    return "OK", 200
+
+@app.route("/api/data")
+def api_data():
+    """Background JSON API endpoint for zero-reload live updates."""
+    symbol = request.args.get("symbol", "NIFTY").upper()
+    rows, spot_price, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
+    return jsonify({
+        "rows": rows,
+        "spot_price": spot_price,
+        "expiry": expiry,
+        "updated": updated,
+        "pcr": pcr,
+        "total_ce_oi": total_ce_oi,
+        "total_pe_oi": total_pe_oi,
+        "error": error
+    })
+
+@app.route("/", methods=["GET", "HEAD"])
+def index():
+    if request.method == "HEAD":
+        return Response(status=200)
+
+    symbol = request.args.get("symbol", "NIFTY").upper()
+    rows, spot_price, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
+    return render_template_string(
+        MAIN_HTML_TEMPLATE,
+        rows=rows,
+        symbol=symbol,
+        spot_price=spot_price,
+        expiry=expiry,
+        updated=updated,
+        pcr=pcr,
+        total_ce_oi=total_ce_oi,
+        total_pe_oi=total_pe_oi,
+        error=error
+    )
+
+@app.route("/analysis", methods=["GET"])
+def analysis_dashboard():
+    symbol = request.args.get("symbol", "NIFTY").upper()
+    rows, spot_price, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
+
+    return render_template_string(
+        ANALYSIS_HTML_TEMPLATE,
+        rows=rows,
+        symbol=symbol,
+        spot_price=spot_price,
+        expiry=expiry,
+        updated=updated,
+        pcr=pcr,
+        total_ce_oi=total_ce_oi,
+        total_pe_oi=total_pe_oi,
+        error=error
+    )
+
+@app.route("/download")
+def download_csv():
+    symbol = request.args.get("symbol", "NIFTY").upper()
+    rows, spot_price, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
+
+    si = io.StringIO()
+    cw = csv.writer(si)
+    cw.writerow([f"Symbol: {symbol}", f"Spot Price: {spot_price}", f"Expiry: {expiry}", f"PCR: {pcr}", f"Updated: {updated}"])
+    cw.writerow([
+        "CE OI", "CE Vol", "CE IV", "CE Delta", "CE Theta", "CE Vega", "CE Gamma", "CE Bid", "CE Ask", "CE LTP",
+        "STRIKE",
+        "PE LTP", "PE Bid", "PE Ask", "PE Delta", "PE Theta", "PE Vega", "PE Gamma", "PE IV", "PE Vol", "PE OI"
+    ])
+
+    if not error:
+        for r in rows:
+            cw.writerow([
+                r["ce_oi"], r["ce_vol"], r["ce_iv"], r["ce_delta"], r["ce_theta"], r["ce_vega"], r["ce_gamma"], r["ce_bid"], r["ce_ask"], r["ce_ltp"],
+                r["strike"],
+                r["pe_ltp"], r["pe_bid"], r["pe_ask"], r["pe_delta"], r["pe_theta"], r["pe_vega"], r["pe_gamma"], r["pe_iv"], r["pe_vol"], r["pe_oi"]
+            ])
+
+    output = Response(si.getvalue(), mimetype="text/csv")
+    output.headers["Content-Disposition"] = f"attachment; filename={symbol}_Advanced_Option_Chain.csv"
+    return output
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
