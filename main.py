@@ -142,7 +142,7 @@ def calculate_ema(prices, period):
 def fetch_historical_candles(symbol, timeframe="5minute", days=60):
     token = get_valid_token()
     if not token:
-        return [], "Authentication required."
+        return {"candles": [], "ema8": [], "ema24": []}, "Authentication required."
 
     instrument_key = INSTRUMENT_KEYS.get(symbol, "NSE_INDEX|Nifty 50")
     headers = {
@@ -154,7 +154,6 @@ def fetch_historical_candles(symbol, timeframe="5minute", days=60):
     to_date = datetime.now(ist_tz).strftime("%Y-%m-%d")
     from_date = (datetime.now(ist_tz) - timedelta(days=days)).strftime("%Y-%m-%d")
 
-    # Map timeframes to Upstox API V2 formats
     tf_map = {
         "5minute": "5minute",
         "15minute": "15minute",
@@ -169,36 +168,44 @@ def fetch_historical_candles(symbol, timeframe="5minute", days=60):
         res = requests.get(url, headers=headers, timeout=10)
 
         if res.status_code != 200:
-            return [], f"Candle API status {res.status_code}: {res.text}"
+            return {"candles": [], "ema8": [], "ema24": []}, f"Candle API status {res.status_code}: {res.text}"
 
         raw_candles = res.json().get("data", {}).get("candles", [])
         if not raw_candles:
-            return [], "No candle data returned."
+            return {"candles": [], "ema8": [], "ema24": []}, "No candle data returned."
 
         # Upstox returns candles newest-first; reverse to chronological order
         raw_candles.reverse()
 
+        seen_times = set()
         parsed_candles = []
         close_prices = []
 
         for c in raw_candles:
-            ts_str, open_p, high_p, low_p, close_p, vol = c[0], c[1], c[2], c[3], c[4], c[5]
-            
+            ts_str = c[0]
             try:
-                dt = datetime.fromisoformat(ts_str)
+                dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
                 unix_ts = int(dt.timestamp())
             except Exception:
-                unix_ts = int(time.time())
+                continue
 
+            if unix_ts in seen_times:
+                continue
+            seen_times.add(unix_ts)
+
+            close_p = round(float(c[4]), 2)
             parsed_candles.append({
                 "time": unix_ts,
-                "open": round(open_p, 2),
-                "high": round(high_p, 2),
-                "low": round(low_p, 2),
-                "close": round(close_p, 2),
-                "volume": vol
+                "open": round(float(c[1]), 2),
+                "high": round(float(c[2]), 2),
+                "low": round(float(c[3]), 2),
+                "close": close_p,
+                "volume": int(c[5])
             })
             close_prices.append(close_p)
+
+        # Sort strictly by timestamp ascending
+        parsed_candles.sort(key=lambda x: x["time"])
 
         # Compute 8 EMA and 24 EMA
         ema8_list = calculate_ema(close_prices, 8)
@@ -221,7 +228,7 @@ def fetch_historical_candles(symbol, timeframe="5minute", days=60):
         }, None
 
     except Exception as e:
-        return [], f"Exception fetching candles: {e}"
+        return {"candles": [], "ema8": [], "ema24": []}, f"Exception fetching candles: {e}"
 
 # --- UPSTOX CONCURRENT DATA FETCHING ---
 def fetch_single_expiry_chain(instrument_key, expiry_date, headers):
@@ -498,14 +505,14 @@ MAIN_HTML_TEMPLATE = """
 </html>
 """
 
-# --- ANALYSIS DASHBOARD TEMPLATE WITH CANDLESTICK CHART & 8/24 EMA ---
+# --- ANALYSIS DASHBOARD TEMPLATE ---
 ANALYSIS_HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
     <title>{{ symbol }} Option Chain & Technical Chart Analysis</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@3.8.0/dist/lightweight-charts.standalone.production.js"></script>
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #0f172a; color: #f8fafc; }
         h2 { color: #38bdf8; margin-bottom: 5px; }
@@ -648,7 +655,7 @@ ANALYSIS_HTML_TEMPLATE = """
         let currentAtmStrike = {{ atm_strike }};
         let myChart = null;
 
-        // TradingView Lightweight Charts References
+        // Lightweight Charts References
         let tvChart = null;
         let candleSeries = null;
         let ema8Series = null;
@@ -671,12 +678,14 @@ ANALYSIS_HTML_TEMPLATE = """
             fetchDataInBackground();
         }
 
-        // --- TRADINGVIEW CANDLESTICK CHART INITIALIZATION ---
+        // --- TRADINGVIEW LIGHTWEIGHT CHARTS INITIALIZATION ---
         function initCandleChart() {
             const container = document.getElementById('candleContainer');
+            if (!container || typeof LightweightCharts === 'undefined') return;
+
             tvChart = LightweightCharts.createChart(container, {
                 layout: {
-                    background: { color: '#0f172a' },
+                    backgroundColor: '#0f172a',
                     textColor: '#94a3b8'
                 },
                 grid: {
@@ -725,15 +734,19 @@ ANALYSIS_HTML_TEMPLATE = """
                 .then(res => res.json())
                 .then(data => {
                     if (data.error || !data.candles || data.candles.length === 0) {
-                        console.error("Candle fetch error:", data.error);
+                        console.warn("Candle data warning:", data.error);
                         return;
                     }
-                    candleSeries.setData(data.candles);
-                    ema8Series.setData(data.ema8 || []);
-                    ema24Series.setData(data.ema24 || []);
-                    tvChart.timeScale().fitContent();
+                    try {
+                        if (candleSeries) candleSeries.setData(data.candles);
+                        if (ema8Series && data.ema8) ema8Series.setData(data.ema8);
+                        if (ema24Series && data.ema24) ema24Series.setData(data.ema24);
+                        if (tvChart) tvChart.timeScale().fitContent();
+                    } catch (e) {
+                        console.error("Error populating candle series:", e);
+                    }
                 })
-                .catch(err => console.error("Error loading candle chart:", err));
+                .catch(err => console.error("Error fetching candle data:", err));
         }
 
         function computeLinearTrend(data) {
@@ -968,8 +981,13 @@ ANALYSIS_HTML_TEMPLATE = """
                 });
         }
 
-        initCandleChart();
-        initChart();
+        // --- ISOLATED SAFE INITIALIZATION SEQUENCE ---
+        try {
+            initChart();
+        } catch(e) {
+            console.error("Bar Chart Init Error:", e);
+        }
+
         renderPageData({
             rows: rawRows,
             spot_price: {{ spot_price }},
@@ -978,6 +996,13 @@ ANALYSIS_HTML_TEMPLATE = """
             updated: "{{ updated }}",
             pcr: {{ pcr }}
         });
+
+        try {
+            initCandleChart();
+        } catch(e) {
+            console.error("Candle Chart Init Error:", e);
+        }
+
         startAutoSync();
     </script>
 </body>
