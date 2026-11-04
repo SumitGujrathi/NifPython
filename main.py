@@ -122,10 +122,10 @@ def get_valid_token():
     return perform_single_auth()
 
 # --- UPSTOX DATA FETCHING & STABILIZED PROCESSING ---
-def fetch_option_chain(symbol):
+def fetch_option_chain(symbol, selected_expiry=None):
     token = get_valid_token()
     if not token:
-        return None, None, "Authentication paused to protect account from lockout. Wait 25 mins or check logs."
+        return None, None, [], "Authentication paused to protect account from lockout. Wait 25 mins or check logs."
 
     instrument_key = INSTRUMENT_KEYS.get(symbol, "NSE_INDEX|Nifty 50")
     headers = {
@@ -141,44 +141,48 @@ def fetch_option_chain(symbol):
             invalidate_session()
             token = perform_single_auth()
             if not token:
-                return None, None, "Session expired and re-authentication paused."
+                return None, None, [], "Session expired and re-authentication paused."
             headers["Authorization"] = f"Bearer {token}"
             exp_res = requests.get(expiry_url, headers=headers, timeout=10)
 
         if exp_res.status_code != 200:
-            return None, None, f"Expiry lookup failed: {exp_res.text}"
+            return None, None, [], f"Expiry lookup failed: {exp_res.text}"
 
         expiries = sorted(list(set(item["expiry"] for item in exp_res.json().get("data", []))))
         if not expiries:
-            return None, None, "No option contract expiries found."
+            return None, None, [], "No option contract expiries found."
 
-        current_expiry = expiries[0]
+        # Select targeted expiry if specified and valid; otherwise default to nearest current week expiry
+        if selected_expiry and selected_expiry in expiries:
+            target_expiry = selected_expiry
+        else:
+            target_expiry = expiries[0]
 
-        chain_url = f"https://api.upstox.com/v2/option/chain?instrument_key={urllib.parse.quote(instrument_key)}&expiry_date={current_expiry}"
+        chain_url = f"https://api.upstox.com/v2/option/chain?instrument_key={urllib.parse.quote(instrument_key)}&expiry_date={target_expiry}"
         chain_res = requests.get(chain_url, headers=headers, timeout=10)
 
         if chain_res.status_code != 200:
-            return None, current_expiry, f"Option Chain fetch failed: {chain_res.text}"
+            return None, target_expiry, expiries, f"Option Chain fetch failed: {chain_res.text}"
 
         chain_data = chain_res.json().get("data", [])
-        return chain_data, current_expiry, None
+        return chain_data, target_expiry, expiries, None
 
     except Exception as e:
-        return None, None, f"Exception during fetch: {e}"
+        return None, None, [], f"Exception during fetch: {e}"
 
-def process_option_data(symbol):
-    chain_data, current_expiry, error = fetch_option_chain(symbol)
+def process_option_data(symbol, selected_expiry=None):
+    chain_data, current_expiry, expiries, error = fetch_option_chain(symbol, selected_expiry)
     
     # IST Timezone Formatting
     ist_tz = timezone(timedelta(hours=5, minutes=30))
     updated_time = datetime.now(ist_tz).strftime("%d/%m/%Y %H:%M:%S IST")
 
     if error or not chain_data:
-        return [], 0, 0, current_expiry or "N/A", updated_time, 0, 0, 0, error or "No option chain data available."
+        return [], 0, 0, current_expiry or "N/A", expiries, updated_time, 0, 0, 0, error or "No option chain data available."
 
     spot_price = chain_data[0].get("underlying_spot_price", 0) if chain_data else 0
 
-    # Grid Stabilization: Calculate fixed ATM strike and symmetric strike range
+    # Fixed ATM strike rounding and symmetric strike grid
     step = 100 if symbol == "BANKNIFTY" else 50
     atm_strike = round(spot_price / step) * step if step > 0 else spot_price
 
@@ -251,9 +255,9 @@ def process_option_data(symbol):
             })
 
     pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 0
-    return rows, spot_price, atm_strike, current_expiry, updated_time, pcr, total_ce_oi, total_pe_oi, None
+    return rows, spot_price, atm_strike, current_expiry, expiries, updated_time, pcr, total_ce_oi, total_pe_oi, None
 
-# --- MAIN TABLE TEMPLATE (RED CE / GREEN PE / YELLOW SPOT) ---
+# --- MAIN TABLE TEMPLATE WITH DYNAMIC EXPIRY LIST ---
 MAIN_HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -272,13 +276,13 @@ MAIN_HTML_TEMPLATE = """
         .btn-success { background-color: #28a745; }
         .btn-purple { background-color: #6f42c1; }
         .btn:hover { opacity: 0.9; }
+        select { padding: 8px 12px; font-size: 14px; border-radius: 4px; border: 1px solid #ced4da; outline: none; font-weight: 600; }
         .table-container { overflow-x: auto; background: #fff; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.06); }
         table { width: 100%; border-collapse: collapse; min-width: 1200px; }
         th, td { border: 1px solid #e9ecef; padding: 7px 9px; text-align: center; font-size: 13px; }
         th { background-color: #343a40; color: white; position: sticky; top: 0; }
         tr:nth-child(even){ background-color: #f8f9fa; }
         
-        /* STRICT COLOR SCHEME: RED CE, GREEN PE, YELLOW SPOT */
         .ce-header { background-color: #dc3545 !important; color: white; }
         .pe-header { background-color: #28a745 !important; color: white; }
         .ce-cell { background-color: #fff5f5; }
@@ -305,11 +309,22 @@ MAIN_HTML_TEMPLATE = """
             <div class="metric-card"><strong>Total Put OI:</strong> {{ "{:,}".format(total_pe_oi) }}</div>
             <div class="metric-card"><strong>Last Updated (IST):</strong> {{ updated }}</div>
         </div>
-        <div>
+        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
             <a href="/?symbol=NIFTY" class="btn">View NIFTY</a>
             <a href="/?symbol=BANKNIFTY" class="btn">View BANKNIFTY</a>
-            <a href="/analysis?symbol={{ symbol }}" class="btn btn-purple">📊 Open Analysis Dashboard</a>
-            <a href="/download?symbol={{ symbol }}" class="btn btn-success">Download Full CSV</a>
+            
+            <form method="GET" action="/" style="display: inline-flex; align-items: center; gap: 6px; margin: 0;">
+                <input type="hidden" name="symbol" value="{{ symbol }}">
+                <label style="font-weight: bold; color: #334155;">Select Expiry:</label>
+                <select name="expiry" onchange="this.form.submit()">
+                    {% for exp in expiries %}
+                        <option value="{{ exp }}" {% if exp == expiry %}selected{% endif %}>{{ exp }}</option>
+                    {% endfor %}
+                </select>
+            </form>
+
+            <a href="/analysis?symbol={{ symbol }}&expiry={{ expiry }}" class="btn btn-purple">📊 Open Analysis Dashboard</a>
+            <a href="/download?symbol={{ symbol }}&expiry={{ expiry }}" class="btn btn-success">Download Full CSV</a>
         </div>
     </div>
 
@@ -368,7 +383,7 @@ MAIN_HTML_TEMPLATE = """
 </html>
 """
 
-# --- ANALYSIS DASHBOARD TEMPLATE (STABILIZED, IST, TRENDLINES & YELLOW SPOT LINE) ---
+# --- ANALYSIS DASHBOARD TEMPLATE WITH EXPIRY SELECTOR & LIVE AUTO-SYNC ---
 ANALYSIS_HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -410,7 +425,14 @@ ANALYSIS_HTML_TEMPLATE = """
             <option value="BANKNIFTY" {% if symbol == 'BANKNIFTY' %}selected{% endif %}>BANK NIFTY</option>
         </select>
 
-        <label style="color: #94a3b8; font-weight: bold; margin-left: 15px;">Metric View:</label>
+        <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Expiry:</label>
+        <select id="expirySelector" onchange="switchExpiry(this.value)">
+            {% for exp in expiries %}
+                <option value="{{ exp }}" {% if exp == expiry %}selected{% endif %}>{{ exp }}</option>
+            {% endfor %}
+        </select>
+
+        <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Metric View:</label>
         <select id="metricSelector" onchange="updateChartMetric()">
             <option value="oi">Open Interest (CE vs PE)</option>
             <option value="oi_chg">Change in Open Interest (Chg in OI)</option>
@@ -422,7 +444,7 @@ ANALYSIS_HTML_TEMPLATE = """
 
         <div style="margin-left: auto; display: flex; align-items: center; gap: 12px;">
             <span class="timer-badge">Auto Sync: <span id="countdown">10</span>s</span>
-            <a href="/?symbol={{ symbol }}" class="btn btn-table">📋 Back to Table View</a>
+            <a href="/?symbol={{ symbol }}&expiry={{ expiry }}" class="btn btn-table">📋 Back to Table View</a>
         </div>
     </div>
 
@@ -451,7 +473,7 @@ ANALYSIS_HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- DYNAMIC METRIC SENTIMENT GAUGE (CE VS PE SUM & AVG) -->
+    <!-- DYNAMIC METRIC SENTIMENT GAUGE -->
     <div class="sentiment-bar-container">
         <div style="display: flex; justify-content: space-between; font-weight: bold; margin-bottom: 8px;">
             <span style="color: #ef4444;" id="gaugeCeLabel">CALL (CE) TOTAL: -</span>
@@ -469,7 +491,7 @@ ANALYSIS_HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- MAIN GRAPHICAL BAR CHART WITH TRENDLINES & SPOT HIGHLIGHT -->
+    <!-- MAIN GRAPHICAL BAR CHART -->
     <div class="chart-box">
         <div class="chart-header">
             <div class="chart-title" id="chartHeaderTitle">Strike-Wise Open Interest (Call vs Put)</div>
@@ -480,6 +502,7 @@ ANALYSIS_HTML_TEMPLATE = """
 
     <script>
         let currentSymbol = "{{ symbol }}";
+        let currentExpiry = "{{ expiry }}";
         let rawRows = {{ rows | tojson }};
         let currentAtmStrike = {{ atm_strike }};
         let myChart = null;
@@ -496,7 +519,11 @@ ANALYSIS_HTML_TEMPLATE = """
             window.location.href = `/analysis?symbol=${newSym}`;
         }
 
-        // Linear Regression Calculation for Trendlines
+        function switchExpiry(newExp) {
+            currentExpiry = newExp;
+            fetchDataInBackground();
+        }
+
         function computeLinearTrend(data) {
             const n = data.length;
             if (n === 0) return [];
@@ -515,7 +542,6 @@ ANALYSIS_HTML_TEMPLATE = """
             return data.map((_, i) => Number((slope * i + intercept).toFixed(2)));
         }
 
-        // Custom Canvas Plugin to Draw Vertical Yellow Spot Line on Chart
         const spotLinePlugin = {
             id: 'spotLinePlugin',
             afterDraw: (chart) => {
@@ -669,17 +695,14 @@ ANALYSIS_HTML_TEMPLATE = """
 
             myChart.data.labels = strikes;
             
-            // Call Bar Dataset
             myChart.data.datasets[0].label = ceLabel;
             myChart.data.datasets[0].data = ceData;
             myChart.data.datasets[0].backgroundColor = ceColor;
 
-            // Put Bar Dataset
             myChart.data.datasets[1].label = peLabel;
             myChart.data.datasets[1].data = peData;
             myChart.data.datasets[1].backgroundColor = peColor;
 
-            // Linear Trendlines
             myChart.data.datasets[2].label = `${ceLabel} Trend`;
             myChart.data.datasets[2].data = computeLinearTrend(ceData);
 
@@ -688,7 +711,6 @@ ANALYSIS_HTML_TEMPLATE = """
 
             myChart.update();
 
-            // Calculate Gauge SUM and AVG
             const count = rawRows.length || 1;
             const ceSum = ceData.reduce((a, b) => a + Math.abs(b), 0);
             const peSum = peData.reduce((a, b) => a + Math.abs(b), 0);
@@ -711,7 +733,6 @@ ANALYSIS_HTML_TEMPLATE = """
             document.getElementById("gaugePeBar").style.width = `${pePct}%`;
         }
 
-        // --- BACKGROUND AJAX POLLING (10s TIMER) ---
         let timerSeconds = 10;
         function startAutoSync() {
             setInterval(() => {
@@ -725,7 +746,7 @@ ANALYSIS_HTML_TEMPLATE = """
         }
 
         function fetchDataInBackground() {
-            fetch(`/api/data?symbol=${currentSymbol}`)
+            fetch(`/api/data?symbol=${currentSymbol}&expiry=${currentExpiry}`)
                 .then(res => res.json())
                 .then(data => {
                     renderPageData(data);
@@ -759,12 +780,14 @@ def health():
 def api_data():
     """Background JSON API endpoint for zero-reload live updates."""
     symbol = request.args.get("symbol", "NIFTY").upper()
-    rows, spot_price, atm_strike, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
+    selected_expiry = request.args.get("expiry")
+    rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
     return jsonify({
         "rows": rows,
         "spot_price": spot_price,
         "atm_strike": atm_strike,
         "expiry": expiry,
+        "expiries": expiries,
         "updated": updated,
         "pcr": pcr,
         "total_ce_oi": total_ce_oi,
@@ -778,7 +801,8 @@ def index():
         return Response(status=200)
 
     symbol = request.args.get("symbol", "NIFTY").upper()
-    rows, spot_price, atm_strike, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
+    selected_expiry = request.args.get("expiry")
+    rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
     return render_template_string(
         MAIN_HTML_TEMPLATE,
         rows=rows,
@@ -786,6 +810,7 @@ def index():
         spot_price=spot_price,
         atm_strike=atm_strike,
         expiry=expiry,
+        expiries=expiries,
         updated=updated,
         pcr=pcr,
         total_ce_oi=total_ce_oi,
@@ -796,7 +821,8 @@ def index():
 @app.route("/analysis", methods=["GET"])
 def analysis_dashboard():
     symbol = request.args.get("symbol", "NIFTY").upper()
-    rows, spot_price, atm_strike, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
+    selected_expiry = request.args.get("expiry")
+    rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
 
     return render_template_string(
         ANALYSIS_HTML_TEMPLATE,
@@ -805,6 +831,7 @@ def analysis_dashboard():
         spot_price=spot_price,
         atm_strike=atm_strike,
         expiry=expiry,
+        expiries=expiries,
         updated=updated,
         pcr=pcr,
         total_ce_oi=total_ce_oi,
@@ -815,7 +842,8 @@ def analysis_dashboard():
 @app.route("/download")
 def download_csv():
     symbol = request.args.get("symbol", "NIFTY").upper()
-    rows, spot_price, atm_strike, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
+    selected_expiry = request.args.get("expiry")
+    rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
 
     si = io.StringIO()
     cw = csv.writer(si)
@@ -835,7 +863,7 @@ def download_csv():
             ])
 
     output = Response(si.getvalue(), mimetype="text/csv")
-    output.headers["Content-Disposition"] = f"attachment; filename={symbol}_Advanced_Option_Chain.csv"
+    output.headers["Content-Disposition"] = f"attachment; filename={symbol}_{expiry}_Option_Chain.csv"
     return output
 
 if __name__ == "__main__":
