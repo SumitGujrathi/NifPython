@@ -199,22 +199,30 @@ def fetch_option_chain(symbol, selected_expiry="ALL"):
         if not expiries:
             return None, None, [], "No option contract expiries found."
 
+        clean_expiry = str(selected_expiry).strip().upper() if selected_expiry else "ALL"
+
         # Default to ALL Expiries Consolidated
-        if not selected_expiry or selected_expiry == "ALL" or selected_expiry not in expiries:
-            combined_chain = []
+        if clean_expiry == "ALL" or clean_expiry == "ALL EXPIRIES (CONSOLIDATED)" or clean_expiry not in expiries:
             target_expiries = expiries[:6]
+            results_dict = {}
+
             with ThreadPoolExecutor(max_workers=5) as executor:
-                futures = [executor.submit(fetch_single_expiry_chain, instrument_key, exp, headers) for exp in target_expiries]
+                futures = {executor.submit(fetch_single_expiry_chain, instrument_key, exp, headers): exp for exp in target_expiries}
                 for future in as_completed(futures):
-                    _, data = future.result()
+                    exp_date, data = future.result()
                     if data:
-                        combined_chain.extend(data)
+                        results_dict[exp_date] = data
+
+            # Deterministic sorting to prevent thread race condition
+            combined_chain = []
+            for exp in sorted(results_dict.keys()):
+                combined_chain.extend(results_dict[exp])
             
             return combined_chain, "ALL EXPIRIES (CONSOLIDATED)", expiries, None
 
         # Specific Single Expiry Handling
-        _, chain_data = fetch_single_expiry_chain(instrument_key, selected_expiry, headers)
-        return chain_data, selected_expiry, expiries, None
+        _, chain_data = fetch_single_expiry_chain(instrument_key, clean_expiry, headers)
+        return chain_data, clean_expiry, expiries, None
 
     except Exception as e:
         return None, None, [], f"Exception during fetch: {e}"
@@ -268,6 +276,7 @@ def process_option_data(symbol, selected_expiry="ALL"):
         c_oi = ce_mkt.get("oi", 0) or 0
         p_oi = pe_mkt.get("oi", 0) or 0
 
+        # Aggregating volumes and open interest across expiries
         rec["ce_oi"] += c_oi
         rec["pe_oi"] += p_oi
         rec["ce_oi_chg"] += ce_mkt.get("poi", 0) or (c_oi - ce_mkt.get("prev_oi", c_oi))
@@ -279,6 +288,7 @@ def process_option_data(symbol, selected_expiry="ALL"):
         rec["pe_bid_qty"] += pe_mkt.get("bid_qty", 0) or 0
         rec["pe_ask_qty"] += pe_mkt.get("ask_qty", 0) or 0
 
+        # Lock primary option contract pricing to nearest expiry systematically
         if not rec["_has_pricing"]:
             rec["ce_ltp"] = ce_mkt.get("ltp", 0) or 0
             rec["ce_bid"] = ce_mkt.get("bid_price", 0) or 0
@@ -447,8 +457,8 @@ MAIN_HTML_TEMPLATE = """
             <div class="metric-card"><strong>Last Updated (IST):</strong> {{ updated }}</div>
         </div>
         <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-            <a href="/?symbol=NIFTY" class="btn">View NIFTY</a>
-            <a href="/?symbol=BANKNIFTY" class="btn">View BANKNIFTY</a>
+            <a href="/?symbol=NIFTY&expiry={{ expiry }}" class="btn">View NIFTY</a>
+            <a href="/?symbol=BANKNIFTY&expiry={{ expiry }}" class="btn">View BANKNIFTY</a>
             
             <form method="GET" action="/" style="display: inline-flex; align-items: center; gap: 6px; margin: 0;">
                 <input type="hidden" name="symbol" value="{{ symbol }}">
@@ -1057,7 +1067,6 @@ ANALYSIS_HTML_TEMPLATE = """
             isSyncing = true;
             document.getElementById("syncBadge").innerText = "Syncing (Hold 2s)...";
 
-            // 2-Second Hold / Calculation delay for 100% data verification
             setTimeout(() => {
                 fetch(`/api/data?symbol=${currentSymbol}&expiry=${currentExpiry}`)
                     .then(res => res.json())
@@ -1099,7 +1108,6 @@ def health():
 
 @app.route("/api/history")
 def api_history():
-    """Returns stored in-memory 5-minute snapshots filtered by symbol & resampled by timeframe."""
     symbol = request.args.get("symbol", "NIFTY").upper()
     timeframe = request.args.get("timeframe", "5minute")
 
@@ -1127,9 +1135,8 @@ def api_history():
 
 @app.route("/api/data")
 def api_data():
-    """Background JSON API endpoint for zero-reload live updates."""
     symbol = request.args.get("symbol", "NIFTY").upper()
-    selected_expiry = request.args.get("expiry", "ALL")
+    selected_expiry = request.args.get("expiry", "ALL").upper()
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
     return jsonify({
         "rows": rows,
@@ -1150,7 +1157,7 @@ def index():
         return Response(status=200)
 
     symbol = request.args.get("symbol", "NIFTY").upper()
-    selected_expiry = request.args.get("expiry", "ALL")
+    selected_expiry = request.args.get("expiry", "ALL").upper()
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
     return render_template_string(
         MAIN_HTML_TEMPLATE,
@@ -1170,7 +1177,7 @@ def index():
 @app.route("/analysis", methods=["GET"])
 def analysis_dashboard():
     symbol = request.args.get("symbol", "NIFTY").upper()
-    selected_expiry = request.args.get("expiry", "ALL")
+    selected_expiry = request.args.get("expiry", "ALL").upper()
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
 
     return render_template_string(
@@ -1191,7 +1198,7 @@ def analysis_dashboard():
 @app.route("/download")
 def download_csv():
     symbol = request.args.get("symbol", "NIFTY").upper()
-    selected_expiry = request.args.get("expiry", "ALL")
+    selected_expiry = request.args.get("expiry", "ALL").upper()
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
 
     si = io.StringIO()
@@ -1217,7 +1224,6 @@ def download_csv():
 
 @app.route("/download_history")
 def download_history_csv():
-    """Exports in-memory 5-minute historical memory snapshot variables to CSV for offline analysis."""
     symbol = request.args.get("symbol", "NIFTY").upper()
 
     with SNAPSHOT_LOCK:
