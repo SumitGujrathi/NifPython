@@ -3,7 +3,6 @@ import time
 import io
 import csv
 import json
-import sys
 import threading
 import urllib.parse
 from datetime import datetime, timezone, timedelta
@@ -37,7 +36,7 @@ AUTH_COOLDOWN = {
 }
 
 # --- IN-MEMORY HISTORICAL SNAPSHOT STORAGE ---
-HISTORICAL_SNAPSHOTS = []  # In-memory buffer for 5-minute snapshot time series
+HISTORICAL_SNAPSHOTS = []  # Buffer for 5-minute snapshot time series
 SNAPSHOT_LOCK = threading.Lock()
 
 # --- MARKET HOURS & MEMORY MANAGEMENT ---
@@ -45,7 +44,6 @@ def is_market_open():
     """Checks if current IST time is within Indian stock market hours (Mon-Fri, 9:15 AM - 3:30 PM)."""
     ist_tz = timezone(timedelta(hours=5, minutes=30))
     now_ist = datetime.now(ist_tz)
-    # Check weekday: Mon(0) to Fri(4). Sat(5) & Sun(6) are closed.
     if now_ist.weekday() >= 5:
         return False
     start_time = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
@@ -53,7 +51,7 @@ def is_market_open():
     return start_time <= now_ist <= end_time
 
 def trim_memory_if_needed():
-    """Ensures in-memory historical snapshot buffer does not exceed 50 MB, trimming down to ~30 MB."""
+    """Ensures memory usage of snapshot buffer stays under 50 MB, trimming down to ~30 MB."""
     global HISTORICAL_SNAPSHOTS
     with SNAPSHOT_LOCK:
         try:
@@ -62,14 +60,14 @@ def trim_memory_if_needed():
             target_limit = 30 * 1024 * 1024  # 30 MB target
 
             if raw_bytes > max_limit:
-                print(f"[Memory Trim] Buffer size {raw_bytes / (1024*1024):.2f} MB exceeds 50MB limit. Trimming down to ~30MB...")
+                print(f"[Memory Trim] Size {raw_bytes / (1024*1024):.2f} MB exceeds 50MB. Trimming down to ~30MB...")
                 while len(HISTORICAL_SNAPSHOTS) > 20:
                     current_size = len(json.dumps(HISTORICAL_SNAPSHOTS).encode('utf-8'))
                     if current_size <= target_limit:
                         break
                     trim_count = max(1, len(HISTORICAL_SNAPSHOTS) // 10)
                     HISTORICAL_SNAPSHOTS = HISTORICAL_SNAPSHOTS[trim_count:]
-                print(f"[Memory Trim Complete] New buffer size: {len(json.dumps(HISTORICAL_SNAPSHOTS).encode('utf-8')) / (1024*1024):.2f} MB ({len(HISTORICAL_SNAPSHOTS)} records retained)")
+                print(f"[Memory Trim Complete] New size: {len(json.dumps(HISTORICAL_SNAPSHOTS).encode('utf-8')) / (1024*1024):.2f} MB")
         except Exception as e:
             print(f"[Memory Trim Exception]: {e}")
 
@@ -176,7 +174,7 @@ def calculate_ema(prices, period):
         ema[i] = round(val, 2)
     return ema
 
-# --- UPSTOX HISTORICAL CANDLE DATA FETCHING ---
+# --- UPSTOX HISTORICAL & INTRADAY LIVE CANDLE DATA ---
 def fetch_historical_candles(symbol, timeframe="5minute", days=60):
     token = get_valid_token()
     if not token:
@@ -627,7 +625,7 @@ MAIN_HTML_TEMPLATE = """
 </html>
 """
 
-# --- ANALYSIS DASHBOARD TEMPLATE WITH HISTORICAL TREND CHART & CANDLESTICKS ---
+# --- ANALYSIS DASHBOARD TEMPLATE ---
 ANALYSIS_HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -662,8 +660,8 @@ ANALYSIS_HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-    <h2>📊 {{ symbol }} Advanced Analytics & Historical Trend Dashboard</h2>
-    <div class="subtitle">Live background auto-sync — Historical memory snapshots, candlestick charts, 8/24 EMAs, and option sentiment</div>
+    <h2>📊 {{ symbol }} Advanced Analytics & Historical Memory Dashboard</h2>
+    <div class="subtitle">Live background auto-sync — Real-time memory snapshots, strike positioning, and live candlestick price</div>
 
     <div class="nav-bar">
         <label style="color: #94a3b8; font-weight: bold;">Symbol:</label>
@@ -680,10 +678,10 @@ ANALYSIS_HTML_TEMPLATE = """
             {% endfor %}
         </select>
 
-        <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Option Metric:</label>
+        <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Bar Chart Metric:</label>
         <select id="metricSelector" onchange="updateChartMetric()">
+            <option value="oi_chg" selected>Change in Open Interest (Chg in OI)</option>
             <option value="oi">Open Interest (CE vs PE)</option>
-            <option value="oi_chg">Change in Open Interest (Chg in OI)</option>
             <option value="vol">Trading Volume</option>
             <option value="depth_qty">Order Book Depth (Bid Quantity vs Ask Quantity)</option>
             <option value="delta">Delta Exposure</option>
@@ -697,62 +695,6 @@ ANALYSIS_HTML_TEMPLATE = """
     </div>
 
     <div id="errorContainer" class="error-msg" style="display: none;"></div>
-
-    <!-- 1. NEW HISTORICAL TREND ANALYTICS CHART (FROM IN-MEMORY SNAPSHOTS) -->
-    <div class="chart-box">
-        <div class="chart-header">
-            <div style="display: flex; align-items: center; gap: 15px;">
-                <span class="chart-title">📈 Historical Snapshot Trend (5-Min Market Memory)</span>
-            </div>
-            <div style="display: flex; gap: 12px; align-items: center;">
-                <label style="color: #94a3b8; font-weight: bold;">Trend Metric:</label>
-                <select id="historyMetricSelector" onchange="loadHistoricalChart()">
-                    <option value="spot_price">Live Spot Price (Index)</option>
-                    <option value="oi" selected>Open Interest (CE vs PE)</option>
-                    <option value="vol">Trading Volume (CE vs PE)</option>
-                    <option value="pcr">Put-Call Ratio (PCR)</option>
-                    <option value="iv">Implied Volatility (IV CE vs PE)</option>
-                    <option value="delta">Delta Exposure (CE vs PE)</option>
-                    <option value="theta">Theta Decay (CE vs PE)</option>
-                    <option value="vega">Vega Exposure (CE vs PE)</option>
-                    <option value="gamma">Gamma Exposure (CE vs PE)</option>
-                    <option value="depth_qty">Order Book Depth (Ask Qty vs Bid Qty)</option>
-                </select>
-
-                <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Interval:</label>
-                <select id="historyTimeframeSelector" onchange="loadHistoricalChart()">
-                    <option value="5minute" selected>5 Min</option>
-                    <option value="15minute">15 Min</option>
-                    <option value="30minute">30 Min</option>
-                    <option value="60minute">1 Hour</option>
-                    <option value="day">1 Day</option>
-                </select>
-            </div>
-        </div>
-        <canvas id="historyChart" style="max-height: 420px;"></canvas>
-    </div>
-
-    <!-- 2. CANDLESTICK TECHNICAL ANALYSIS SECTION -->
-    <div class="chart-box">
-        <div class="chart-header">
-            <div style="display: flex; align-items: center; gap: 15px;">
-                <span class="chart-title">📊 60-Day Technical Price Chart (Candlestick & EMAs)</span>
-                <span class="legend-badge" style="color: #facc15;">🟡 8 EMA</span>
-                <span class="legend-badge" style="color: #38bdf8;">🔵 24 EMA</span>
-            </div>
-            <div>
-                <label style="color: #94a3b8; font-weight: bold; margin-right: 8px;">Chart Timeframe:</label>
-                <select id="candleTimeframeSelector" onchange="loadCandleChart()">
-                    <option value="5minute" selected>5 Min</option>
-                    <option value="15minute">15 Min</option>
-                    <option value="30minute">30 Min</option>
-                    <option value="60minute">1 Hour</option>
-                    <option value="day">1 Day</option>
-                </select>
-            </div>
-        </div>
-        <div id="candleContainer"></div>
-    </div>
 
     <div class="metrics-grid">
         <div class="card" style="border-left-color: #facc15;">
@@ -795,13 +737,69 @@ ANALYSIS_HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- 3. MAIN STRIKE-WISE OPTION CHAIN BAR CHART -->
+    <!-- CHART 1: HISTORICAL SNAPSHOT TREND (5-MIN MARKET MEMORY) -->
     <div class="chart-box">
         <div class="chart-header">
-            <div class="chart-title" id="chartHeaderTitle">Strike-Wise Open Interest (Call vs Put)</div>
+            <div style="display: flex; align-items: center; gap: 15px;">
+                <span class="chart-title">📈 Historical Snapshot Trend (5-Min Market Memory)</span>
+            </div>
+            <div style="display: flex; gap: 12px; align-items: center;">
+                <label style="color: #94a3b8; font-weight: bold;">Trend Metric:</label>
+                <select id="historyMetricSelector" onchange="loadHistoricalChart()">
+                    <option value="spot_price">Live Spot Price (Index)</option>
+                    <option value="oi" selected>Open Interest (CE vs PE)</option>
+                    <option value="vol">Trading Volume (CE vs PE)</option>
+                    <option value="pcr">Put-Call Ratio (PCR)</option>
+                    <option value="iv">Implied Volatility (IV CE vs PE)</option>
+                    <option value="delta">Delta Exposure (CE vs PE)</option>
+                    <option value="theta">Theta Decay (CE vs PE)</option>
+                    <option value="vega">Vega Exposure (CE vs PE)</option>
+                    <option value="gamma">Gamma Exposure (CE vs PE)</option>
+                    <option value="depth_qty">Order Book Depth (Ask Qty vs Bid Qty)</option>
+                </select>
+
+                <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Interval:</label>
+                <select id="historyTimeframeSelector" onchange="loadHistoricalChart()">
+                    <option value="5minute" selected>5 Min</option>
+                    <option value="15minute">15 Min</option>
+                    <option value="30minute">30 Min</option>
+                    <option value="60minute">1 Hour</option>
+                    <option value="day">1 Day</option>
+                </select>
+            </div>
+        </div>
+        <canvas id="historyChart" style="max-height: 420px;"></canvas>
+    </div>
+
+    <!-- CHART 2: STRIKE-WISE OPTION CHAIN BAR CHART -->
+    <div class="chart-box">
+        <div class="chart-header">
+            <div class="chart-title" id="chartHeaderTitle">Change in Open Interest (Chg in OI)</div>
             <span style="color: #facc15; font-size: 13px; font-weight: bold;">★ Yellow Line = Spot ATM Strike | Dashed Lines = Linear Trendlines</span>
         </div>
         <canvas id="analysisChart" style="max-height: 480px;"></canvas>
+    </div>
+
+    <!-- CHART 3: TECHNICAL PRICE CHART (CANDLESTICK & EMAs) -->
+    <div class="chart-box">
+        <div class="chart-header">
+            <div style="display: flex; align-items: center; gap: 15px;">
+                <span class="chart-title">📊 Technical Price Chart (Candlestick & EMAs - Live Today)</span>
+                <span class="legend-badge" style="color: #facc15;">🟡 8 EMA</span>
+                <span class="legend-badge" style="color: #38bdf8;">🔵 24 EMA</span>
+            </div>
+            <div>
+                <label style="color: #94a3b8; font-weight: bold; margin-right: 8px;">Chart Timeframe:</label>
+                <select id="candleTimeframeSelector" onchange="loadCandleChart()">
+                    <option value="5minute" selected>5 Min</option>
+                    <option value="15minute">15 Min</option>
+                    <option value="30minute">30 Min</option>
+                    <option value="60minute">1 Hour</option>
+                    <option value="day">1 Day</option>
+                </select>
+            </div>
+        </div>
+        <div id="candleContainer"></div>
     </div>
 
     <script>
@@ -1019,7 +1017,6 @@ ANALYSIS_HTML_TEMPLATE = """
                             tension: 0.2
                         });
 
-                        // Add Linear Trendlines
                         datasets.push({
                             label: `${titleCe} Trend`,
                             data: computeLinearTrend(ceVals),
@@ -1143,7 +1140,6 @@ ANALYSIS_HTML_TEMPLATE = """
 
         function updateChartMetric() {
             const selected = document.getElementById("metricSelector").value;
-            localStorage.setItem("selected_option_metric", selected);
 
             const titleEl = document.getElementById("chartHeaderTitle");
             const strikes = rawRows.map(r => r.strike);
@@ -1153,19 +1149,19 @@ ANALYSIS_HTML_TEMPLATE = """
             let ceColor = "", peColor = "";
             let metricTitle = "";
 
-            if (selected === "oi") {
-                metricTitle = "Open Interest (CE vs PE)";
-                ceLabel = "Call OI"; peLabel = "Put OI";
-                ceColor = 'rgba(239, 68, 68, 0.85)'; peColor = 'rgba(34, 197, 94, 0.85)';
-                ceData = rawRows.map(r => r.ce_oi);
-                peData = rawRows.map(r => r.pe_oi);
-            }
-            else if (selected === "oi_chg") {
+            if (selected === "oi_chg") {
                 metricTitle = "Change in Open Interest (Chg in OI)";
                 ceLabel = "Call Chg in OI"; peLabel = "Put Chg in OI";
                 ceColor = 'rgba(225, 29, 72, 0.85)'; peColor = 'rgba(16, 185, 129, 0.85)';
                 ceData = rawRows.map(r => r.ce_oi_chg);
                 peData = rawRows.map(r => r.pe_oi_chg);
+            }
+            else if (selected === "oi") {
+                metricTitle = "Open Interest (CE vs PE)";
+                ceLabel = "Call OI"; peLabel = "Put OI";
+                ceColor = 'rgba(239, 68, 68, 0.85)'; peColor = 'rgba(34, 197, 94, 0.85)';
+                ceData = rawRows.map(r => r.ce_oi);
+                peData = rawRows.map(r => r.pe_oi);
             }
             else if (selected === "vol") {
                 metricTitle = "Trading Volume";
@@ -1255,12 +1251,15 @@ ANALYSIS_HTML_TEMPLATE = """
                 .then(res => res.json())
                 .then(data => {
                     renderPageData(data);
+                    loadHistoricalChart();
+                    loadCandleChart();
                 })
                 .catch(err => {
                     console.error("Auto Sync Error:", err);
                 });
         }
 
+        try { initHistoryChart(); } catch(e) { console.error("History Chart Init Error:", e); }
         try { initChart(); } catch(e) { console.error("Bar Chart Init Error:", e); }
         renderPageData({
             rows: rawRows,
@@ -1270,7 +1269,6 @@ ANALYSIS_HTML_TEMPLATE = """
             updated: "{{ updated }}",
             pcr: {{ pcr }}
         });
-        try { initHistoryChart(); } catch(e) { console.error("History Chart Init Error:", e); }
         try { initCandleChart(); } catch(e) { console.error("Candle Chart Init Error:", e); }
 
         startAutoSync();
@@ -1314,7 +1312,7 @@ def api_history():
 
 @app.route("/api/candles")
 def api_candles():
-    """Returns 60 days of historical candle OHLC data with 8 EMA and 24 EMA."""
+    """Returns historical & today's intraday live candle OHLC data with 8 EMA and 24 EMA."""
     symbol = request.args.get("symbol", "NIFTY").upper()
     timeframe = request.args.get("timeframe", "5minute")
     data, error = fetch_historical_candles(symbol, timeframe, days=60)
