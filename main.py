@@ -192,28 +192,46 @@ def process_option_data(symbol):
 
         c_oi = ce_mkt.get("oi", 0) or 0
         p_oi = pe_mkt.get("oi", 0) or 0
+        
+        # Extract Change in OI and Quantity Depth
+        c_oi_chg = ce_mkt.get("poi", 0) or (c_oi - ce_mkt.get("prev_oi", c_oi))
+        p_oi_chg = pe_mkt.get("poi", 0) or (p_oi - pe_mkt.get("prev_oi", p_oi))
+        
+        c_bid_qty = ce_mkt.get("bid_qty", 0) or 0
+        c_ask_qty = ce_mkt.get("ask_qty", 0) or 0
+        p_bid_qty = pe_mkt.get("bid_qty", 0) or 0
+        p_ask_qty = pe_mkt.get("ask_qty", 0) or 0
+
         total_ce_oi += c_oi
         total_pe_oi += p_oi
 
         if abs(strike - spot_price) <= range_limit:
             rows.append({
                 "strike": strike,
+                # CE Data
                 "ce_oi": c_oi,
+                "ce_oi_chg": c_oi_chg,
                 "ce_vol": ce_mkt.get("volume", 0) or 0,
                 "ce_iv": round(ce_greek.get("iv", 0) or 0, 2),
                 "ce_ltp": ce_mkt.get("ltp", 0) or 0,
                 "ce_bid": ce_mkt.get("bid_price", 0) or 0,
                 "ce_ask": ce_mkt.get("ask_price", 0) or 0,
+                "ce_bid_qty": c_bid_qty,
+                "ce_ask_qty": c_ask_qty,
                 "ce_delta": round(ce_greek.get("delta", 0) or 0, 2),
                 "ce_theta": round(ce_greek.get("theta", 0) or 0, 2),
                 "ce_vega": round(ce_greek.get("vega", 0) or 0, 2),
                 "ce_gamma": round(ce_greek.get("gamma", 0) or 0, 4),
+                # PE Data
                 "pe_ltp": pe_mkt.get("ltp", 0) or 0,
                 "pe_bid": pe_mkt.get("bid_price", 0) or 0,
                 "pe_ask": pe_mkt.get("ask_price", 0) or 0,
+                "pe_bid_qty": p_bid_qty,
+                "pe_ask_qty": p_ask_qty,
                 "pe_iv": round(pe_greek.get("iv", 0) or 0, 2),
                 "pe_vol": pe_mkt.get("volume", 0) or 0,
                 "pe_oi": p_oi,
+                "pe_oi_chg": p_oi_chg,
                 "pe_delta": round(pe_greek.get("delta", 0) or 0, 2),
                 "pe_theta": round(pe_greek.get("theta", 0) or 0, 2),
                 "pe_vega": round(pe_greek.get("vega", 0) or 0, 2),
@@ -330,12 +348,13 @@ MAIN_HTML_TEMPLATE = """
 </html>
 """
 
-# --- NEW ANALYSIS & GRAPHICAL DASHBOARD TEMPLATE ---
+# --- NEW ANALYSIS DASHBOARD WITH CHANGE IN OI & BID/ASK QUANTITY ---
 ANALYSIS_HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
     <title>{{ symbol }} Option Chain Analysis Dashboard</title>
+    <meta http-equiv="refresh" content="60">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #0f172a; color: #f8fafc; }
@@ -355,16 +374,17 @@ ANALYSIS_HTML_TEMPLATE = """
         .chart-box { background: #1e293b; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); margin-bottom: 30px; }
         .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
         .chart-title { font-size: 18px; font-weight: bold; color: #f8fafc; }
+        .timer-badge { background: #0284c7; color: #ffffff; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
         .error-msg { color: #f87171; font-weight: bold; padding: 15px; background: #450a0a; border-radius: 8px; }
     </style>
 </head>
 <body>
     <h2>📊 {{ symbol }} Intraday Options Analysis Dashboard</h2>
-    <div class="subtitle">Real-time institutional liquidity, sentiment, and strike-wise metrics analyzer</div>
+    <div class="subtitle">Real-time institutional liquidity, sentiment, Change in OI, and Bid/Ask Quantities analyzer</div>
 
     <div class="nav-bar">
         <form method="GET" action="/analysis" style="display: flex; gap: 12px; align-items: center; margin: 0;">
-            <label style="color: #94a3b8; font-weight: bold;">Select Symbol:</label>
+            <label style="color: #94a3b8; font-weight: bold;">Symbol:</label>
             <select name="symbol" onchange="this.form.submit()">
                 <option value="NIFTY" {% if symbol == 'NIFTY' %}selected{% endif %}>NIFTY 50</option>
                 <option value="BANKNIFTY" {% if symbol == 'BANKNIFTY' %}selected{% endif %}>BANK NIFTY</option>
@@ -373,14 +393,16 @@ ANALYSIS_HTML_TEMPLATE = """
             <label style="color: #94a3b8; font-weight: bold; margin-left: 15px;">Metric View:</label>
             <select id="metricSelector" onchange="updateChartMetric()">
                 <option value="oi">Open Interest (CE vs PE)</option>
+                <option value="oi_chg">Change in Open Interest (Chg in OI)</option>
                 <option value="vol">Trading Volume</option>
-                <option value="depth">Order Book Depth (CE Bid/Ask vs PE Bid/Ask)</option>
+                <option value="depth_qty">Order Book Depth (Bid Quantity vs Ask Quantity)</option>
                 <option value="delta">Delta Exposure</option>
                 <option value="theta">Theta Time Decay</option>
             </select>
         </form>
 
-        <div style="margin-left: auto;">
+        <div style="margin-left: auto; display: flex; align-items: center; gap: 12px;">
+            <span class="timer-badge">Auto Refresh: <span id="countdown">60</span>s</span>
             <a href="/?symbol={{ symbol }}" class="btn btn-table">📋 Back to Table View</a>
         </div>
     </div>
@@ -433,12 +455,20 @@ ANALYSIS_HTML_TEMPLATE = """
     </div>
 
     <script>
-        const rawRows = {{ rows | tojson }};
-        const spotPrice = {{ spot_price }};
+        // 60-Second Auto Refresh Timer
+        let seconds = 60;
+        setInterval(() => {
+            seconds--;
+            if (seconds <= 0) {
+                location.reload();
+            } else {
+                document.getElementById("countdown").innerText = seconds;
+            }
+        }, 1000);
 
+        const rawRows = {{ rows | tojson }};
         const strikes = rawRows.map(r => r.strike);
         
-        // Find Support and Resistance
         let maxCE = -1, resStrike = 0;
         let maxPE = -1, supStrike = 0;
         rawRows.forEach(r => {
@@ -489,10 +519,7 @@ ANALYSIS_HTML_TEMPLATE = """
                 },
                 plugins: {
                     legend: { labels: { color: '#f8fafc', font: { size: 14 } } },
-                    tooltip: {
-                        mode: 'index',
-                        intersect: false
-                    }
+                    tooltip: { mode: 'index', intersect: false }
                 }
             }
         };
@@ -512,7 +539,17 @@ ANALYSIS_HTML_TEMPLATE = """
                 myChart.data.datasets[1].label = "Put OI";
                 myChart.data.datasets[1].data = rawRows.map(r => r.pe_oi);
                 myChart.data.datasets[1].backgroundColor = 'rgba(34, 197, 94, 0.85)';
-            } 
+            }
+            else if (selected === "oi_chg") {
+                titleEl.innerText = "Strike-Wise Change in Open Interest (Chg in OI)";
+                myChart.data.datasets[0].label = "Call Chg in OI";
+                myChart.data.datasets[0].data = rawRows.map(r => r.ce_oi_chg);
+                myChart.data.datasets[0].backgroundColor = 'rgba(225, 29, 72, 0.85)';
+                
+                myChart.data.datasets[1].label = "Put Chg in OI";
+                myChart.data.datasets[1].data = rawRows.map(r => r.pe_oi_chg);
+                myChart.data.datasets[1].backgroundColor = 'rgba(16, 185, 129, 0.85)';
+            }
             else if (selected === "vol") {
                 titleEl.innerText = "Strike-Wise Volume Analysis";
                 myChart.data.datasets[0].label = "Call Volume";
@@ -523,14 +560,14 @@ ANALYSIS_HTML_TEMPLATE = """
                 myChart.data.datasets[1].data = rawRows.map(r => r.pe_vol);
                 myChart.data.datasets[1].backgroundColor = 'rgba(14, 165, 233, 0.85)';
             }
-            else if (selected === "depth") {
-                titleEl.innerText = "Order Book Depth (Call Ask vs Put Bid)";
-                myChart.data.datasets[0].label = "Call Ask Price";
-                myChart.data.datasets[0].data = rawRows.map(r => r.ce_ask);
+            else if (selected === "depth_qty") {
+                titleEl.innerText = "Order Book Depth Quantity (Call Ask Qty vs Put Bid Qty)";
+                myChart.data.datasets[0].label = "Call Ask Quantity (Sell Pressure)";
+                myChart.data.datasets[0].data = rawRows.map(r => r.ce_ask_qty);
                 myChart.data.datasets[0].backgroundColor = 'rgba(236, 72, 153, 0.85)';
                 
-                myChart.data.datasets[1].label = "Put Ask Price";
-                myChart.data.datasets[1].data = rawRows.map(r => r.pe_ask);
+                myChart.data.datasets[1].label = "Put Bid Quantity (Buy Support)";
+                myChart.data.datasets[1].data = rawRows.map(r => r.pe_bid_qty);
                 myChart.data.datasets[1].backgroundColor = 'rgba(168, 85, 247, 0.85)';
             }
             else if (selected === "delta") {
@@ -592,7 +629,6 @@ def analysis_dashboard():
     symbol = request.args.get("symbol", "NIFTY").upper()
     rows, spot_price, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
     
-    # Calculate PCR Percentage for sentiment gauge (clamped 0 to 100%)
     pcr_percent = min(max(int((pcr / 2.0) * 100), 5), 100)
 
     return render_template_string(
