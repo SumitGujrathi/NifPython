@@ -158,111 +158,6 @@ def get_valid_token():
         return token
     return perform_single_auth()
 
-# --- TECHNICAL ANALYSIS (EMA CALCULATOR) ---
-def calculate_ema(prices, period):
-    """Calculates Exponential Moving Average (EMA) for a price series."""
-    if len(prices) < period:
-        return [None] * len(prices)
-    
-    ema = [None] * len(prices)
-    sma = sum(prices[:period]) / period
-    ema[period - 1] = round(sma, 2)
-    multiplier = 2 / (period + 1)
-    
-    for i in range(period, len(prices)):
-        val = (prices[i] - ema[i - 1]) * multiplier + ema[i - 1]
-        ema[i] = round(val, 2)
-    return ema
-
-# --- UPSTOX HISTORICAL & INTRADAY LIVE CANDLE DATA ---
-def fetch_historical_candles(symbol, timeframe="5minute", days=60):
-    token = get_valid_token()
-    if not token:
-        return {"candles": [], "ema8": [], "ema24": []}, "Authentication required."
-
-    instrument_key = INSTRUMENT_KEYS.get(symbol, "NSE_INDEX|Nifty 50")
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
-
-    ist_tz = timezone(timedelta(hours=5, minutes=30))
-    to_date = datetime.now(ist_tz).strftime("%Y-%m-%d")
-    from_date = (datetime.now(ist_tz) - timedelta(days=days)).strftime("%Y-%m-%d")
-
-    tf_map = {
-        "5minute": "5minute",
-        "15minute": "15minute",
-        "30minute": "30minute",
-        "60minute": "60minute",
-        "day": "day"
-    }
-    interval = tf_map.get(timeframe, "5minute")
-
-    try:
-        url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/{interval}/{to_date}/{from_date}"
-        res = requests.get(url, headers=headers, timeout=10)
-
-        if res.status_code != 200:
-            return {"candles": [], "ema8": [], "ema24": []}, f"Candle API status {res.status_code}: {res.text}"
-
-        raw_candles = res.json().get("data", {}).get("candles", [])
-        if not raw_candles:
-            return {"candles": [], "ema8": [], "ema24": []}, "No candle data returned."
-
-        raw_candles.reverse()
-
-        seen_times = set()
-        parsed_candles = []
-        close_prices = []
-
-        for c in raw_candles:
-            ts_str = c[0]
-            try:
-                dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                unix_ts = int(dt.timestamp())
-            except Exception:
-                continue
-
-            if unix_ts in seen_times:
-                continue
-            seen_times.add(unix_ts)
-
-            close_p = round(float(c[4]), 2)
-            parsed_candles.append({
-                "time": unix_ts,
-                "open": round(float(c[1]), 2),
-                "high": round(float(c[2]), 2),
-                "low": round(float(c[3]), 2),
-                "close": close_p,
-                "volume": int(c[5])
-            })
-            close_prices.append(close_p)
-
-        parsed_candles.sort(key=lambda x: x["time"])
-
-        ema8_list = calculate_ema(close_prices, 8)
-        ema24_list = calculate_ema(close_prices, 24)
-
-        ema8_data = []
-        ema24_data = []
-
-        for i in range(len(parsed_candles)):
-            t = parsed_candles[i]["time"]
-            if ema8_list[i] is not None:
-                ema8_data.append({"time": t, "value": ema8_list[i]})
-            if ema24_list[i] is not None:
-                ema24_data.append({"time": t, "value": ema24_list[i]})
-
-        return {
-            "candles": parsed_candles,
-            "ema8": ema8_data,
-            "ema24": ema24_data
-        }, None
-
-    except Exception as e:
-        return {"candles": [], "ema8": [], "ema24": []}, f"Exception fetching candles: {e}"
-
 # --- UPSTOX CONCURRENT DATA FETCHING ---
 def fetch_single_expiry_chain(instrument_key, expiry_date, headers):
     try:
@@ -274,7 +169,7 @@ def fetch_single_expiry_chain(instrument_key, expiry_date, headers):
         print(f"[Fetch Error] Failed fetching expiry {expiry_date}: {e}")
     return expiry_date, []
 
-def fetch_option_chain(symbol, selected_expiry=None):
+def fetch_option_chain(symbol, selected_expiry="ALL"):
     token = get_valid_token()
     if not token:
         return None, None, [], "Authentication paused to protect account from lockout. Wait 25 mins or check logs."
@@ -304,7 +199,8 @@ def fetch_option_chain(symbol, selected_expiry=None):
         if not expiries:
             return None, None, [], "No option contract expiries found."
 
-        if selected_expiry == "ALL":
+        # Default to ALL Expiries Consolidated
+        if not selected_expiry or selected_expiry == "ALL" or selected_expiry not in expiries:
             combined_chain = []
             target_expiries = expiries[:6]
             with ThreadPoolExecutor(max_workers=5) as executor:
@@ -316,21 +212,21 @@ def fetch_option_chain(symbol, selected_expiry=None):
             
             return combined_chain, "ALL EXPIRIES (CONSOLIDATED)", expiries, None
 
-        target_expiry = selected_expiry if (selected_expiry and selected_expiry in expiries) else expiries[0]
-        _, chain_data = fetch_single_expiry_chain(instrument_key, target_expiry, headers)
-        return chain_data, target_expiry, expiries, None
+        # Specific Single Expiry Handling
+        _, chain_data = fetch_single_expiry_chain(instrument_key, selected_expiry, headers)
+        return chain_data, selected_expiry, expiries, None
 
     except Exception as e:
         return None, None, [], f"Exception during fetch: {e}"
 
-def process_option_data(symbol, selected_expiry=None):
+def process_option_data(symbol, selected_expiry="ALL"):
     chain_data, current_expiry, expiries, error = fetch_option_chain(symbol, selected_expiry)
     
     ist_tz = timezone(timedelta(hours=5, minutes=30))
     updated_time = datetime.now(ist_tz).strftime("%d/%m/%Y %H:%M:%S IST")
 
     if error or not chain_data:
-        return [], 0, 0, current_expiry or "N/A", expiries, updated_time, 0, 0, 0, error or "No option chain data available."
+        return [], 0, 0, current_expiry or "ALL EXPIRIES (CONSOLIDATED)", expiries, updated_time, 0, 0, 0, error or "No option chain data available."
 
     spot_price = chain_data[0].get("underlying_spot_price", 0) if chain_data else 0
 
@@ -558,7 +454,7 @@ MAIN_HTML_TEMPLATE = """
                 <input type="hidden" name="symbol" value="{{ symbol }}">
                 <label style="font-weight: bold; color: #334155;">Select Expiry:</label>
                 <select name="expiry" onchange="this.form.submit()">
-                    <option value="ALL" {% if expiry == 'ALL EXPIRIES (CONSOLIDATED)' or expiry == 'ALL' %}selected{% endif %}>★ ALL EXPIRIES (CONSOLIDATED)</option>
+                    <option value="ALL" {% if expiry == 'ALL EXPIRIES (CONSOLIDATED)' or expiry == 'ALL' or not expiry %}selected{% endif %}>★ ALL EXPIRIES (CONSOLIDATED)</option>
                     {% for exp in expiries %}
                         <option value="{{ exp }}" {% if exp == expiry %}selected{% endif %}>{{ exp }}</option>
                     {% endfor %}
@@ -632,7 +528,6 @@ ANALYSIS_HTML_TEMPLATE = """
 <head>
     <title>{{ symbol }} Option Chain & Technical Chart Analysis</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@3.8.0/dist/lightweight-charts.standalone.production.js"></script>
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #0f172a; color: #f8fafc; }
         h2 { color: #38bdf8; margin-bottom: 5px; }
@@ -654,14 +549,12 @@ ANALYSIS_HTML_TEMPLATE = """
         .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px; }
         .chart-title { font-size: 18px; font-weight: bold; color: #f8fafc; }
         .timer-badge { background: #0284c7; color: #ffffff; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
-        .legend-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: bold; margin-left: 15px; }
         .error-msg { color: #f87171; font-weight: bold; padding: 15px; background: #450a0a; border-radius: 8px; }
-        #candleContainer { width: 100%; height: 440px; border-radius: 8px; overflow: hidden; }
     </style>
 </head>
 <body>
     <h2>📊 {{ symbol }} Advanced Analytics & Historical Memory Dashboard</h2>
-    <div class="subtitle">Live background auto-sync — Real-time memory snapshots, strike positioning, and live candlestick price</div>
+    <div class="subtitle">Live background auto-sync — Real-time memory snapshots & strike positioning</div>
 
     <div class="nav-bar">
         <label style="color: #94a3b8; font-weight: bold;">Symbol:</label>
@@ -672,7 +565,7 @@ ANALYSIS_HTML_TEMPLATE = """
 
         <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Expiry:</label>
         <select id="expirySelector" onchange="switchExpiry(this.value)">
-            <option value="ALL" {% if expiry == 'ALL EXPIRIES (CONSOLIDATED)' or expiry == 'ALL' %}selected{% endif %}>★ ALL EXPIRIES (CONSOLIDATED)</option>
+            <option value="ALL" {% if expiry == 'ALL EXPIRIES (CONSOLIDATED)' or expiry == 'ALL' or not expiry %}selected{% endif %}>★ ALL EXPIRIES (CONSOLIDATED)</option>
             {% for exp in expiries %}
                 <option value="{{ exp }}" {% if exp == expiry %}selected{% endif %}>{{ exp }}</option>
             {% endfor %}
@@ -780,28 +673,6 @@ ANALYSIS_HTML_TEMPLATE = """
         <canvas id="analysisChart" style="max-height: 480px;"></canvas>
     </div>
 
-    <!-- CHART 3: TECHNICAL PRICE CHART (CANDLESTICK & EMAs) -->
-    <div class="chart-box">
-        <div class="chart-header">
-            <div style="display: flex; align-items: center; gap: 15px;">
-                <span class="chart-title">📊 Technical Price Chart (Candlestick & EMAs - Live Today)</span>
-                <span class="legend-badge" style="color: #facc15;">🟡 8 EMA</span>
-                <span class="legend-badge" style="color: #38bdf8;">🔵 24 EMA</span>
-            </div>
-            <div>
-                <label style="color: #94a3b8; font-weight: bold; margin-right: 8px;">Chart Timeframe:</label>
-                <select id="candleTimeframeSelector" onchange="loadCandleChart()">
-                    <option value="5minute" selected>5 Min</option>
-                    <option value="15minute">15 Min</option>
-                    <option value="30minute">30 Min</option>
-                    <option value="60minute">1 Hour</option>
-                    <option value="day">1 Day</option>
-                </select>
-            </div>
-        </div>
-        <div id="candleContainer"></div>
-    </div>
-
     <script>
         let currentSymbol = "{{ symbol }}";
         let currentExpiry = "{{ expiry }}";
@@ -810,14 +681,8 @@ ANALYSIS_HTML_TEMPLATE = """
         let myChart = null;
         let historyChartObj = null;
 
-        // Lightweight Charts References
-        let tvChart = null;
-        let candleSeries = null;
-        let ema8Series = null;
-        let ema24Series = null;
-
         function switchSymbol(newSym) {
-            window.location.href = `/analysis?symbol=${newSym}`;
+            window.location.href = `/analysis?symbol=${newSym}&expiry=${currentExpiry}`;
         }
 
         function switchExpiry(newExp) {
@@ -841,74 +706,6 @@ ANALYSIS_HTML_TEMPLATE = """
             const intercept = (sumY - slope * sumX) / n;
 
             return data.map((_, i) => Number((slope * i + intercept).toFixed(2)));
-        }
-
-        // --- TRADINGVIEW LIGHTWEIGHT CHARTS INITIALIZATION ---
-        function initCandleChart() {
-            const container = document.getElementById('candleContainer');
-            if (!container || typeof LightweightCharts === 'undefined') return;
-
-            tvChart = LightweightCharts.createChart(container, {
-                layout: {
-                    backgroundColor: '#0f172a',
-                    textColor: '#94a3b8'
-                },
-                grid: {
-                    vertLines: { color: '#1e293b' },
-                    horzLines: { color: '#1e293b' }
-                },
-                crosshair: {
-                    mode: LightweightCharts.CrosshairMode.Normal
-                },
-                rightPriceScale: {
-                    borderColor: '#334155'
-                },
-                timeScale: {
-                    borderColor: '#334155',
-                    timeVisible: true,
-                    secondsVisible: false
-                }
-            });
-
-            candleSeries = tvChart.addCandlestickSeries({
-                upColor: '#22c55e',
-                downColor: '#ef4444',
-                borderVisible: false,
-                wickUpColor: '#22c55e',
-                wickDownColor: '#ef4444'
-            });
-
-            ema8Series = tvChart.addLineSeries({
-                color: '#facc15',
-                lineWidth: 2,
-                title: '8 EMA'
-            });
-
-            ema24Series = tvChart.addLineSeries({
-                color: '#38bdf8',
-                lineWidth: 2,
-                title: '24 EMA'
-            });
-
-            loadCandleChart();
-        }
-
-        function loadCandleChart() {
-            const tf = document.getElementById('candleTimeframeSelector').value;
-            fetch(`/api/candles?symbol=${currentSymbol}&timeframe=${tf}`)
-                .then(res => res.json())
-                .then(data => {
-                    if (data.error || !data.candles || data.candles.length === 0) return;
-                    try {
-                        if (candleSeries) candleSeries.setData(data.candles);
-                        if (ema8Series && data.ema8) ema8Series.setData(data.ema8);
-                        if (ema24Series && data.ema24) ema24Series.setData(data.ema24);
-                        if (tvChart) tvChart.timeScale().fitContent();
-                    } catch (e) {
-                        console.error("Error populating candle series:", e);
-                    }
-                })
-                .catch(err => console.error("Error fetching candle data:", err));
         }
 
         // --- HISTORICAL SNAPSHOT TREND CHART (FROM MEMORY) ---
@@ -1252,7 +1049,6 @@ ANALYSIS_HTML_TEMPLATE = """
                 .then(data => {
                     renderPageData(data);
                     loadHistoricalChart();
-                    loadCandleChart();
                 })
                 .catch(err => {
                     console.error("Auto Sync Error:", err);
@@ -1269,7 +1065,6 @@ ANALYSIS_HTML_TEMPLATE = """
             updated: "{{ updated }}",
             pcr: {{ pcr }}
         });
-        try { initCandleChart(); } catch(e) { console.error("Candle Chart Init Error:", e); }
 
         startAutoSync();
     </script>
@@ -1310,27 +1105,11 @@ def api_history():
     resampled = [grouped[b] for b in sorted(grouped.keys())]
     return jsonify({"history": resampled, "count": len(resampled)})
 
-@app.route("/api/candles")
-def api_candles():
-    """Returns historical & today's intraday live candle OHLC data with 8 EMA and 24 EMA."""
-    symbol = request.args.get("symbol", "NIFTY").upper()
-    timeframe = request.args.get("timeframe", "5minute")
-    data, error = fetch_historical_candles(symbol, timeframe, days=60)
-    
-    if error:
-        return jsonify({"candles": [], "ema8": [], "ema24": [], "error": error})
-    return jsonify({
-        "candles": data["candles"],
-        "ema8": data["ema8"],
-        "ema24": data["ema24"],
-        "error": None
-    })
-
 @app.route("/api/data")
 def api_data():
     """Background JSON API endpoint for zero-reload live updates."""
     symbol = request.args.get("symbol", "NIFTY").upper()
-    selected_expiry = request.args.get("expiry")
+    selected_expiry = request.args.get("expiry", "ALL")
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
     return jsonify({
         "rows": rows,
@@ -1351,7 +1130,7 @@ def index():
         return Response(status=200)
 
     symbol = request.args.get("symbol", "NIFTY").upper()
-    selected_expiry = request.args.get("expiry")
+    selected_expiry = request.args.get("expiry", "ALL")
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
     return render_template_string(
         MAIN_HTML_TEMPLATE,
@@ -1371,7 +1150,7 @@ def index():
 @app.route("/analysis", methods=["GET"])
 def analysis_dashboard():
     symbol = request.args.get("symbol", "NIFTY").upper()
-    selected_expiry = request.args.get("expiry")
+    selected_expiry = request.args.get("expiry", "ALL")
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
 
     return render_template_string(
@@ -1392,7 +1171,7 @@ def analysis_dashboard():
 @app.route("/download")
 def download_csv():
     symbol = request.args.get("symbol", "NIFTY").upper()
-    selected_expiry = request.args.get("expiry")
+    selected_expiry = request.args.get("expiry", "ALL")
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
 
     si = io.StringIO()
