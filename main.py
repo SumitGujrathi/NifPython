@@ -5,6 +5,7 @@ import csv
 import json
 import threading
 import urllib.parse
+from datetime import datetime, timezone, timedelta
 import requests
 import pyotp
 from flask import Flask, render_template_string, request, Response, jsonify
@@ -120,7 +121,7 @@ def get_valid_token():
         return token
     return perform_single_auth()
 
-# --- UPSTOX DATA FETCHING ---
+# --- UPSTOX DATA FETCHING & STABILIZED PROCESSING ---
 def fetch_option_chain(symbol):
     token = get_valid_token()
     if not token:
@@ -167,19 +168,31 @@ def fetch_option_chain(symbol):
 
 def process_option_data(symbol):
     chain_data, current_expiry, error = fetch_option_chain(symbol)
-    updated_time = time.strftime("%m/%d/%Y %H:%M:%S")
+    
+    # IST Timezone Formatting
+    ist_tz = timezone(timedelta(hours=5, minutes=30))
+    updated_time = datetime.now(ist_tz).strftime("%d/%m/%Y %H:%M:%S IST")
 
     if error or not chain_data:
-        return [], 0, current_expiry or "N/A", updated_time, 0, 0, 0, error or "No option chain data available."
+        return [], 0, 0, current_expiry or "N/A", updated_time, 0, 0, 0, error or "No option chain data available."
 
     spot_price = chain_data[0].get("underlying_spot_price", 0) if chain_data else 0
-    range_limit = 1200 if symbol == "BANKNIFTY" else 600
-    rows = []
 
+    # Grid Stabilization: Calculate fixed ATM strike and symmetric strike range
+    step = 100 if symbol == "BANKNIFTY" else 50
+    atm_strike = round(spot_price / step) * step if step > 0 else spot_price
+
+    num_strikes_each_side = 12
+    min_strike = atm_strike - (num_strikes_each_side * step)
+    max_strike = atm_strike + (num_strikes_each_side * step)
+
+    sorted_chain = sorted(chain_data, key=lambda x: x.get("strike_price", 0))
+
+    rows = []
     total_ce_oi = 0
     total_pe_oi = 0
 
-    for item in chain_data:
+    for item in sorted_chain:
         strike = item.get("strike_price", 0)
 
         ce = item.get("call_options", {}) or {}
@@ -204,9 +217,11 @@ def process_option_data(symbol):
         total_ce_oi += c_oi
         total_pe_oi += p_oi
 
-        if abs(strike - spot_price) <= range_limit:
+        if min_strike <= strike <= max_strike:
+            is_atm = (strike == atm_strike)
             rows.append({
                 "strike": strike,
+                "is_atm": is_atm,
                 "ce_oi": c_oi,
                 "ce_oi_chg": c_oi_chg,
                 "ce_vol": ce_mkt.get("volume", 0) or 0,
@@ -236,9 +251,9 @@ def process_option_data(symbol):
             })
 
     pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 0
-    return rows, spot_price, current_expiry, updated_time, pcr, total_ce_oi, total_pe_oi, None
+    return rows, spot_price, atm_strike, current_expiry, updated_time, pcr, total_ce_oi, total_pe_oi, None
 
-# --- ORIGINAL UNTOUCHED HTML MAIN TABLE TEMPLATE ---
+# --- MAIN TABLE TEMPLATE (RED CE / GREEN PE / YELLOW SPOT) ---
 MAIN_HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -262,11 +277,17 @@ MAIN_HTML_TEMPLATE = """
         th, td { border: 1px solid #e9ecef; padding: 7px 9px; text-align: center; font-size: 13px; }
         th { background-color: #343a40; color: white; position: sticky; top: 0; }
         tr:nth-child(even){ background-color: #f8f9fa; }
-        .atm { background-color: #fff3cd !important; font-weight: bold; color: #856404; font-size: 14px; }
-        .ce-header { background-color: #28a745 !important; }
-        .pe-header { background-color: #dc3545 !important; }
-        .greek-col { background-color: #eef2f7; font-size: 12px; }
-        .order-col { background-color: #fdfffe; font-size: 12px; color: #495057; }
+        
+        /* STRICT COLOR SCHEME: RED CE, GREEN PE, YELLOW SPOT */
+        .ce-header { background-color: #dc3545 !important; color: white; }
+        .pe-header { background-color: #28a745 !important; color: white; }
+        .ce-cell { background-color: #fff5f5; }
+        .pe-cell { background-color: #f0fff4; }
+        .greek-col { font-size: 12px; color: #495057; }
+        .order-col { font-size: 12px; color: #495057; }
+        
+        .strike-normal { background-color: #e2e8f0; font-weight: bold; }
+        .atm-spot { background-color: #facc15 !important; color: #000 !important; font-weight: bold; font-size: 14px; border: 2px solid #ca8a04 !important; }
         .error-msg { color: #dc3545; font-weight: bold; padding: 12px; background: #f8d7da; border-radius: 4px; }
     </style>
 </head>
@@ -275,14 +296,14 @@ MAIN_HTML_TEMPLATE = """
     <div class="info-box">
         <div class="metrics-grid">
             <div class="metric-card"><strong>Symbol:</strong> {{ symbol }}</div>
-            <div class="metric-card"><strong>Spot Price:</strong> {{ spot_price }}</div>
+            <div class="metric-card"><strong>Spot Price:</strong> {{ spot_price }} (ATM: {{ atm_strike }})</div>
             <div class="metric-card"><strong>Expiry:</strong> {{ expiry }}</div>
             <div class="metric-card {% if pcr >= 1.0 %}pcr-bullish{% else %}pcr-bearish{% endif %}">
                 <strong>PCR:</strong> {{ pcr }} {% if pcr >= 1.0 %}(Bullish){% else %}(Bearish){% endif %}
             </div>
             <div class="metric-card"><strong>Total Call OI:</strong> {{ "{:,}".format(total_ce_oi) }}</div>
             <div class="metric-card"><strong>Total Put OI:</strong> {{ "{:,}".format(total_pe_oi) }}</div>
-            <div class="metric-card"><strong>Updated:</strong> {{ updated }}</div>
+            <div class="metric-card"><strong>Last Updated (IST):</strong> {{ updated }}</div>
         </div>
         <div>
             <a href="/?symbol=NIFTY" class="btn">View NIFTY</a>
@@ -299,9 +320,9 @@ MAIN_HTML_TEMPLATE = """
         <table>
             <thead>
                 <tr>
-                    <th colspan="10" class="ce-header">CALL OPTIONS</th>
+                    <th colspan="10" class="ce-header">CALL OPTIONS (CE)</th>
                     <th>STRIKE</th>
-                    <th colspan="10" class="pe-header">PUT OPTIONS</th>
+                    <th colspan="10" class="pe-header">PUT OPTIONS (PE)</th>
                 </tr>
                 <tr>
                     <th>OI</th><th>Vol</th><th>IV</th><th>Delta</th><th>Theta</th><th>Vega</th><th>Gamma</th><th>Bid</th><th>Ask</th><th>LTP</th>
@@ -312,29 +333,31 @@ MAIN_HTML_TEMPLATE = """
             <tbody>
                 {% for row in rows %}
                 <tr>
-                    <td>{{ "{:,}".format(row.ce_oi) }}</td>
-                    <td>{{ "{:,}".format(row.ce_vol) }}</td>
-                    <td>{{ row.ce_iv }}</td>
-                    <td class="greek-col">{{ row.ce_delta }}</td>
-                    <td class="greek-col">{{ row.ce_theta }}</td>
-                    <td class="greek-col">{{ row.ce_vega }}</td>
-                    <td class="greek-col">{{ row.ce_gamma }}</td>
-                    <td class="order-col">{{ row.ce_bid }}</td>
-                    <td class="order-col">{{ row.ce_ask }}</td>
-                    <td><strong>{{ row.ce_ltp }}</strong></td>
+                    <td class="ce-cell">{{ "{:,}".format(row.ce_oi) }}</td>
+                    <td class="ce-cell">{{ "{:,}".format(row.ce_vol) }}</td>
+                    <td class="ce-cell">{{ row.ce_iv }}</td>
+                    <td class="ce-cell greek-col">{{ row.ce_delta }}</td>
+                    <td class="ce-cell greek-col">{{ row.ce_theta }}</td>
+                    <td class="ce-cell greek-col">{{ row.ce_vega }}</td>
+                    <td class="ce-cell greek-col">{{ row.ce_gamma }}</td>
+                    <td class="ce-cell order-col">{{ row.ce_bid }}</td>
+                    <td class="ce-cell order-col">{{ row.ce_ask }}</td>
+                    <td class="ce-cell"><strong>{{ row.ce_ltp }}</strong></td>
                     
-                    <td class="atm">{{ row.strike }}</td>
+                    <td class="{% if row.is_atm %}atm-spot{% else %}strike-normal{% endif %}">
+                        {% if row.is_atm %}★ {{ row.strike }} (SPOT){% else %}{{ row.strike }}{% endif %}
+                    </td>
                     
-                    <td><strong>{{ row.pe_ltp }}</strong></td>
-                    <td class="order-col">{{ row.pe_bid }}</td>
-                    <td class="order-col">{{ row.pe_ask }}</td>
-                    <td class="greek-col">{{ row.pe_delta }}</td>
-                    <td class="greek-col">{{ row.pe_theta }}</td>
-                    <td class="greek-col">{{ row.pe_vega }}</td>
-                    <td class="greek-col">{{ row.pe_gamma }}</td>
-                    <td>{{ row.pe_iv }}</td>
-                    <td>{{ "{:,}".format(row.pe_vol) }}</td>
-                    <td>{{ "{:,}".format(row.pe_oi) }}</td>
+                    <td class="pe-cell"><strong>{{ row.pe_ltp }}</strong></td>
+                    <td class="pe-cell order-col">{{ row.pe_bid }}</td>
+                    <td class="pe-cell order-col">{{ row.pe_ask }}</td>
+                    <td class="pe-cell greek-col">{{ row.pe_delta }}</td>
+                    <td class="pe-cell greek-col">{{ row.pe_theta }}</td>
+                    <td class="pe-cell greek-col">{{ row.pe_vega }}</td>
+                    <td class="pe-cell greek-col">{{ row.pe_gamma }}</td>
+                    <td class="pe-cell">{{ row.pe_iv }}</td>
+                    <td class="pe-cell">{{ "{:,}".format(row.pe_vol) }}</td>
+                    <td class="pe-cell">{{ "{:,}".format(row.pe_oi) }}</td>
                 </tr>
                 {% endfor %}
             </tbody>
@@ -345,7 +368,7 @@ MAIN_HTML_TEMPLATE = """
 </html>
 """
 
-# --- ENHANCED ANALYSIS DASHBOARD TEMPLATE (AJAX LIVE AUTO-FETCH & PERSISTENT DROPDOWN) ---
+# --- ANALYSIS DASHBOARD TEMPLATE (STABILIZED, IST, TRENDLINES & YELLOW SPOT LINE) ---
 ANALYSIS_HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -406,9 +429,9 @@ ANALYSIS_HTML_TEMPLATE = """
     <div id="errorContainer" class="error-msg" style="display: none;"></div>
 
     <div class="metrics-grid">
-        <div class="card" style="border-left-color: #38bdf8;">
-            <div class="card-title">Spot Price</div>
-            <div class="card-value" id="cardSpot">{{ spot_price }}</div>
+        <div class="card" style="border-left-color: #facc15;">
+            <div class="card-title">Spot Price / ATM</div>
+            <div class="card-value" id="cardSpot" style="color: #facc15;">{{ spot_price }} (ATM: {{ atm_strike }})</div>
         </div>
         <div class="card" id="cardPcrBox">
             <div class="card-title">Put-Call Ratio (PCR)</div>
@@ -416,15 +439,15 @@ ANALYSIS_HTML_TEMPLATE = """
         </div>
         <div class="card" style="border-left-color: #ef4444;">
             <div class="card-title">Major Resistance (Max Call OI)</div>
-            <div class="card-value" id="maxCallStrike">-</div>
+            <div class="card-value" id="maxCallStrike" style="color: #ef4444;">-</div>
         </div>
         <div class="card" style="border-left-color: #22c55e;">
             <div class="card-title">Major Support (Max Put OI)</div>
-            <div class="card-value" id="maxPutStrike">-</div>
+            <div class="card-value" id="maxPutStrike" style="color: #22c55e;">-</div>
         </div>
         <div class="card" style="border-left-color: #a855f7;">
-            <div class="card-title">Last Updated</div>
-            <div class="card-value" id="cardUpdated" style="font-size: 16px;">{{ updated }}</div>
+            <div class="card-title">Last Updated (IST)</div>
+            <div class="card-value" id="cardUpdated" style="font-size: 15px;">{{ updated }}</div>
         </div>
     </div>
 
@@ -446,10 +469,11 @@ ANALYSIS_HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- MAIN GRAPHICAL BAR CHART -->
+    <!-- MAIN GRAPHICAL BAR CHART WITH TRENDLINES & SPOT HIGHLIGHT -->
     <div class="chart-box">
         <div class="chart-header">
             <div class="chart-title" id="chartHeaderTitle">Strike-Wise Open Interest (Call vs Put)</div>
+            <span style="color: #facc15; font-size: 13px; font-weight: bold;">★ Yellow Line = Spot ATM Strike | Dashed Lines = Linear Trendlines</span>
         </div>
         <canvas id="analysisChart" style="max-height: 480px;"></canvas>
     </div>
@@ -457,9 +481,9 @@ ANALYSIS_HTML_TEMPLATE = """
     <script>
         let currentSymbol = "{{ symbol }}";
         let rawRows = {{ rows | tojson }};
+        let currentAtmStrike = {{ atm_strike }};
         let myChart = null;
 
-        // Restore selected metric from localStorage if present
         const savedMetric = localStorage.getItem("selected_option_metric");
         if (savedMetric) {
             const selector = document.getElementById("metricSelector");
@@ -472,6 +496,55 @@ ANALYSIS_HTML_TEMPLATE = """
             window.location.href = `/analysis?symbol=${newSym}`;
         }
 
+        // Linear Regression Calculation for Trendlines
+        function computeLinearTrend(data) {
+            const n = data.length;
+            if (n === 0) return [];
+            let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+            for (let i = 0; i < n; i++) {
+                const val = data[i] || 0;
+                sumX += i;
+                sumY += val;
+                sumXY += i * val;
+                sumXX += i * i;
+            }
+            const denom = (n * sumXX - sumX * sumX);
+            const slope = denom !== 0 ? (n * sumXY - sumX * sumY) / denom : 0;
+            const intercept = (sumY - slope * sumX) / n;
+
+            return data.map((_, i) => Number((slope * i + intercept).toFixed(2)));
+        }
+
+        // Custom Canvas Plugin to Draw Vertical Yellow Spot Line on Chart
+        const spotLinePlugin = {
+            id: 'spotLinePlugin',
+            afterDraw: (chart) => {
+                const index = chart.data.labels.indexOf(currentAtmStrike);
+                if (index !== -1) {
+                    const meta = chart.getDatasetMeta(0);
+                    if (meta && meta.data[index]) {
+                        const x = meta.data[index].x;
+                        const topY = chart.scales.y.top;
+                        const bottomY = chart.scales.y.bottom;
+                        const ctx = chart.ctx;
+                        ctx.save();
+                        ctx.beginPath();
+                        ctx.moveTo(x, topY);
+                        ctx.lineTo(x, bottomY);
+                        ctx.lineWidth = 3;
+                        ctx.strokeStyle = '#facc15';
+                        ctx.setLineDash([6, 4]);
+                        ctx.stroke();
+
+                        ctx.fillStyle = '#facc15';
+                        ctx.font = 'bold 12px Segoe UI';
+                        ctx.fillText('★ ATM (' + currentAtmStrike + ')', x + 5, topY + 15);
+                        ctx.restore();
+                    }
+                }
+            }
+        };
+
         function renderPageData(data) {
             if (data.error) {
                 document.getElementById("errorContainer").style.display = "block";
@@ -481,7 +554,9 @@ ANALYSIS_HTML_TEMPLATE = """
             document.getElementById("errorContainer").style.display = "none";
 
             rawRows = data.rows || [];
-            document.getElementById("cardSpot").innerText = data.spot_price || 0;
+            currentAtmStrike = data.atm_strike || 0;
+            
+            document.getElementById("cardSpot").innerText = `${data.spot_price || 0} (ATM: ${currentAtmStrike})`;
             document.getElementById("cardUpdated").innerText = data.updated || "";
             
             const pcrVal = data.pcr || 0;
@@ -494,7 +569,6 @@ ANALYSIS_HTML_TEMPLATE = """
                 document.getElementById("cardPcr").innerHTML = `${pcrVal} <span style="color:#ef4444; font-size:14px;">(Bearish)</span>`;
             }
 
-            // Resistance & Support strikes
             let maxCE = -1, resStrike = 0;
             let maxPE = -1, supStrike = 0;
             rawRows.forEach(r => {
@@ -514,8 +588,10 @@ ANALYSIS_HTML_TEMPLATE = """
                 data: {
                     labels: rawRows.map(r => r.strike),
                     datasets: [
-                        { label: 'Calls', data: [], backgroundColor: 'rgba(239, 68, 68, 0.85)' },
-                        { label: 'Puts', data: [], backgroundColor: 'rgba(34, 197, 94, 0.85)' }
+                        { type: 'bar', label: 'Calls (CE)', data: [], backgroundColor: 'rgba(239, 68, 68, 0.85)', borderColor: '#ef4444', borderWidth: 1 },
+                        { type: 'bar', label: 'Puts (PE)', data: [], backgroundColor: 'rgba(34, 197, 94, 0.85)', borderColor: '#22c55e', borderWidth: 1 },
+                        { type: 'line', label: 'CE Trend', data: [], borderColor: '#f87171', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, fill: false },
+                        { type: 'line', label: 'PE Trend', data: [], borderColor: '#4ade80', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, fill: false }
                     ]
                 },
                 options: {
@@ -526,10 +602,11 @@ ANALYSIS_HTML_TEMPLATE = """
                         y: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } }
                     },
                     plugins: {
-                        legend: { labels: { color: '#f8fafc', font: { size: 14 } } },
+                        legend: { labels: { color: '#f8fafc', font: { size: 13 } } },
                         tooltip: { mode: 'index', intersect: false }
                     }
-                }
+                },
+                plugins: [spotLinePlugin]
             });
         }
 
@@ -591,13 +668,23 @@ ANALYSIS_HTML_TEMPLATE = """
             titleEl.innerText = metricTitle;
 
             myChart.data.labels = strikes;
+            
+            // Call Bar Dataset
             myChart.data.datasets[0].label = ceLabel;
             myChart.data.datasets[0].data = ceData;
             myChart.data.datasets[0].backgroundColor = ceColor;
 
+            // Put Bar Dataset
             myChart.data.datasets[1].label = peLabel;
             myChart.data.datasets[1].data = peData;
             myChart.data.datasets[1].backgroundColor = peColor;
+
+            // Linear Trendlines
+            myChart.data.datasets[2].label = `${ceLabel} Trend`;
+            myChart.data.datasets[2].data = computeLinearTrend(ceData);
+
+            myChart.data.datasets[3].label = `${peLabel} Trend`;
+            myChart.data.datasets[3].data = computeLinearTrend(peData);
 
             myChart.update();
 
@@ -648,11 +735,11 @@ ANALYSIS_HTML_TEMPLATE = """
                 });
         }
 
-        // Initialize page
         initChart();
         renderPageData({
             rows: rawRows,
             spot_price: {{ spot_price }},
+            atm_strike: {{ atm_strike }},
             expiry: "{{ expiry }}",
             updated: "{{ updated }}",
             pcr: {{ pcr }}
@@ -672,10 +759,11 @@ def health():
 def api_data():
     """Background JSON API endpoint for zero-reload live updates."""
     symbol = request.args.get("symbol", "NIFTY").upper()
-    rows, spot_price, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
+    rows, spot_price, atm_strike, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
     return jsonify({
         "rows": rows,
         "spot_price": spot_price,
+        "atm_strike": atm_strike,
         "expiry": expiry,
         "updated": updated,
         "pcr": pcr,
@@ -690,12 +778,13 @@ def index():
         return Response(status=200)
 
     symbol = request.args.get("symbol", "NIFTY").upper()
-    rows, spot_price, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
+    rows, spot_price, atm_strike, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
     return render_template_string(
         MAIN_HTML_TEMPLATE,
         rows=rows,
         symbol=symbol,
         spot_price=spot_price,
+        atm_strike=atm_strike,
         expiry=expiry,
         updated=updated,
         pcr=pcr,
@@ -707,13 +796,14 @@ def index():
 @app.route("/analysis", methods=["GET"])
 def analysis_dashboard():
     symbol = request.args.get("symbol", "NIFTY").upper()
-    rows, spot_price, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
+    rows, spot_price, atm_strike, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
 
     return render_template_string(
         ANALYSIS_HTML_TEMPLATE,
         rows=rows,
         symbol=symbol,
         spot_price=spot_price,
+        atm_strike=atm_strike,
         expiry=expiry,
         updated=updated,
         pcr=pcr,
@@ -725,11 +815,11 @@ def analysis_dashboard():
 @app.route("/download")
 def download_csv():
     symbol = request.args.get("symbol", "NIFTY").upper()
-    rows, spot_price, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
+    rows, spot_price, atm_strike, expiry, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol)
 
     si = io.StringIO()
     cw = csv.writer(si)
-    cw.writerow([f"Symbol: {symbol}", f"Spot Price: {spot_price}", f"Expiry: {expiry}", f"PCR: {pcr}", f"Updated: {updated}"])
+    cw.writerow([f"Symbol: {symbol}", f"Spot Price: {spot_price}", f"ATM Strike: {atm_strike}", f"Expiry: {expiry}", f"PCR: {pcr}", f"Updated: {updated}"])
     cw.writerow([
         "CE OI", "CE Vol", "CE IV", "CE Delta", "CE Theta", "CE Vega", "CE Gamma", "CE Bid", "CE Ask", "CE LTP",
         "STRIKE",
