@@ -535,6 +535,8 @@ ANALYSIS_HTML_TEMPLATE = """
         .nav-bar { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; align-items: center; background: #1e293b; padding: 15px; border-radius: 10px; }
         .btn { padding: 9px 18px; color: #fff; background-color: #3b82f6; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 14px; border: none; cursor: pointer; }
         .btn-table { background-color: #64748b; }
+        .btn-dl { background-color: #10b981; font-size: 12px; padding: 6px 12px; text-decoration: none; color: #fff; border-radius: 6px; font-weight: bold; }
+        .btn-dl:hover { background-color: #059669; }
         .btn:hover { opacity: 0.9; }
         select { padding: 9px 14px; background: #0f172a; color: #38bdf8; border: 1px solid #334155; border-radius: 6px; font-weight: 600; font-size: 14px; outline: none; }
         .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; }
@@ -573,16 +575,16 @@ ANALYSIS_HTML_TEMPLATE = """
 
         <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Bar Chart Metric:</label>
         <select id="metricSelector" onchange="updateChartMetric()">
-            <option value="oi_chg" selected>Change in Open Interest (Chg in OI)</option>
+            <option value="depth_qty" selected>1 - Order Book Depth Quantity (Call Ask Qty vs Put Bid Qty)</option>
+            <option value="oi_chg">Change in Open Interest (Chg in OI)</option>
             <option value="oi">Open Interest (CE vs PE)</option>
             <option value="vol">Trading Volume</option>
-            <option value="depth_qty">Order Book Depth (Bid Quantity vs Ask Quantity)</option>
             <option value="delta">Delta Exposure</option>
             <option value="theta">Theta Time Decay</option>
         </select>
 
         <div style="margin-left: auto; display: flex; align-items: center; gap: 12px;">
-            <span class="timer-badge">Auto Sync: <span id="countdown">10</span>s</span>
+            <span class="timer-badge" id="syncBadge">Auto Sync: <span id="countdown">10</span>s</span>
             <a href="/?symbol={{ symbol }}&expiry={{ expiry }}" class="btn btn-table">📋 Back to Table View</a>
         </div>
     </div>
@@ -630,11 +632,20 @@ ANALYSIS_HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- CHART 1: HISTORICAL SNAPSHOT TREND (5-MIN MARKET MEMORY) -->
+    <!-- CHART 1: ORDER BOOK DEPTH QUANTITY & STRIKE BAR CHART -->
+    <div class="chart-box">
+        <div class="chart-header">
+            <div class="chart-title" id="chartHeaderTitle">1 - Order Book Depth Quantity (Call Ask Qty vs Put Bid Qty)</div>
+            <span style="color: #facc15; font-size: 13px; font-weight: bold;">★ Yellow Line = Spot ATM Strike | Dashed Lines = Linear Trendlines</span>
+        </div>
+        <canvas id="analysisChart" style="max-height: 480px;"></canvas>
+    </div>
+
+    <!-- CHART 2: HISTORICAL SNAPSHOT TREND (5-MIN MARKET MEMORY) -->
     <div class="chart-box">
         <div class="chart-header">
             <div style="display: flex; align-items: center; gap: 15px;">
-                <span class="chart-title">📈 Historical Snapshot Trend (5-Min Market Memory)</span>
+                <span class="chart-title">2 - 📈 Historical Snapshot Trend (5-Min Market Memory)</span>
             </div>
             <div style="display: flex; gap: 12px; align-items: center;">
                 <label style="color: #94a3b8; font-weight: bold;">Trend Metric:</label>
@@ -659,18 +670,12 @@ ANALYSIS_HTML_TEMPLATE = """
                     <option value="60minute">1 Hour</option>
                     <option value="day">1 Day</option>
                 </select>
+
+                <!-- DOWNLOAD 5-MIN HISTORICAL SNAPSHOT DATA BUTTON -->
+                <a id="downloadHistoryBtn" href="/download_history?symbol={{ symbol }}" class="btn-dl">📥 Download 5-Min Memory CSV</a>
             </div>
         </div>
         <canvas id="historyChart" style="max-height: 420px;"></canvas>
-    </div>
-
-    <!-- CHART 2: STRIKE-WISE OPTION CHAIN BAR CHART -->
-    <div class="chart-box">
-        <div class="chart-header">
-            <div class="chart-title" id="chartHeaderTitle">Change in Open Interest (Chg in OI)</div>
-            <span style="color: #facc15; font-size: 13px; font-weight: bold;">★ Yellow Line = Spot ATM Strike | Dashed Lines = Linear Trendlines</span>
-        </div>
-        <canvas id="analysisChart" style="max-height: 480px;"></canvas>
     </div>
 
     <script>
@@ -682,6 +687,8 @@ ANALYSIS_HTML_TEMPLATE = """
         let historyChartObj = null;
 
         function switchSymbol(newSym) {
+            currentSymbol = newSym;
+            document.getElementById("downloadHistoryBtn").href = `/download_history?symbol=${newSym}`;
             window.location.href = `/analysis?symbol=${newSym}&expiry=${currentExpiry}`;
         }
 
@@ -946,7 +953,14 @@ ANALYSIS_HTML_TEMPLATE = """
             let ceColor = "", peColor = "";
             let metricTitle = "";
 
-            if (selected === "oi_chg") {
+            if (selected === "depth_qty") {
+                metricTitle = "1 - Order Book Depth Quantity (Call Ask Qty vs Put Bid Qty)";
+                ceLabel = "Call Ask Qty (Sell Vol)"; peLabel = "Put Bid Qty (Buy Vol)";
+                ceColor = 'rgba(236, 72, 153, 0.85)'; peColor = 'rgba(168, 85, 247, 0.85)';
+                ceData = rawRows.map(r => r.ce_ask_qty);
+                peData = rawRows.map(r => r.pe_bid_qty);
+            }
+            else if (selected === "oi_chg") {
                 metricTitle = "Change in Open Interest (Chg in OI)";
                 ceLabel = "Call Chg in OI"; peLabel = "Put Chg in OI";
                 ceColor = 'rgba(225, 29, 72, 0.85)'; peColor = 'rgba(16, 185, 129, 0.85)';
@@ -966,13 +980,6 @@ ANALYSIS_HTML_TEMPLATE = """
                 ceColor = 'rgba(249, 115, 22, 0.85)'; peColor = 'rgba(14, 165, 233, 0.85)';
                 ceData = rawRows.map(r => r.ce_vol);
                 peData = rawRows.map(r => r.pe_vol);
-            }
-            else if (selected === "depth_qty") {
-                metricTitle = "Order Book Depth Quantity (Call Ask Qty vs Put Bid Qty)";
-                ceLabel = "Call Ask Qty (Sell Vol)"; peLabel = "Put Bid Qty (Buy Vol)";
-                ceColor = 'rgba(236, 72, 153, 0.85)'; peColor = 'rgba(168, 85, 247, 0.85)';
-                ceData = rawRows.map(r => r.ce_ask_qty);
-                peData = rawRows.map(r => r.pe_bid_qty);
             }
             else if (selected === "delta") {
                 metricTitle = "Option Delta Exposure";
@@ -1032,8 +1039,11 @@ ANALYSIS_HTML_TEMPLATE = """
         }
 
         let timerSeconds = 10;
+        let isSyncing = false;
+
         function startAutoSync() {
             setInterval(() => {
+                if (isSyncing) return;
                 timerSeconds--;
                 if (timerSeconds <= 0) {
                     timerSeconds = 10;
@@ -1044,19 +1054,29 @@ ANALYSIS_HTML_TEMPLATE = """
         }
 
         function fetchDataInBackground() {
-            fetch(`/api/data?symbol=${currentSymbol}&expiry=${currentExpiry}`)
-                .then(res => res.json())
-                .then(data => {
-                    renderPageData(data);
-                    loadHistoricalChart();
-                })
-                .catch(err => {
-                    console.error("Auto Sync Error:", err);
-                });
+            isSyncing = true;
+            document.getElementById("syncBadge").innerText = "Syncing (Hold 2s)...";
+
+            // 2-Second Hold / Calculation delay for 100% data verification
+            setTimeout(() => {
+                fetch(`/api/data?symbol=${currentSymbol}&expiry=${currentExpiry}`)
+                    .then(res => res.json())
+                    .then(data => {
+                        renderPageData(data);
+                        loadHistoricalChart();
+                    })
+                    .catch(err => {
+                        console.error("Auto Sync Error:", err);
+                    })
+                    .finally(() => {
+                        isSyncing = false;
+                        document.getElementById("syncBadge").innerHTML = 'Auto Sync: <span id="countdown">' + timerSeconds + '</span>s';
+                    });
+            }, 2000);
         }
 
-        try { initHistoryChart(); } catch(e) { console.error("History Chart Init Error:", e); }
         try { initChart(); } catch(e) { console.error("Bar Chart Init Error:", e); }
+        try { initHistoryChart(); } catch(e) { console.error("History Chart Init Error:", e); }
         renderPageData({
             rows: rawRows,
             spot_price: {{ spot_price }},
@@ -1193,6 +1213,38 @@ def download_csv():
 
     output = Response(si.getvalue(), mimetype="text/csv")
     output.headers["Content-Disposition"] = f"attachment; filename={symbol}_{expiry}_Option_Chain.csv"
+    return output
+
+@app.route("/download_history")
+def download_history_csv():
+    """Exports in-memory 5-minute historical memory snapshot variables to CSV for offline analysis."""
+    symbol = request.args.get("symbol", "NIFTY").upper()
+
+    with SNAPSHOT_LOCK:
+        filtered = [s for s in HISTORICAL_SNAPSHOTS if s.get("symbol") == symbol]
+
+    si = io.StringIO()
+    cw = csv.writer(si)
+    cw.writerow([
+        "Timestamp", "Datetime", "Formatted Time", "Symbol", "Spot Price", "ATM Strike", "PCR",
+        "CE Total OI", "PE Total OI", "CE Total Vol", "PE Total Vol",
+        "CE Avg IV", "PE Avg IV", "CE Sum Delta", "PE Sum Delta",
+        "CE Sum Theta", "PE Sum Theta", "CE Sum Vega", "PE Sum Vega",
+        "CE Sum Gamma", "PE Sum Gamma", "CE Ask Qty (Depth)", "PE Bid Qty (Depth)"
+    ])
+
+    for s in filtered:
+        cw.writerow([
+            s.get("timestamp"), s.get("datetime"), s.get("formatted_time"), s.get("symbol"),
+            s.get("spot_price"), s.get("atm_strike"), s.get("pcr"),
+            s.get("ce_oi"), s.get("pe_oi"), s.get("ce_vol"), s.get("pe_vol"),
+            s.get("ce_iv"), s.get("pe_iv"), s.get("ce_delta"), s.get("pe_delta"),
+            s.get("ce_theta"), s.get("pe_theta"), s.get("ce_vega"), s.get("pe_vega"),
+            s.get("ce_gamma"), s.get("pe_gamma"), s.get("ce_ask_qty"), s.get("pe_bid_qty")
+        ])
+
+    output = Response(si.getvalue(), mimetype="text/csv")
+    output.headers["Content-Disposition"] = f"attachment; filename={symbol}_Historical_5Min_Memory.csv"
     return output
 
 if __name__ == "__main__":
