@@ -36,7 +36,7 @@ AUTH_COOLDOWN = {
 }
 
 # --- IN-MEMORY HISTORICAL SNAPSHOT STORAGE ---
-HISTORICAL_SNAPSHOTS = []  # Buffer for 5-minute snapshot time series
+HISTORICAL_SNAPSHOTS = []  # Global memory storage for snapshots
 SNAPSHOT_LOCK = threading.Lock()
 
 # --- MARKET HOURS & MEMORY MANAGEMENT ---
@@ -60,14 +60,14 @@ def trim_memory_if_needed():
             target_limit = 30 * 1024 * 1024  # 30 MB target
 
             if raw_bytes > max_limit:
-                print(f"[Memory Trim] Size {raw_bytes / (1024*1024):.2f} MB exceeds 50MB. Trimming down to ~30MB...")
+                print(f"[Memory Trim] Size {raw_bytes / (1024*1024):.2f} MB exceeds 50MB. Trimming down...")
                 while len(HISTORICAL_SNAPSHOTS) > 20:
                     current_size = len(json.dumps(HISTORICAL_SNAPSHOTS).encode('utf-8'))
                     if current_size <= target_limit:
                         break
                     trim_count = max(1, len(HISTORICAL_SNAPSHOTS) // 10)
                     HISTORICAL_SNAPSHOTS = HISTORICAL_SNAPSHOTS[trim_count:]
-                print(f"[Memory Trim Complete] New size: {len(json.dumps(HISTORICAL_SNAPSHOTS).encode('utf-8')) / (1024*1024):.2f} MB")
+                print(f"[Memory Trim Complete] New length: {len(HISTORICAL_SNAPSHOTS)}")
         except Exception as e:
             print(f"[Memory Trim Exception]: {e}")
 
@@ -314,11 +314,11 @@ def process_option_data(symbol, selected_expiry="ALL"):
 
 # --- BACKGROUND 5-MINUTE SNAPSHOT RECORDER ---
 def record_snapshot(symbol):
-    """Computes strike-wide aggregated CE/PE metrics & spot price and records a 5-minute snapshot."""
+    """Computes strike-wide aggregated CE/PE metrics & spot price and records snapshot."""
     try:
         rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry="ALL")
         if error or not rows:
-            return
+            return None
 
         ist_tz = timezone(timedelta(hours=5, minutes=30))
         now_ist = datetime.now(ist_tz)
@@ -373,31 +373,16 @@ def record_snapshot(symbol):
         }
 
         with SNAPSHOT_LOCK:
-            HISTORICAL_SNAPSHOTS.append(snapshot)
-            print(f"[Recorder Thread] Recorded snapshot for {symbol} at {formatted_ts}. Total stored: {len(HISTORICAL_SNAPSHOTS)}")
+            # Prevent duplicate timestamps within 30 seconds
+            if not HISTORICAL_SNAPSHOTS or (ts_unix - HISTORICAL_SNAPSHOTS[-1]["timestamp"] > 30):
+                HISTORICAL_SNAPSHOTS.append(snapshot)
+                print(f"[Snapshot Recorded] Symbol: {symbol} at {formatted_ts}. Total count: {len(HISTORICAL_SNAPSHOTS)}")
+        
+        trim_memory_if_needed()
+        return snapshot
     except Exception as e:
         print(f"[Snapshot Error] Exception recording {symbol}: {e}")
-
-def background_5min_recorder():
-    """Background daemon loop that triggers snapshot recording every 5 minutes."""
-    print("[Recorder Thread] Background snapshot initialization sweep starting...")
-    # Seed initial snapshots so historical chart renders immediately
-    for sym in ["NIFTY", "BANKNIFTY"]:
-        record_snapshot(sym)
-
-    while True:
-        try:
-            time.sleep(300)
-            print("[Recorder Thread] Executing 5-min snapshot sweep...")
-            for sym in ["NIFTY", "BANKNIFTY"]:
-                record_snapshot(sym)
-            trim_memory_if_needed()
-        except Exception as e:
-            print(f"[Recorder Thread Exception]: {e}")
-
-def start_background_recorder():
-    thread = threading.Thread(target=background_5min_recorder, daemon=True)
-    thread.start()
+        return None
 
 # --- MAIN TABLE TEMPLATE ---
 MAIN_HTML_TEMPLATE = """
@@ -723,10 +708,7 @@ ANALYSIS_HTML_TEMPLATE = """
             const ctx = document.getElementById('historyChart').getContext('2d');
             historyChartObj = new Chart(ctx, {
                 type: 'line',
-                data: {
-                    labels: [],
-                    datasets: []
-                },
+                data: { labels: [], datasets: [] },
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
@@ -756,7 +738,7 @@ ANALYSIS_HTML_TEMPLATE = """
                     let datasets = [];
 
                     if (snapshots.length === 0) {
-                        historyChartObj.data.labels = ["Waiting for first snapshot..."];
+                        historyChartObj.data.labels = ["Initializing..."];
                         historyChartObj.data.datasets = [{
                             label: 'Status',
                             data: [0],
@@ -958,7 +940,6 @@ ANALYSIS_HTML_TEMPLATE = """
 
         function updateChartMetric() {
             const selected = document.getElementById("metricSelector").value;
-
             const titleEl = document.getElementById("chartHeaderTitle");
             const strikes = rawRows.map(r => r.strike);
 
@@ -1069,23 +1050,21 @@ ANALYSIS_HTML_TEMPLATE = """
 
         function fetchDataInBackground() {
             isSyncing = true;
-            document.getElementById("syncBadge").innerText = "Syncing (Hold 2s)...";
+            document.getElementById("syncBadge").innerText = "Syncing...";
 
-            setTimeout(() => {
-                fetch(`/api/data?symbol=${currentSymbol}&expiry=${currentExpiry}`)
-                    .then(res => res.json())
-                    .then(data => {
-                        renderPageData(data);
-                        loadHistoricalChart();
-                    })
-                    .catch(err => {
-                        console.error("Auto Sync Error:", err);
-                    })
-                    .finally(() => {
-                        isSyncing = false;
-                        document.getElementById("syncBadge").innerHTML = 'Auto Sync: <span id="countdown">' + timerSeconds + '</span>s';
-                    });
-            }, 2000);
+            fetch(`/api/data?symbol=${currentSymbol}&expiry=${currentExpiry}`)
+                .then(res => res.json())
+                .then(data => {
+                    renderPageData(data);
+                    loadHistoricalChart();
+                })
+                .catch(err => {
+                    console.error("Auto Sync Error:", err);
+                })
+                .finally(() => {
+                    isSyncing = false;
+                    document.getElementById("syncBadge").innerHTML = 'Auto Sync: <span id="countdown">' + timerSeconds + '</span>s';
+                });
         }
 
         try { initChart(); } catch(e) { console.error("Bar Chart Init Error:", e); }
@@ -1118,6 +1097,12 @@ def api_history():
     with SNAPSHOT_LOCK:
         filtered = [s for s in HISTORICAL_SNAPSHOTS if s.get("symbol") == symbol]
 
+    # On-demand fallback: seed initial snapshot if list is currently empty
+    if not filtered:
+        sn = record_snapshot(symbol)
+        if sn:
+            filtered = [sn]
+
     if timeframe == "5minute" or not filtered:
         return jsonify({"history": filtered, "count": len(filtered)})
 
@@ -1142,6 +1127,10 @@ def api_data():
     symbol = request.args.get("symbol", "NIFTY").upper()
     selected_expiry = request.args.get("expiry", "ALL").upper()
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
+    
+    # Trigger non-blocking asynchronous snapshot update
+    threading.Thread(target=record_snapshot, args=(symbol,), daemon=True).start()
+
     return jsonify({
         "rows": rows,
         "spot_price": spot_price,
@@ -1163,6 +1152,10 @@ def index():
     symbol = request.args.get("symbol", "NIFTY").upper()
     selected_expiry = request.args.get("expiry", "ALL").upper()
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
+    
+    # Record snapshot on web page access
+    threading.Thread(target=record_snapshot, args=(symbol,), daemon=True).start()
+
     return render_template_string(
         MAIN_HTML_TEMPLATE,
         rows=rows,
@@ -1183,6 +1176,9 @@ def analysis_dashboard():
     symbol = request.args.get("symbol", "NIFTY").upper()
     selected_expiry = request.args.get("expiry", "ALL").upper()
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
+
+    # Record snapshot on analysis page access
+    threading.Thread(target=record_snapshot, args=(symbol,), daemon=True).start()
 
     return render_template_string(
         ANALYSIS_HTML_TEMPLATE,
@@ -1233,6 +1229,11 @@ def download_history_csv():
     with SNAPSHOT_LOCK:
         filtered = [s for s in HISTORICAL_SNAPSHOTS if s.get("symbol") == symbol]
 
+    if not filtered:
+        sn = record_snapshot(symbol)
+        if sn:
+            filtered = [sn]
+
     si = io.StringIO()
     cw = csv.writer(si)
     cw.writerow([
@@ -1258,5 +1259,4 @@ def download_history_csv():
     return output
 
 if __name__ == "__main__":
-    start_background_recorder()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
