@@ -3,6 +3,7 @@ import time
 import io
 import csv
 import json
+import sqlite3
 import threading
 import urllib.parse
 from datetime import datetime, timezone, timedelta
@@ -23,7 +24,9 @@ PIN = os.getenv("UPSTOX_PIN")
 TOTP_KEY = os.getenv("UPSTOX_TOTP_KEY")
 
 SESSION_FILE_PATH = "/tmp/upstox_session.json"
+DB_FILE_PATH = "/tmp/market_history.db"
 AUTH_THREAD_LOCK = threading.Lock()
+DB_LOCK = threading.Lock()
 
 INSTRUMENT_KEYS = {
     "NIFTY": "NSE_INDEX|Nifty 50",
@@ -35,13 +38,130 @@ AUTH_COOLDOWN = {
     "cooldown_duration": 1500  # 25 minutes safety lockout
 }
 
-# --- IN-MEMORY HISTORICAL SNAPSHOT STORAGE ---
-HISTORICAL_SNAPSHOTS = []  # Buffer for 5-minute snapshot time series
-SNAPSHOT_LOCK = threading.Lock()
+# --- SQLITE PERSISTENT DATABASE SETUP ---
+def init_db():
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_FILE_PATH)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER,
+                datetime_str TEXT,
+                formatted_time TEXT,
+                symbol TEXT,
+                spot_price REAL,
+                atm_strike REAL,
+                pcr REAL,
+                ce_oi INTEGER,
+                pe_oi INTEGER,
+                ce_vol INTEGER,
+                pe_vol INTEGER,
+                ce_iv REAL,
+                pe_iv REAL,
+                ce_delta REAL,
+                pe_delta REAL,
+                ce_theta REAL,
+                pe_theta REAL,
+                ce_vega REAL,
+                pe_vega REAL,
+                ce_gamma REAL,
+                pe_gamma REAL,
+                ce_bid_qty INTEGER,
+                ce_ask_qty INTEGER,
+                pe_bid_qty INTEGER,
+                pe_ask_qty INTEGER
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sym_ts ON snapshots(symbol, timestamp);")
+        conn.commit()
+        conn.close()
 
-# --- MARKET HOURS & MEMORY MANAGEMENT ---
+def save_snapshot_to_db(snapshot):
+    with DB_LOCK:
+        try:
+            conn = sqlite3.connect(DB_FILE_PATH)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO snapshots (
+                    timestamp, datetime_str, formatted_time, symbol, spot_price, atm_strike, pcr,
+                    ce_oi, pe_oi, ce_vol, pe_vol, ce_iv, pe_iv, ce_delta, pe_delta,
+                    ce_theta, pe_theta, ce_vega, pe_vega, ce_gamma, pe_gamma,
+                    ce_bid_qty, ce_ask_qty, pe_bid_qty, pe_ask_qty
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                snapshot["timestamp"], snapshot["datetime"], snapshot["formatted_time"], snapshot["symbol"],
+                snapshot["spot_price"], snapshot["atm_strike"], snapshot["pcr"],
+                snapshot["ce_oi"], snapshot["pe_oi"], snapshot["ce_vol"], snapshot["pe_vol"],
+                snapshot["ce_iv"], snapshot["pe_iv"], snapshot["ce_delta"], snapshot["pe_delta"],
+                snapshot["ce_theta"], snapshot["pe_theta"], snapshot["ce_vega"], snapshot["pe_vega"],
+                snapshot["ce_gamma"], snapshot["pe_gamma"], snapshot["ce_bid_qty"], snapshot["ce_ask_qty"],
+                snapshot["pe_bid_qty"], snapshot["pe_ask_qty"]
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[DB Save Error]: {e}")
+
+def get_snapshots_from_db(symbol):
+    with DB_LOCK:
+        try:
+            conn = sqlite3.connect(DB_FILE_PATH)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM snapshots WHERE symbol = ? ORDER BY timestamp ASC", (symbol,))
+            rows = cursor.fetchall()
+            conn.close()
+
+            results = []
+            for r in rows:
+                results.append({
+                    "timestamp": r["timestamp"],
+                    "datetime": r["datetime_str"],
+                    "formatted_time": r["formatted_time"],
+                    "symbol": r["symbol"],
+                    "spot_price": r["spot_price"],
+                    "atm_strike": r["atm_strike"],
+                    "pcr": r["pcr"],
+                    "ce_oi": r["ce_oi"],
+                    "pe_oi": r["pe_oi"],
+                    "ce_vol": r["ce_vol"],
+                    "pe_vol": r["pe_vol"],
+                    "ce_iv": r["ce_iv"],
+                    "pe_iv": r["pe_iv"],
+                    "ce_delta": r["ce_delta"],
+                    "pe_delta": r["pe_delta"],
+                    "ce_theta": r["ce_theta"],
+                    "pe_theta": r["pe_theta"],
+                    "ce_vega": r["ce_vega"],
+                    "pe_vega": r["pe_vega"],
+                    "ce_gamma": r["ce_gamma"],
+                    "pe_gamma": r["pe_gamma"],
+                    "ce_bid_qty": r["ce_bid_qty"],
+                    "ce_ask_qty": r["ce_ask_qty"],
+                    "pe_bid_qty": r["pe_bid_qty"],
+                    "pe_ask_qty": r["pe_ask_qty"]
+                })
+            return results
+        except Exception as e:
+            print(f"[DB Read Error]: {e}")
+            return []
+
+def trim_database_if_needed():
+    """Trims historical snapshot table to retain the most recent 5,000 snapshots."""
+    with DB_LOCK:
+        try:
+            conn = sqlite3.connect(DB_FILE_PATH)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM snapshots WHERE id NOT IN (SELECT id FROM snapshots ORDER BY id DESC LIMIT 5000)")
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[DB Trim Error]: {e}")
+
+# --- MARKET HOURS MANAGEMENT ---
 def is_market_open():
-    """Checks if current IST time is within Indian stock market hours (Mon-Fri, 9:15 AM - 3:30 PM)."""
     ist_tz = timezone(timedelta(hours=5, minutes=30))
     now_ist = datetime.now(ist_tz)
     if now_ist.weekday() >= 5:
@@ -49,27 +169,6 @@ def is_market_open():
     start_time = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
     end_time = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
     return start_time <= now_ist <= end_time
-
-def trim_memory_if_needed():
-    """Ensures memory usage of snapshot buffer stays under 50 MB, trimming down to ~30 MB."""
-    global HISTORICAL_SNAPSHOTS
-    with SNAPSHOT_LOCK:
-        try:
-            raw_bytes = len(json.dumps(HISTORICAL_SNAPSHOTS).encode('utf-8'))
-            max_limit = 50 * 1024 * 1024   # 50 MB threshold
-            target_limit = 30 * 1024 * 1024  # 30 MB target
-
-            if raw_bytes > max_limit:
-                print(f"[Memory Trim] Size {raw_bytes / (1024*1024):.2f} MB exceeds 50MB. Trimming down to ~30MB...")
-                while len(HISTORICAL_SNAPSHOTS) > 20:
-                    current_size = len(json.dumps(HISTORICAL_SNAPSHOTS).encode('utf-8'))
-                    if current_size <= target_limit:
-                        break
-                    trim_count = max(1, len(HISTORICAL_SNAPSHOTS) // 10)
-                    HISTORICAL_SNAPSHOTS = HISTORICAL_SNAPSHOTS[trim_count:]
-                print(f"[Memory Trim Complete] New size: {len(json.dumps(HISTORICAL_SNAPSHOTS).encode('utf-8')) / (1024*1024):.2f} MB")
-        except Exception as e:
-            print(f"[Memory Trim Exception]: {e}")
 
 # --- PERSISTENT SESSION MANAGEMENT ---
 def load_session_token():
@@ -201,7 +300,6 @@ def fetch_option_chain(symbol, selected_expiry="ALL"):
 
         clean_expiry = str(selected_expiry).strip().upper() if selected_expiry else "ALL"
 
-        # Default to ALL Expiries Consolidated
         if clean_expiry == "ALL" or clean_expiry == "ALL EXPIRIES (CONSOLIDATED)" or clean_expiry not in expiries:
             target_expiries = expiries[:6]
             results_dict = {}
@@ -213,14 +311,12 @@ def fetch_option_chain(symbol, selected_expiry="ALL"):
                     if data:
                         results_dict[exp_date] = data
 
-            # Deterministic sorting to prevent thread race condition
             combined_chain = []
             for exp in sorted(results_dict.keys()):
                 combined_chain.extend(results_dict[exp])
             
             return combined_chain, "ALL EXPIRIES (CONSOLIDATED)", expiries, None
 
-        # Specific Single Expiry Handling
         _, chain_data = fetch_single_expiry_chain(instrument_key, clean_expiry, headers)
         return chain_data, clean_expiry, expiries, None
 
@@ -276,7 +372,6 @@ def process_option_data(symbol, selected_expiry="ALL"):
         c_oi = ce_mkt.get("oi", 0) or 0
         p_oi = pe_mkt.get("oi", 0) or 0
 
-        # Aggregating volumes and open interest across expiries
         rec["ce_oi"] += c_oi
         rec["pe_oi"] += p_oi
         rec["ce_oi_chg"] += ce_mkt.get("poi", 0) or (c_oi - ce_mkt.get("prev_oi", c_oi))
@@ -288,7 +383,6 @@ def process_option_data(symbol, selected_expiry="ALL"):
         rec["pe_bid_qty"] += pe_mkt.get("bid_qty", 0) or 0
         rec["pe_ask_qty"] += pe_mkt.get("ask_qty", 0) or 0
 
-        # Lock primary option contract pricing to nearest expiry systematically
         if not rec["_has_pricing"]:
             rec["ce_ltp"] = ce_mkt.get("ltp", 0) or 0
             rec["ce_bid"] = ce_mkt.get("bid_price", 0) or 0
@@ -317,9 +411,9 @@ def process_option_data(symbol, selected_expiry="ALL"):
 
     return rows, spot_price, atm_strike, current_expiry, expiries, updated_time, pcr, total_ce_oi, total_pe_oi, None
 
-# --- BACKGROUND 5-MINUTE SNAPSHOT RECORDER ---
+# --- BACKGROUND 5-MINUTE SNAPSHOT RECORDER WITH DB SAVES ---
 def record_snapshot(symbol):
-    """Computes strike-wide aggregated CE/PE metrics & spot price and records a 5-minute snapshot."""
+    """Computes strike-wide aggregated metrics & spot price and saves to SQLite DB."""
     try:
         rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry="ALL")
         if error or not rows:
@@ -377,30 +471,29 @@ def record_snapshot(symbol):
             "pe_ask_qty": pe_ask_qty_sum
         }
 
-        with SNAPSHOT_LOCK:
-            HISTORICAL_SNAPSHOTS.append(snapshot)
-            print(f"[Recorder Thread] Recorded snapshot for {symbol} at {formatted_ts}. Total stored: {len(HISTORICAL_SNAPSHOTS)}")
+        save_snapshot_to_db(snapshot)
+        print(f"[Recorder Thread] Persistent DB snapshot stored for {symbol} at {formatted_ts}.")
     except Exception as e:
         print(f"[Snapshot Error] Exception recording {symbol}: {e}")
 
 def background_5min_recorder():
-    """Background daemon loop that triggers snapshot recording every 5 minutes during market hours."""
-    time.sleep(5)
-    print("[Recorder Thread] Background 5-minute snapshot thread active.")
+    """Background daemon loop that triggers snapshot recording every 5 minutes."""
+    print("[Recorder Thread] Seeding initial DB snapshot sweep...")
+    for sym in ["NIFTY", "BANKNIFTY"]:
+        record_snapshot(sym)
+
     while True:
         try:
-            if is_market_open():
-                print("[Recorder Thread] Market is OPEN. Executing 5-min snapshot sweep...")
-                for sym in ["NIFTY", "BANKNIFTY"]:
-                    record_snapshot(sym)
-                trim_memory_if_needed()
-            else:
-                print("[Recorder Thread] Market is CLOSED. Skipping snapshot recording.")
+            time.sleep(300)
+            print("[Recorder Thread] Executing 5-min snapshot sweep...")
+            for sym in ["NIFTY", "BANKNIFTY"]:
+                record_snapshot(sym)
+            trim_database_if_needed()
         except Exception as e:
             print(f"[Recorder Thread Exception]: {e}")
-        time.sleep(300)
 
 def start_background_recorder():
+    init_db()
     thread = threading.Thread(target=background_5min_recorder, daemon=True)
     thread.start()
 
@@ -557,7 +650,7 @@ ANALYSIS_HTML_TEMPLATE = """
         .gauge-flex { display: flex; height: 24px; border-radius: 12px; overflow: hidden; margin-top: 10px; }
         .gauge-ce { background-color: #ef4444; height: 100%; transition: width 0.4s ease; }
         .gauge-pe { background-color: #22c55e; height: 100%; transition: width 0.4s ease; }
-        .chart-box { background: #1e293b; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); margin-bottom: 30px; }
+        .chart-box { background: #1e293b; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); margin-bottom: 30px; position: relative; }
         .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px; }
         .chart-title { font-size: 18px; font-weight: bold; color: #f8fafc; }
         .timer-badge { background: #0284c7; color: #ffffff; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
@@ -565,8 +658,8 @@ ANALYSIS_HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-    <h2>📊 {{ symbol }} Advanced Analytics & Historical Memory Dashboard</h2>
-    <div class="subtitle">Live background auto-sync — Real-time memory snapshots & strike positioning</div>
+    <h2>📊 {{ symbol }} Advanced Analytics & Persistent SQLite Memory Dashboard</h2>
+    <div class="subtitle">Live background auto-sync — SQLite persistent storage & strike positioning</div>
 
     <div class="nav-bar">
         <label style="color: #94a3b8; font-weight: bold;">Symbol:</label>
@@ -651,11 +744,11 @@ ANALYSIS_HTML_TEMPLATE = """
         <canvas id="analysisChart" style="max-height: 480px;"></canvas>
     </div>
 
-    <!-- CHART 2: HISTORICAL SNAPSHOT TREND (5-MIN MARKET MEMORY) -->
+    <!-- CHART 2: HISTORICAL SNAPSHOT TREND (5-MIN SQLITE PERSISTENT MEMORY) -->
     <div class="chart-box">
         <div class="chart-header">
             <div style="display: flex; align-items: center; gap: 15px;">
-                <span class="chart-title">2 - 📈 Historical Snapshot Trend (5-Min Market Memory)</span>
+                <span class="chart-title">2 - 📈 Historical Snapshot Trend (5-Min SQLite Memory)</span>
             </div>
             <div style="display: flex; gap: 12px; align-items: center;">
                 <label style="color: #94a3b8; font-weight: bold;">Trend Metric:</label>
@@ -681,8 +774,7 @@ ANALYSIS_HTML_TEMPLATE = """
                     <option value="day">1 Day</option>
                 </select>
 
-                <!-- DOWNLOAD 5-MIN HISTORICAL SNAPSHOT DATA BUTTON -->
-                <a id="downloadHistoryBtn" href="/download_history?symbol={{ symbol }}" class="btn-dl">📥 Download 5-Min Memory CSV</a>
+                <a id="downloadHistoryBtn" href="/download_history?symbol={{ symbol }}" class="btn-dl">📥 Download 5-Min DB CSV</a>
             </div>
         </div>
         <canvas id="historyChart" style="max-height: 420px;"></canvas>
@@ -725,7 +817,6 @@ ANALYSIS_HTML_TEMPLATE = """
             return data.map((_, i) => Number((slope * i + intercept).toFixed(2)));
         }
 
-        // --- HISTORICAL SNAPSHOT TREND CHART (FROM MEMORY) ---
         function initHistoryChart() {
             const ctx = document.getElementById('historyChart').getContext('2d');
             historyChartObj = new Chart(ctx, {
@@ -761,6 +852,17 @@ ANALYSIS_HTML_TEMPLATE = """
                     const times = snapshots.map(s => s.formatted_time || s.datetime);
 
                     let datasets = [];
+
+                    if (snapshots.length === 0) {
+                        historyChartObj.data.labels = ["Saving initial DB snapshot..."];
+                        historyChartObj.data.datasets = [{
+                            label: 'Status',
+                            data: [0],
+                            borderColor: '#94a3b8'
+                        }];
+                        historyChartObj.update();
+                        return;
+                    }
 
                     if (metric === "spot_price") {
                         const spotVals = snapshots.map(s => s.spot_price);
@@ -1108,14 +1210,14 @@ def health():
 
 @app.route("/api/history")
 def api_history():
+    """Returns stored SQLite 5-minute snapshots filtered by symbol & resampled by timeframe."""
     symbol = request.args.get("symbol", "NIFTY").upper()
     timeframe = request.args.get("timeframe", "5minute")
 
-    with SNAPSHOT_LOCK:
-        filtered = [s for s in HISTORICAL_SNAPSHOTS if s.get("symbol") == symbol]
+    snapshots = get_snapshots_from_db(symbol)
 
-    if timeframe == "5minute" or not filtered:
-        return jsonify({"history": filtered, "count": len(filtered)})
+    if timeframe == "5minute" or not snapshots:
+        return jsonify({"history": snapshots, "count": len(snapshots)})
 
     sec_map = {
         "15minute": 15 * 60,
@@ -1126,7 +1228,7 @@ def api_history():
     interval_sec = sec_map.get(timeframe, 300)
 
     grouped = {}
-    for item in filtered:
+    for item in snapshots:
         bucket = (item["timestamp"] // interval_sec) * interval_sec
         grouped[bucket] = item
 
@@ -1225,9 +1327,7 @@ def download_csv():
 @app.route("/download_history")
 def download_history_csv():
     symbol = request.args.get("symbol", "NIFTY").upper()
-
-    with SNAPSHOT_LOCK:
-        filtered = [s for s in HISTORICAL_SNAPSHOTS if s.get("symbol") == symbol]
+    snapshots = get_snapshots_from_db(symbol)
 
     si = io.StringIO()
     cw = csv.writer(si)
@@ -1239,7 +1339,7 @@ def download_history_csv():
         "CE Sum Gamma", "PE Sum Gamma", "CE Ask Qty (Depth)", "PE Bid Qty (Depth)"
     ])
 
-    for s in filtered:
+    for s in snapshots:
         cw.writerow([
             s.get("timestamp"), s.get("datetime"), s.get("formatted_time"), s.get("symbol"),
             s.get("spot_price"), s.get("atm_strike"), s.get("pcr"),
