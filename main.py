@@ -150,7 +150,8 @@ def format_time_str(time_raw):
 
 def fetch_history_from_gsheet(symbol="NIFTY"):
     symbol_upper = symbol.upper()
-    candidate_sheets = ["NIFTY", "NIFTY", symbol_upper, "Sheet1", ""]
+    sheet_id = SPREADSHEET_ID or "1fpXdodshvwHcduwffOhEK54K-a7a4TmOZF2Q-EgVRzM"
+    candidate_sheets = ["NITY", "NIFTY", symbol_upper, "Sheet1", ""]
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -161,9 +162,9 @@ def fetch_history_from_gsheet(symbol="NIFTY"):
 
     for sheet_name in candidate_sheets:
         if sheet_name:
-            url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/gviz/tq?tqx=out:csv&sheet={urllib.parse.quote(sheet_name)}"
+            url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={urllib.parse.quote(sheet_name)}"
         else:
-            url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/export?format=csv"
+            url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
 
         try:
             res = requests.get(url, headers=headers, timeout=10)
