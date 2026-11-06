@@ -281,6 +281,87 @@ def fetch_history_from_gsheet(symbol="NIFTY"):
     # Reverse snapshot list so line chart progresses chronologically (oldest on left -> newest on right)
     return snapshots[::-1], None
 
+# --- UPSTOX LIVE TRADE & POSITION FETCHING ---
+def fetch_upstox_positions():
+    token = get_valid_token()
+    if not token:
+        return [], [], 0.0, 0.0, 0.0, "Authentication paused or invalid."
+
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+
+    try:
+        # Fetch Positions
+        pos_url = "https://api.upstox.com/v2/portfolio/short-term-positions"
+        pos_res = requests.get(pos_url, headers=headers, timeout=10)
+
+        if pos_res.status_code == 401:
+            invalidate_session()
+            token = perform_single_auth()
+            if not token:
+                return [], [], 0.0, 0.0, 0.0, "Session expired."
+            headers["Authorization"] = f"Bearer {token}"
+            pos_res = requests.get(pos_url, headers=headers, timeout=10)
+
+        positions_raw = pos_res.json().get("data", []) if pos_res.status_code == 200 else []
+
+        # Fetch Order History
+        ord_url = "https://api.upstox.com/v2/order/retrieve-all"
+        ord_res = requests.get(ord_url, headers=headers, timeout=10)
+        orders_raw = ord_res.json().get("data", []) if ord_res.status_code == 200 else []
+
+        positions = []
+        total_pnl = 0.0
+        realised_pnl = 0.0
+        unrealised_pnl = 0.0
+
+        for p in positions_raw:
+            trading_symbol = p.get("trading_symbol", "")
+            quantity = p.get("quantity", 0)
+            buy_price = p.get("buy_price", 0.0) or 0.0
+            sell_price = p.get("sell_price", 0.0) or 0.0
+            ltp = p.get("last_price", 0.0) or 0.0
+            pnl = p.get("pnl", 0.0) or 0.0
+            u_pnl = p.get("unrealised", 0.0) or 0.0
+            r_pnl = p.get("realised", 0.0) or 0.0
+            product = p.get("product", "")
+
+            total_pnl += pnl
+            unrealised_pnl += u_pnl
+            realised_pnl += r_pnl
+
+            positions.append({
+                "trading_symbol": trading_symbol,
+                "product": product,
+                "quantity": quantity,
+                "buy_price": round(buy_price, 2),
+                "sell_price": round(sell_price, 2),
+                "ltp": round(ltp, 2),
+                "pnl": round(pnl, 2),
+                "status": "OPEN" if quantity != 0 else "CLOSED"
+            })
+
+        orders = []
+        for o in orders_raw:
+            orders.append({
+                "order_id": o.get("order_id", ""),
+                "trading_symbol": o.get("trading_symbol", ""),
+                "transaction_type": o.get("transaction_type", ""),
+                "quantity": o.get("quantity", 0),
+                "price": o.get("price", 0.0),
+                "average_price": o.get("average_price", 0.0),
+                "status": o.get("status", ""),
+                "order_timestamp": o.get("order_timestamp", "")
+            })
+
+        return positions, orders, round(total_pnl, 2), round(realised_pnl, 2), round(unrealised_pnl, 2), None
+
+    except Exception as e:
+        print(f"[Positions Exception] Error fetching positions: {e}")
+        return [], [], 0.0, 0.0, 0.0, str(e)
+
 # --- UPSTOX CONCURRENT DATA FETCHING ---
 def fetch_single_expiry_chain(instrument_key, expiry_date, headers):
     try:
@@ -1121,7 +1202,7 @@ ANALYSIS_HTML_TEMPLATE = """
                 .then(res => res.json())
                 .then(data => {
                     renderPageData(data);
-                    loadHistoricalChart();
+                    loadHistoricalChart(); // Triggers live auto-sync for Google Sheet trend chart as well
                 })
                 .catch(err => {
                     console.error("Auto Sync Error:", err);
@@ -1149,10 +1230,162 @@ ANALYSIS_HTML_TEMPLATE = """
 </html>
 """
 
+# --- LIVE TRADE & POSITION DASHBOARD TEMPLATE ---
+POSITIONS_HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Upstox Private Live Trade & Positions Dashboard</title>
+    <meta http-equiv="refresh" content="10">
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #0b1329; color: #f8fafc; }
+        h2 { color: #38bdf8; margin-bottom: 5px; }
+        .subtitle { color: #94a3b8; font-size: 13px; margin-bottom: 20px; }
+        .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 18px; margin-bottom: 25px; }
+        .card { background: #1e293b; padding: 18px; border-radius: 10px; border-left: 5px solid #3b82f6; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
+        .card-title { font-size: 12px; color: #94a3b8; text-transform: uppercase; font-weight: bold; margin-bottom: 6px; }
+        .card-value { font-size: 24px; font-weight: bold; }
+        
+        .pnl-green { color: #22c55e !important; border-left-color: #22c55e !important; }
+        .pnl-red { color: #ef4444 !important; border-left-color: #ef4444 !important; }
+        
+        .section-title { font-size: 18px; font-weight: bold; color: #f8fafc; margin-top: 25px; margin-bottom: 12px; border-left: 4px solid #38bdf8; padding-left: 10px; }
+        
+        .table-container { overflow-x: auto; background: #1e293b; border-radius: 10px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); margin-bottom: 25px; }
+        table { width: 100%; border-collapse: collapse; min-width: 900px; }
+        th, td { border: 1px solid #334155; padding: 10px 14px; text-align: center; font-size: 13px; }
+        th { background-color: #0f172a; color: #38bdf8; text-transform: uppercase; font-size: 12px; }
+        tr:nth-child(even){ background-color: #172554; }
+        
+        .status-open { background-color: #065f46; color: #34d399; padding: 3px 8px; border-radius: 12px; font-weight: bold; font-size: 11px; }
+        .status-closed { background-color: #334155; color: #94a3b8; padding: 3px 8px; border-radius: 12px; font-weight: bold; font-size: 11px; }
+        .error-msg { color: #f87171; font-weight: bold; padding: 15px; background: #450a0a; border-radius: 8px; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <h2>🔐 Private Live Trade & Positions Dashboard</h2>
+    <div class="subtitle">Real-time Upstox Portfolio & Executed Order Log — Unlisted Endpoint</div>
+
+    {% if error %}
+        <div class="error-msg">Error Fetching Positions: {{ error }}</div>
+    {% endif %}
+
+    <div class="metrics-grid">
+        <div class="card {% if total_pnl >= 0 %}pnl-green{% else %}pnl-red{% endif %}">
+            <div class="card-title">Total Overall P&L</div>
+            <div class="card-value">₹ {{ "{:,.2f}".format(total_pnl) }}</div>
+        </div>
+        <div class="card {% if unrealised_pnl >= 0 %}pnl-green{% else %}pnl-red{% endif %}">
+            <div class="card-title">Unrealised P&L (Live Positions)</div>
+            <div class="card-value">₹ {{ "{:,.2f}".format(unrealised_pnl) }}</div>
+        </div>
+        <div class="card {% if realised_pnl >= 0 %}pnl-green{% else %}pnl-red{% endif %}">
+            <div class="card-title">Realised P&L (Booked Today)</div>
+            <div class="card-value">₹ {{ "{:,.2f}".format(realised_pnl) }}</div>
+        </div>
+    </div>
+
+    <div class="section-title">📊 Live & Closed Positions</div>
+    <div class="table-container">
+        <table>
+            <thead>
+                <tr>
+                    <th>Status</th>
+                    <th>Script / Trading Symbol</th>
+                    <th>Product</th>
+                    <th>Qty</th>
+                    <th>Avg Buy Price</th>
+                    <th>Avg Sell Price</th>
+                    <th>LTP</th>
+                    <th>P&L (₹)</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% if positions %}
+                    {% for p in positions %}
+                    <tr>
+                        <td>
+                            {% if p.status == 'OPEN' %}
+                                <span class="status-open">OPEN</span>
+                            {% else %}
+                                <span class="status-closed">CLOSED</span>
+                            {% endif %}
+                        </td>
+                        <td><strong>{{ p.trading_symbol }}</strong></td>
+                        <td>{{ p.product }}</td>
+                        <td><strong>{{ p.quantity }}</strong></td>
+                        <td>₹ {{ p.buy_price }}</td>
+                        <td>₹ {{ p.sell_price }}</td>
+                        <td>₹ {{ p.ltp }}</td>
+                        <td style="font-weight: bold; color: {% if p.pnl >= 0 %}#22c55e{% else %}#ef4444{% endif %};">
+                            ₹ {{ "{:,.2f}".format(p.pnl) }}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                {% else %}
+                    <tr><td colspan="8" style="color: #94a3b8;">No open or closed positions found for today.</td></tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+
+    <div class="section-title">📋 Today's Executed Trades & Orders Log</div>
+    <div class="table-container">
+        <table>
+            <thead>
+                <tr>
+                    <th>Order Time</th>
+                    <th>Trading Symbol</th>
+                    <th>Type</th>
+                    <th>Qty</th>
+                    <th>Executed Price</th>
+                    <th>Status</th>
+                    <th>Order ID</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% if orders %}
+                    {% for o in orders %}
+                    <tr>
+                        <td style="font-size: 12px; color: #94a3b8;">{{ o.order_timestamp }}</td>
+                        <td><strong>{{ o.trading_symbol }}</strong></td>
+                        <td style="font-weight: bold; color: {% if o.transaction_type == 'BUY' %}#38bdf8{% else %}#f43f5e{% endif %};">
+                            {{ o.transaction_type }}
+                        </td>
+                        <td>{{ o.quantity }}</td>
+                        <td>₹ {{ o.average_price or o.price }}</td>
+                        <td><strong>{{ o.status }}</strong></td>
+                        <td style="font-size: 11px; color: #64748b;">{{ o.order_id }}</td>
+                    </tr>
+                    {% endfor %}
+                {% else %}
+                    <tr><td colspan="7" style="color: #94a3b8;">No trades executed today.</td></tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>
+"""
+
 # --- ROUTES ---
 @app.route("/health")
 def health():
     return "OK", 200
+
+@app.route("/Live_Trade_Position", methods=["GET"])
+def live_trade_position():
+    """Unlisted private route for real-time portfolio, trade logs & P&L."""
+    positions, orders, total_pnl, realised_pnl, unrealised_pnl, error = fetch_upstox_positions()
+    return render_template_string(
+        POSITIONS_HTML_TEMPLATE,
+        positions=positions,
+        orders=orders,
+        total_pnl=total_pnl,
+        realised_pnl=realised_pnl,
+        unrealised_pnl=unrealised_pnl,
+        error=error
+    )
 
 @app.route("/api/history")
 def api_history():
