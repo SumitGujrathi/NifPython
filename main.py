@@ -150,70 +150,135 @@ def format_time_str(time_raw):
 
 def fetch_history_from_gsheet(symbol="NIFTY"):
     symbol_upper = symbol.upper()
-    candidate_sheets = ["NITY", "NIFTY", symbol_upper] if symbol_upper in ["NIFTY", "NITY"] else [symbol_upper]
+    candidate_sheets = ["NIFTY", "NIFTY", symbol_upper, "Sheet1", ""]
     
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
     raw_csv = None
+    last_err = None
+
     for sheet_name in candidate_sheets:
-        url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
+        if sheet_name:
+            url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/gviz/tq?tqx=out:csv&sheet={urllib.parse.quote(sheet_name)}"
+        else:
+            url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/export?format=csv"
+
         try:
-            res = requests.get(url, timeout=8)
-            if res.status_code == 200 and len(res.text) > 50:
-                raw_csv = res.text
-                break
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code == 200:
+                text = res.text.strip()
+                if text.startswith("<!DOCTYPE") or "<html" in text.lower() or "google-site-verification" in text:
+                    last_err = "Google Sheet is private. Set Sharing permissions to 'Anyone with the link can view'."
+                    continue
+                if len(text) > 30 and ("Time" in text or "LTP" in text or "PCR" in text or "Symbol" in text):
+                    raw_csv = text
+                    break
+            else:
+                last_err = f"Google Sheet HTTP status {res.status_code}"
         except Exception as e:
-            print(f"[GSheet Fetch Warning] Failed fetching sheet '{sheet_name}': {e}")
-            
+            last_err = f"Network error connecting to Google Sheet: {e}"
+
     if not raw_csv:
-        return []
+        err_msg = last_err or "Could not retrieve CSV from Google Sheet. Check Sheet ID and tab permissions."
+        print(f"[GSheet Error] {err_msg}")
+        return [], err_msg
 
     snapshots = []
     try:
-        reader = csv.DictReader(io.StringIO(raw_csv))
+        lines = [line for line in raw_csv.splitlines() if line.strip()]
+        header_idx = 0
+        for i, l in enumerate(lines[:10]):
+            l_lower = l.lower()
+            if "time" in l_lower or "symbol" in l_lower or "pcr" in l_lower or "ltp" in l_lower:
+                header_idx = i
+                break
+
+        csv_data_stream = "\n".join(lines[header_idx:])
+        reader = csv.DictReader(io.StringIO(csv_data_stream))
+
         for row in reader:
-            r = {k.strip(): v for k, v in row.items() if k}
-            time_val = r.get("Time", r.get("datetime", ""))
-            if not time_val:
+            if not row:
                 continue
-                
-            def safe_float(val, default=0.0):
-                try:
-                    return float(str(val).replace(",", "").strip())
-                except (ValueError, TypeError):
-                    return default
+            norm_r = {str(k).strip().lower(): str(v).strip() for k, v in row.items() if k is not None}
+
+            def get_val(possible_keys, default=0.0):
+                for pk in possible_keys:
+                    pk_lower = pk.lower()
+                    if pk_lower in norm_r:
+                        val_str = norm_r[pk_lower].replace(",", "")
+                        try:
+                            return float(val_str)
+                        except (ValueError, TypeError):
+                            if val_str:
+                                return val_str
+                return default
+
+            time_val = str(get_val(["time", "datetime", "timestamp"], ""))
+            if not time_val or time_val == "0.0":
+                continue
+
+            spot_val = get_val(["price ltp", "spot_price", "spot price", "ltp"], 0.0)
+            atm_val = get_val(["atm strike", "atm_strike", "strike"], 0.0)
+            pcr_val = get_val(["pcr"], 0.0)
+            ce_oi_val = get_val(["ce oi", "ce_oi"], 0.0)
+            pe_oi_val = get_val(["pe oi", "pe_oi"], 0.0)
+            ce_oi_chg_val = get_val(["ce chg in oi", "ce_oi_chg", "ce oi chg"], 0.0)
+            pe_oi_chg_val = get_val(["pe chg in oi", "pe_oi_chg", "pe oi chg"], 0.0)
+            ce_vol_val = get_val(["ce vol", "ce_vol"], 0.0)
+            pe_vol_val = get_val(["pe vol", "pe_vol"], 0.0)
+            ce_iv_val = get_val(["ce iv", "ce_iv"], 0.0)
+            pe_iv_val = get_val(["pe iv", "pe_iv"], 0.0)
+            ce_delta_val = get_val(["ce delta", "ce_delta"], 0.0)
+            pe_delta_val = get_val(["pe delta", "pe_delta"], 0.0)
+            ce_theta_val = get_val(["ce theta", "ce_theta"], 0.0)
+            pe_theta_val = get_val(["pe theta", "pe_theta"], 0.0)
+            ce_vega_val = get_val(["ce vega", "ce_vega"], 0.0)
+            pe_vega_val = get_val(["pe vega", "pe_vega"], 0.0)
+            ce_gamma_val = get_val(["ce gamma", "ce_gamma"], 0.0)
+            pe_gamma_val = get_val(["pe gamma", "pe_gamma"], 0.0)
+            ce_ask_val = get_val(["ce ask", "ce_ask_qty", "ce ask qty"], 0.0)
+            pe_bid_val = get_val(["pe bid", "pe_bid_qty", "pe bid qty"], 0.0)
+            sym_val = str(get_val(["symbol"], symbol_upper))
 
             snapshot = {
                 "timestamp": parse_timestamp(time_val),
                 "datetime": time_val,
                 "formatted_time": format_time_str(time_val),
-                "symbol": r.get("Symbol", symbol_upper),
-                "spot_price": safe_float(r.get("Price LTP", r.get("spot_price", 0))),
-                "atm_strike": safe_float(r.get("ATM Strike", r.get("atm_strike", 0))),
-                "pcr": safe_float(r.get("PCR", r.get("pcr", 0))),
-                "ce_oi": safe_float(r.get("CE OI", r.get("ce_oi", 0))),
-                "pe_oi": safe_float(r.get("PE OI", r.get("pe_oi", 0))),
-                "ce_oi_chg": safe_float(r.get("CE Chg in OI", r.get("ce_oi_chg", 0))),
-                "pe_oi_chg": safe_float(r.get("PE Chg in OI", r.get("pe_oi_chg", 0))),
-                "ce_vol": safe_float(r.get("CE Vol", r.get("ce_vol", 0))),
-                "pe_vol": safe_float(r.get("PE Vol", r.get("pe_vol", 0))),
-                "ce_iv": safe_float(r.get("CE IV", r.get("ce_iv", 0))),
-                "pe_iv": safe_float(r.get("PE IV", r.get("pe_iv", 0))),
-                "ce_delta": safe_float(r.get("CE Delta", r.get("ce_delta", 0))),
-                "pe_delta": safe_float(r.get("PE Delta", r.get("pe_delta", 0))),
-                "ce_theta": safe_float(r.get("CE Theta", r.get("ce_theta", 0))),
-                "pe_theta": safe_float(r.get("PE Theta", r.get("pe_theta", 0))),
-                "ce_vega": safe_float(r.get("CE Vega", r.get("ce_vega", 0))),
-                "pe_vega": safe_float(r.get("PE Vega", r.get("pe_vega", 0))),
-                "ce_gamma": safe_float(r.get("CE Gamma", r.get("ce_gamma", 0))),
-                "pe_gamma": safe_float(r.get("PE Gamma", r.get("pe_gamma", 0))),
-                "ce_ask_qty": safe_float(r.get("CE Ask", r.get("CE Ask Qty", r.get("ce_ask_qty", 0)))),
-                "pe_bid_qty": safe_float(r.get("PE Bid", r.get("PE Bid Qty", r.get("pe_bid_qty", 0)))),
+                "symbol": sym_val,
+                "spot_price": float(spot_val) if isinstance(spot_val, (int, float)) else 0.0,
+                "atm_strike": float(atm_val) if isinstance(atm_val, (int, float)) else 0.0,
+                "pcr": float(pcr_val) if isinstance(pcr_val, (int, float)) else 0.0,
+                "ce_oi": float(ce_oi_val) if isinstance(ce_oi_val, (int, float)) else 0.0,
+                "pe_oi": float(pe_oi_val) if isinstance(pe_oi_val, (int, float)) else 0.0,
+                "ce_oi_chg": float(ce_oi_chg_val) if isinstance(ce_oi_chg_val, (int, float)) else 0.0,
+                "pe_oi_chg": float(pe_oi_chg_val) if isinstance(pe_oi_chg_val, (int, float)) else 0.0,
+                "ce_vol": float(ce_vol_val) if isinstance(ce_vol_val, (int, float)) else 0.0,
+                "pe_vol": float(pe_vol_val) if isinstance(pe_vol_val, (int, float)) else 0.0,
+                "ce_iv": float(ce_iv_val) if isinstance(ce_iv_val, (int, float)) else 0.0,
+                "pe_iv": float(pe_iv_val) if isinstance(pe_iv_val, (int, float)) else 0.0,
+                "ce_delta": float(ce_delta_val) if isinstance(ce_delta_val, (int, float)) else 0.0,
+                "pe_delta": float(pe_delta_val) if isinstance(pe_delta_val, (int, float)) else 0.0,
+                "ce_theta": float(ce_theta_val) if isinstance(ce_theta_val, (int, float)) else 0.0,
+                "pe_theta": float(pe_theta_val) if isinstance(pe_theta_val, (int, float)) else 0.0,
+                "ce_vega": float(ce_vega_val) if isinstance(ce_vega_val, (int, float)) else 0.0,
+                "pe_vega": float(pe_vega_val) if isinstance(pe_vega_val, (int, float)) else 0.0,
+                "ce_gamma": float(ce_gamma_val) if isinstance(ce_gamma_val, (int, float)) else 0.0,
+                "pe_gamma": float(pe_gamma_val) if isinstance(pe_gamma_val, (int, float)) else 0.0,
+                "ce_ask_qty": float(ce_ask_val) if isinstance(ce_ask_val, (int, float)) else 0.0,
+                "pe_bid_qty": float(pe_bid_val) if isinstance(pe_bid_val, (int, float)) else 0.0,
             }
             snapshots.append(snapshot)
     except Exception as e:
-        print(f"[GSheet Parsing Error]: {e}")
-        
+        print(f"[GSheet Parsing Exception]: {e}")
+        return [], f"Parsing error reading Google Sheet CSV: {e}"
+
+    if not snapshots:
+        return [], "Google Sheet connected but no valid data rows were found matching expected columns."
+
     # Reverse snapshot list so line chart progresses chronologically (oldest on left -> newest on right)
-    return snapshots[::-1]
+    return snapshots[::-1], None
 
 # --- UPSTOX CONCURRENT DATA FETCHING ---
 def fetch_single_expiry_chain(instrument_key, expiry_date, headers):
@@ -720,13 +785,24 @@ ANALYSIS_HTML_TEMPLATE = """
             fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&metric=${metric}`)
                 .then(res => res.json())
                 .then(data => {
+                    if (data.error) {
+                        historyChartObj.data.labels = [data.error];
+                        historyChartObj.data.datasets = [{
+                            label: 'Status / Error',
+                            data: [0],
+                            borderColor: '#ef4444'
+                        }];
+                        historyChartObj.update();
+                        return;
+                    }
+
                     const snapshots = data.history || [];
                     const times = snapshots.map(s => s.formatted_time || s.datetime);
 
                     let datasets = [];
 
                     if (snapshots.length === 0) {
-                        historyChartObj.data.labels = ["Connecting to Google Sheet..."];
+                        historyChartObj.data.labels = ["No data found in Google Sheet."];
                         historyChartObj.data.datasets = [{
                             label: 'Status',
                             data: [0],
@@ -1082,7 +1158,10 @@ def api_history():
     symbol = request.args.get("symbol", "NIFTY").upper()
     timeframe = request.args.get("timeframe", "5minute")
 
-    snapshots = fetch_history_from_gsheet(symbol)
+    snapshots, err = fetch_history_from_gsheet(symbol)
+
+    if err:
+        return jsonify({"history": [], "count": 0, "error": err})
 
     if timeframe == "5minute" or not snapshots:
         return jsonify({"history": snapshots, "count": len(snapshots)})
@@ -1198,7 +1277,7 @@ def download_csv():
 @app.route("/download_history")
 def download_history_csv():
     symbol = request.args.get("symbol", "NIFTY").upper()
-    snapshots = fetch_history_from_gsheet(symbol)
+    snapshots, _ = fetch_history_from_gsheet(symbol)
 
     si = io.StringIO()
     cw = csv.writer(si)
