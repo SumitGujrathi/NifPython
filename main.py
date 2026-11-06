@@ -405,7 +405,7 @@ MAIN_HTML_TEMPLATE = """
         .btn:hover { opacity: 0.9; }
         select { padding: 8px 12px; font-size: 14px; border-radius: 4px; border: 1px solid #ced4da; outline: none; font-weight: 600; }
         .table-container { overflow-x: auto; background: #fff; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.06); }
-        table { width: 100%; border-collapse: collapse; min-width: 1200px; }
+        table { width: 100%; border-collapse: collapse; min-width: 1300px; }
         th, td { border: 1px solid #e9ecef; padding: 7px 9px; text-align: center; font-size: 13px; }
         th { background-color: #343a40; color: white; position: sticky; top: 0; }
         tr:nth-child(even){ background-color: #f8f9fa; }
@@ -463,20 +463,21 @@ MAIN_HTML_TEMPLATE = """
         <table>
             <thead>
                 <tr>
-                    <th colspan="10" class="ce-header">CALL OPTIONS (CE)</th>
+                    <th colspan="11" class="ce-header">CALL OPTIONS (CE)</th>
                     <th>STRIKE</th>
-                    <th colspan="10" class="pe-header">PUT OPTIONS (PE)</th>
+                    <th colspan="11" class="pe-header">PUT OPTIONS (PE)</th>
                 </tr>
                 <tr>
-                    <th>OI</th><th>Vol</th><th>IV</th><th>Delta</th><th>Theta</th><th>Vega</th><th>Gamma</th><th>Bid</th><th>Ask</th><th>LTP</th>
+                    <th>OI</th><th>Chg in OI</th><th>Vol</th><th>IV</th><th>Delta</th><th>Theta</th><th>Vega</th><th>Gamma</th><th>Bid</th><th>Ask</th><th>LTP</th>
                     <th>Price</th>
-                    <th>LTP</th><th>Bid</th><th>Ask</th><th>Delta</th><th>Theta</th><th>Vega</th><th>Gamma</th><th>IV</th><th>Vol</th><th>OI</th>
+                    <th>LTP</th><th>Bid</th><th>Ask</th><th>Delta</th><th>Theta</th><th>Vega</th><th>Gamma</th><th>IV</th><th>Vol</th><th>Chg in OI</th><th>OI</th>
                 </tr>
             </thead>
             <tbody>
                 {% for row in rows %}
                 <tr>
                     <td class="ce-cell">{{ "{:,}".format(row.ce_oi) }}</td>
+                    <td class="ce-cell">{{ "{:,}".format(row.ce_oi_chg) }}</td>
                     <td class="ce-cell">{{ "{:,}".format(row.ce_vol) }}</td>
                     <td class="ce-cell">{{ row.ce_iv }}</td>
                     <td class="ce-cell greek-col">{{ row.ce_delta }}</td>
@@ -500,6 +501,7 @@ MAIN_HTML_TEMPLATE = """
                     <td class="pe-cell greek-col">{{ row.pe_gamma }}</td>
                     <td class="pe-cell">{{ row.pe_iv }}</td>
                     <td class="pe-cell">{{ "{:,}".format(row.pe_vol) }}</td>
+                    <td class="pe-cell">{{ "{:,}".format(row.pe_oi_chg) }}</td>
                     <td class="pe-cell">{{ "{:,}".format(row.pe_oi) }}</td>
                 </tr>
                 {% endfor %}
@@ -1205,17 +1207,17 @@ def download_csv():
     cw = csv.writer(si)
     cw.writerow([f"Symbol: {symbol}", f"Spot Price: {spot_price}", f"ATM Strike: {atm_strike}", f"Expiry: {expiry}", f"PCR: {pcr}", f"Updated: {updated}"])
     cw.writerow([
-        "CE OI", "CE Vol", "CE IV", "CE Delta", "CE Theta", "CE Vega", "CE Gamma", "CE Bid", "CE Ask", "CE LTP",
+        "CE OI", "CE Chg in OI", "CE Vol", "CE IV", "CE Delta", "CE Theta", "CE Vega", "CE Gamma", "CE Bid", "CE Ask", "CE LTP",
         "STRIKE",
-        "PE LTP", "PE Bid", "PE Ask", "PE Delta", "PE Theta", "PE Vega", "PE Gamma", "PE IV", "PE Vol", "PE OI"
+        "PE LTP", "PE Bid", "PE Ask", "PE Delta", "PE Theta", "PE Vega", "PE Gamma", "PE IV", "PE Vol", "PE Chg in OI", "PE OI"
     ])
 
     if not error:
         for r in rows:
             cw.writerow([
-                r["ce_oi"], r["ce_vol"], r["ce_iv"], r["ce_delta"], r["ce_theta"], r["ce_vega"], r["ce_gamma"], r["ce_bid"], r["ce_ask"], r["ce_ltp"],
+                r["ce_oi"], r["ce_oi_chg"], r["ce_vol"], r["ce_iv"], r["ce_delta"], r["ce_theta"], r["ce_vega"], r["ce_gamma"], r["ce_bid"], r["ce_ask"], r["ce_ltp"],
                 r["strike"],
-                r["pe_ltp"], r["pe_bid"], r["pe_ask"], r["pe_delta"], r["pe_theta"], r["pe_vega"], r["pe_gamma"], r["pe_iv"], r["pe_vol"], r["pe_oi"]
+                r["pe_ltp"], r["pe_bid"], r["pe_ask"], r["pe_delta"], r["pe_theta"], r["pe_vega"], r["pe_gamma"], r["pe_iv"], r["pe_vol"], r["pe_oi_chg"], r["pe_oi"]
             ])
 
     output = Response(si.getvalue(), mimetype="text/csv")
