@@ -21,6 +21,7 @@ REDIRECT_URI = os.getenv("UPSTOX_REDIRECT_URI", "http://127.0.0.1:5000/")
 USER_ID = os.getenv("UPSTOX_USER_ID")
 PIN = os.getenv("UPSTOX_PIN")
 TOTP_KEY = os.getenv("UPSTOX_TOTP_KEY")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1fpXdodshvwHcduwffOhEK54K-a7a4TmOZF2Q-EgVRzM")
 
 SESSION_FILE_PATH = "/tmp/upstox_session.json"
 AUTH_THREAD_LOCK = threading.Lock()
@@ -34,42 +35,6 @@ AUTH_COOLDOWN = {
     "last_failure_time": 0,
     "cooldown_duration": 1500  # 25 minutes safety lockout
 }
-
-# --- IN-MEMORY HISTORICAL SNAPSHOT STORAGE ---
-HISTORICAL_SNAPSHOTS = []  # Global memory storage for snapshots
-SNAPSHOT_LOCK = threading.Lock()
-
-# --- MARKET HOURS & MEMORY MANAGEMENT ---
-def is_market_open():
-    """Checks if current IST time is within Indian stock market hours (Mon-Fri, 9:15 AM - 3:30 PM)."""
-    ist_tz = timezone(timedelta(hours=5, minutes=30))
-    now_ist = datetime.now(ist_tz)
-    if now_ist.weekday() >= 5:
-        return False
-    start_time = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
-    end_time = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
-    return start_time <= now_ist <= end_time
-
-def trim_memory_if_needed():
-    """Ensures memory usage of snapshot buffer stays under 50 MB, trimming down to ~30 MB."""
-    global HISTORICAL_SNAPSHOTS
-    with SNAPSHOT_LOCK:
-        try:
-            raw_bytes = len(json.dumps(HISTORICAL_SNAPSHOTS).encode('utf-8'))
-            max_limit = 50 * 1024 * 1024   # 50 MB threshold
-            target_limit = 30 * 1024 * 1024  # 30 MB target
-
-            if raw_bytes > max_limit:
-                print(f"[Memory Trim] Size {raw_bytes / (1024*1024):.2f} MB exceeds 50MB. Trimming down...")
-                while len(HISTORICAL_SNAPSHOTS) > 20:
-                    current_size = len(json.dumps(HISTORICAL_SNAPSHOTS).encode('utf-8'))
-                    if current_size <= target_limit:
-                        break
-                    trim_count = max(1, len(HISTORICAL_SNAPSHOTS) // 10)
-                    HISTORICAL_SNAPSHOTS = HISTORICAL_SNAPSHOTS[trim_count:]
-                print(f"[Memory Trim Complete] New length: {len(HISTORICAL_SNAPSHOTS)}")
-        except Exception as e:
-            print(f"[Memory Trim Exception]: {e}")
 
 # --- PERSISTENT SESSION MANAGEMENT ---
 def load_session_token():
@@ -157,6 +122,98 @@ def get_valid_token():
     if token:
         return token
     return perform_single_auth()
+
+# --- GOOGLE SHEET HISTORICAL DATA LOADER ---
+def parse_timestamp(dt_str):
+    if not dt_str:
+        return 0
+    dt_str = str(dt_str).strip()
+    for fmt in ("%m/%d/%Y %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M", "%d/%m/%Y %H:%M"):
+        try:
+            dt = datetime.strptime(dt_str, fmt)
+            return int(dt.timestamp())
+        except ValueError:
+            pass
+    return 0
+
+def format_time_str(time_raw):
+    time_str = str(time_raw).strip()
+    if " " in time_str:
+        parts = time_str.split(" ")
+        time_part = parts[1] if len(parts) > 1 else parts[0]
+    else:
+        time_part = time_str
+    t_parts = time_part.split(":")
+    if len(t_parts) >= 2:
+        return f"{t_parts[0]}:{t_parts[1]}"
+    return time_str
+
+def fetch_history_from_gsheet(symbol="NIFTY"):
+    symbol_upper = symbol.upper()
+    candidate_sheets = ["NITY", "NIFTY", symbol_upper] if symbol_upper in ["NIFTY", "NITY"] else [symbol_upper]
+    
+    raw_csv = None
+    for sheet_name in candidate_sheets:
+        url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
+        try:
+            res = requests.get(url, timeout=8)
+            if res.status_code == 200 and len(res.text) > 50:
+                raw_csv = res.text
+                break
+        except Exception as e:
+            print(f"[GSheet Fetch Warning] Failed fetching sheet '{sheet_name}': {e}")
+            
+    if not raw_csv:
+        return []
+
+    snapshots = []
+    try:
+        reader = csv.DictReader(io.StringIO(raw_csv))
+        for row in reader:
+            r = {k.strip(): v for k, v in row.items() if k}
+            time_val = r.get("Time", r.get("datetime", ""))
+            if not time_val:
+                continue
+                
+            def safe_float(val, default=0.0):
+                try:
+                    return float(str(val).replace(",", "").strip())
+                except (ValueError, TypeError):
+                    return default
+
+            snapshot = {
+                "timestamp": parse_timestamp(time_val),
+                "datetime": time_val,
+                "formatted_time": format_time_str(time_val),
+                "symbol": r.get("Symbol", symbol_upper),
+                "spot_price": safe_float(r.get("Price LTP", r.get("spot_price", 0))),
+                "atm_strike": safe_float(r.get("ATM Strike", r.get("atm_strike", 0))),
+                "pcr": safe_float(r.get("PCR", r.get("pcr", 0))),
+                "ce_oi": safe_float(r.get("CE OI", r.get("ce_oi", 0))),
+                "pe_oi": safe_float(r.get("PE OI", r.get("pe_oi", 0))),
+                "ce_oi_chg": safe_float(r.get("CE Chg in OI", r.get("ce_oi_chg", 0))),
+                "pe_oi_chg": safe_float(r.get("PE Chg in OI", r.get("pe_oi_chg", 0))),
+                "ce_vol": safe_float(r.get("CE Vol", r.get("ce_vol", 0))),
+                "pe_vol": safe_float(r.get("PE Vol", r.get("pe_vol", 0))),
+                "ce_iv": safe_float(r.get("CE IV", r.get("ce_iv", 0))),
+                "pe_iv": safe_float(r.get("PE IV", r.get("pe_iv", 0))),
+                "ce_delta": safe_float(r.get("CE Delta", r.get("ce_delta", 0))),
+                "pe_delta": safe_float(r.get("PE Delta", r.get("pe_delta", 0))),
+                "ce_theta": safe_float(r.get("CE Theta", r.get("ce_theta", 0))),
+                "pe_theta": safe_float(r.get("PE Theta", r.get("pe_theta", 0))),
+                "ce_vega": safe_float(r.get("CE Vega", r.get("ce_vega", 0))),
+                "pe_vega": safe_float(r.get("PE Vega", r.get("pe_vega", 0))),
+                "ce_gamma": safe_float(r.get("CE Gamma", r.get("ce_gamma", 0))),
+                "pe_gamma": safe_float(r.get("PE Gamma", r.get("pe_gamma", 0))),
+                "ce_ask_qty": safe_float(r.get("CE Ask", r.get("CE Ask Qty", r.get("ce_ask_qty", 0)))),
+                "pe_bid_qty": safe_float(r.get("PE Bid", r.get("PE Bid Qty", r.get("pe_bid_qty", 0)))),
+            }
+            snapshots.append(snapshot)
+    except Exception as e:
+        print(f"[GSheet Parsing Error]: {e}")
+        
+    # Reverse snapshot list so line chart progresses chronologically (oldest on left -> newest on right)
+    return snapshots[::-1]
 
 # --- UPSTOX CONCURRENT DATA FETCHING ---
 def fetch_single_expiry_chain(instrument_key, expiry_date, headers):
@@ -311,78 +368,6 @@ def process_option_data(symbol, selected_expiry="ALL"):
     pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 0
 
     return rows, spot_price, atm_strike, current_expiry, expiries, updated_time, pcr, total_ce_oi, total_pe_oi, None
-
-# --- BACKGROUND 5-MINUTE SNAPSHOT RECORDER ---
-def record_snapshot(symbol):
-    """Computes strike-wide aggregated CE/PE metrics & spot price and records snapshot."""
-    try:
-        rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry="ALL")
-        if error or not rows:
-            return None
-
-        ist_tz = timezone(timedelta(hours=5, minutes=30))
-        now_ist = datetime.now(ist_tz)
-        ts_unix = int(now_ist.timestamp())
-        formatted_ts = now_ist.strftime("%H:%M")
-        full_dt_str = now_ist.strftime("%Y-%m-%d %H:%M:%S IST")
-
-        num_strikes = len(rows) or 1
-        ce_vol_sum = sum(r["ce_vol"] for r in rows)
-        pe_vol_sum = sum(r["pe_vol"] for r in rows)
-        ce_iv_avg = round(sum(r["ce_iv"] for r in rows) / num_strikes, 2)
-        pe_iv_avg = round(sum(r["pe_iv"] for r in rows) / num_strikes, 2)
-        ce_delta_sum = round(sum(r["ce_delta"] for r in rows), 2)
-        pe_delta_sum = round(sum(r["pe_delta"] for r in rows), 2)
-        ce_theta_sum = round(sum(r["ce_theta"] for r in rows), 2)
-        pe_theta_sum = round(sum(r["pe_theta"] for r in rows), 2)
-        ce_vega_sum = round(sum(r["ce_vega"] for r in rows), 2)
-        pe_vega_sum = round(sum(r["pe_vega"] for r in rows), 2)
-        ce_gamma_sum = round(sum(r["ce_gamma"] for r in rows), 4)
-        pe_gamma_sum = round(sum(r["pe_gamma"] for r in rows), 4)
-        ce_bid_qty_sum = sum(r["ce_bid_qty"] for r in rows)
-        ce_ask_qty_sum = sum(r["ce_ask_qty"] for r in rows)
-        pe_bid_qty_sum = sum(r["pe_bid_qty"] for r in rows)
-        pe_ask_qty_sum = sum(r["pe_ask_qty"] for r in rows)
-
-        snapshot = {
-            "timestamp": ts_unix,
-            "datetime": full_dt_str,
-            "formatted_time": formatted_ts,
-            "symbol": symbol,
-            "spot_price": spot_price,
-            "atm_strike": atm_strike,
-            "pcr": pcr,
-            "ce_oi": total_ce_oi,
-            "pe_oi": total_pe_oi,
-            "ce_vol": ce_vol_sum,
-            "pe_vol": pe_vol_sum,
-            "ce_iv": ce_iv_avg,
-            "pe_iv": pe_iv_avg,
-            "ce_delta": ce_delta_sum,
-            "pe_delta": pe_delta_sum,
-            "ce_theta": ce_theta_sum,
-            "pe_theta": pe_theta_sum,
-            "ce_vega": ce_vega_sum,
-            "pe_vega": pe_vega_sum,
-            "ce_gamma": ce_gamma_sum,
-            "pe_gamma": pe_gamma_sum,
-            "ce_bid_qty": ce_bid_qty_sum,
-            "ce_ask_qty": ce_ask_qty_sum,
-            "pe_bid_qty": pe_bid_qty_sum,
-            "pe_ask_qty": pe_ask_qty_sum
-        }
-
-        with SNAPSHOT_LOCK:
-            # Prevent duplicate timestamps within 30 seconds
-            if not HISTORICAL_SNAPSHOTS or (ts_unix - HISTORICAL_SNAPSHOTS[-1]["timestamp"] > 30):
-                HISTORICAL_SNAPSHOTS.append(snapshot)
-                print(f"[Snapshot Recorded] Symbol: {symbol} at {formatted_ts}. Total count: {len(HISTORICAL_SNAPSHOTS)}")
-        
-        trim_memory_if_needed()
-        return snapshot
-    except Exception as e:
-        print(f"[Snapshot Error] Exception recording {symbol}: {e}")
-        return None
 
 # --- MAIN TABLE TEMPLATE ---
 MAIN_HTML_TEMPLATE = """
@@ -547,8 +532,8 @@ ANALYSIS_HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-    <h2>📊 {{ symbol }} Advanced Analytics & Historical Memory Dashboard</h2>
-    <div class="subtitle">Live background auto-sync — Real-time memory snapshots & strike positioning</div>
+    <h2>📊 {{ symbol }} Advanced Analytics & Google Sheet Memory Dashboard</h2>
+    <div class="subtitle">Live background auto-sync — Real-time Google Sheet snapshots & strike positioning</div>
 
     <div class="nav-bar">
         <label style="color: #94a3b8; font-weight: bold;">Symbol:</label>
@@ -633,17 +618,18 @@ ANALYSIS_HTML_TEMPLATE = """
         <canvas id="analysisChart" style="max-height: 480px;"></canvas>
     </div>
 
-    <!-- CHART 2: HISTORICAL SNAPSHOT TREND (5-MIN MARKET MEMORY) -->
+    <!-- CHART 2: HISTORICAL SNAPSHOT TREND (GOOGLE SHEET MEMORY) -->
     <div class="chart-box">
         <div class="chart-header">
             <div style="display: flex; align-items: center; gap: 15px;">
-                <span class="chart-title">2 - 📈 Historical Snapshot Trend (5-Min Market Memory)</span>
+                <span class="chart-title">2 - 📈 Historical Snapshot Trend (Google Sheet Memory)</span>
             </div>
             <div style="display: flex; gap: 12px; align-items: center;">
                 <label style="color: #94a3b8; font-weight: bold;">Trend Metric:</label>
                 <select id="historyMetricSelector" onchange="loadHistoricalChart()">
                     <option value="spot_price">Live Spot Price (Index)</option>
                     <option value="oi" selected>Open Interest (CE vs PE)</option>
+                    <option value="oi_chg">Change in Open Interest (CE vs PE)</option>
                     <option value="vol">Trading Volume (CE vs PE)</option>
                     <option value="pcr">Put-Call Ratio (PCR)</option>
                     <option value="iv">Implied Volatility (IV CE vs PE)</option>
@@ -663,7 +649,7 @@ ANALYSIS_HTML_TEMPLATE = """
                     <option value="day">1 Day</option>
                 </select>
 
-                <a id="downloadHistoryBtn" href="/download_history?symbol={{ symbol }}" class="btn-dl">📥 Download 5-Min Memory CSV</a>
+                <a id="downloadHistoryBtn" href="/download_history?symbol={{ symbol }}" class="btn-dl">📥 Download Google Sheet Memory CSV</a>
             </div>
         </div>
         <canvas id="historyChart" style="max-height: 420px;"></canvas>
@@ -740,7 +726,7 @@ ANALYSIS_HTML_TEMPLATE = """
                     let datasets = [];
 
                     if (snapshots.length === 0) {
-                        historyChartObj.data.labels = ["Initializing..."];
+                        historyChartObj.data.labels = ["Connecting to Google Sheet..."];
                         historyChartObj.data.datasets = [{
                             label: 'Status',
                             data: [0],
@@ -1096,17 +1082,10 @@ def api_history():
     symbol = request.args.get("symbol", "NIFTY").upper()
     timeframe = request.args.get("timeframe", "5minute")
 
-    with SNAPSHOT_LOCK:
-        filtered = [s for s in HISTORICAL_SNAPSHOTS if s.get("symbol") == symbol]
+    snapshots = fetch_history_from_gsheet(symbol)
 
-    # On-demand fallback: seed initial snapshot if list is currently empty
-    if not filtered:
-        sn = record_snapshot(symbol)
-        if sn:
-            filtered = [sn]
-
-    if timeframe == "5minute" or not filtered:
-        return jsonify({"history": filtered, "count": len(filtered)})
+    if timeframe == "5minute" or not snapshots:
+        return jsonify({"history": snapshots, "count": len(snapshots)})
 
     sec_map = {
         "15minute": 15 * 60,
@@ -1117,8 +1096,9 @@ def api_history():
     interval_sec = sec_map.get(timeframe, 300)
 
     grouped = {}
-    for item in filtered:
-        bucket = (item["timestamp"] // interval_sec) * interval_sec
+    for idx, item in enumerate(snapshots):
+        ts = item["timestamp"]
+        bucket = (ts // interval_sec) * interval_sec if ts > 0 else (idx // (interval_sec // 300))
         grouped[bucket] = item
 
     resampled = [grouped[b] for b in sorted(grouped.keys())]
@@ -1130,9 +1110,6 @@ def api_data():
     selected_expiry = request.args.get("expiry", "ALL").upper()
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
     
-    # Trigger non-blocking asynchronous snapshot update
-    threading.Thread(target=record_snapshot, args=(symbol,), daemon=True).start()
-
     return jsonify({
         "rows": rows,
         "spot_price": spot_price,
@@ -1154,9 +1131,6 @@ def index():
     symbol = request.args.get("symbol", "NIFTY").upper()
     selected_expiry = request.args.get("expiry", "ALL").upper()
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
-    
-    # Record snapshot on web page access
-    threading.Thread(target=record_snapshot, args=(symbol,), daemon=True).start()
 
     return render_template_string(
         MAIN_HTML_TEMPLATE,
@@ -1178,9 +1152,6 @@ def analysis_dashboard():
     symbol = request.args.get("symbol", "NIFTY").upper()
     selected_expiry = request.args.get("expiry", "ALL").upper()
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
-
-    # Record snapshot on analysis page access
-    threading.Thread(target=record_snapshot, args=(symbol,), daemon=True).start()
 
     return render_template_string(
         ANALYSIS_HTML_TEMPLATE,
@@ -1227,37 +1198,31 @@ def download_csv():
 @app.route("/download_history")
 def download_history_csv():
     symbol = request.args.get("symbol", "NIFTY").upper()
-
-    with SNAPSHOT_LOCK:
-        filtered = [s for s in HISTORICAL_SNAPSHOTS if s.get("symbol") == symbol]
-
-    if not filtered:
-        sn = record_snapshot(symbol)
-        if sn:
-            filtered = [sn]
+    snapshots = fetch_history_from_gsheet(symbol)
 
     si = io.StringIO()
     cw = csv.writer(si)
     cw.writerow([
-        "Timestamp", "Datetime", "Formatted Time", "Symbol", "Spot Price", "ATM Strike", "PCR",
-        "CE Total OI", "PE Total OI", "CE Total Vol", "PE Total Vol",
-        "CE Avg IV", "PE Avg IV", "CE Sum Delta", "PE Sum Delta",
-        "CE Sum Theta", "PE Sum Theta", "CE Sum Vega", "PE Sum Vega",
-        "CE Sum Gamma", "PE Sum Gamma", "CE Ask Qty (Depth)", "PE Bid Qty (Depth)"
+        "Datetime", "Formatted Time", "Symbol", "Spot Price", "ATM Strike", "PCR",
+        "CE OI", "PE OI", "CE Chg in OI", "PE Chg in OI", "CE Vol", "PE Vol",
+        "CE IV", "PE IV", "CE Delta", "PE Delta",
+        "CE Theta", "PE Theta", "CE Vega", "PE Vega",
+        "CE Gamma", "PE Gamma", "CE Ask Qty (Depth)", "PE Bid Qty (Depth)"
     ])
 
-    for s in filtered:
+    for s in snapshots:
         cw.writerow([
-            s.get("timestamp"), s.get("datetime"), s.get("formatted_time"), s.get("symbol"),
+            s.get("datetime"), s.get("formatted_time"), s.get("symbol"),
             s.get("spot_price"), s.get("atm_strike"), s.get("pcr"),
-            s.get("ce_oi"), s.get("pe_oi"), s.get("ce_vol"), s.get("pe_vol"),
+            s.get("ce_oi"), s.get("pe_oi"), s.get("ce_oi_chg"), s.get("pe_oi_chg"),
+            s.get("ce_vol"), s.get("pe_vol"),
             s.get("ce_iv"), s.get("pe_iv"), s.get("ce_delta"), s.get("pe_delta"),
             s.get("ce_theta"), s.get("pe_theta"), s.get("ce_vega"), s.get("pe_vega"),
             s.get("ce_gamma"), s.get("pe_gamma"), s.get("ce_ask_qty"), s.get("pe_bid_qty")
         ])
 
     output = Response(si.getvalue(), mimetype="text/csv")
-    output.headers["Content-Disposition"] = f"attachment; filename={symbol}_Historical_5Min_Memory.csv"
+    output.headers["Content-Disposition"] = f"attachment; filename={symbol}_Historical_GSheet_Memory.csv"
     return output
 
 if __name__ == "__main__":
