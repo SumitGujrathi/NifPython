@@ -8,7 +8,6 @@ import threading
 import urllib.parse
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import pandas as pd
 import requests
 import pyotp
 from flask import Flask, render_template_string, request, Response, jsonify
@@ -125,7 +124,7 @@ def get_valid_token():
         return token
     return perform_single_auth()
 
-# --- REBUILT GOOGLE SHEET HISTORICAL DATA LOADER ---
+# --- REBUILT GOOGLE SHEET HISTORICAL DATA LOADER (PURE PYTHON CSV) ---
 def parse_timestamp(dt_str):
     if not dt_str:
         return 0
@@ -193,45 +192,56 @@ def fetch_history_from_gsheet(symbol="NIFTY"):
         return [], err_msg
 
     try:
-        df = pd.read_csv(io.StringIO(raw_csv))
-        if df.empty:
+        clean_csv = raw_csv.lstrip('\ufeff')
+        lines = [line.strip().lstrip('\ufeff') for line in clean_csv.splitlines() if line.strip()]
+        if not lines:
             return [], "Google Sheet CSV is empty."
 
-        # Clean column names by removing BOM bytes and extra whitespace
-        df.columns = [re.sub(r'^[^\w]+', '', str(c)).strip() for c in df.columns]
-
-        # Determine time column
-        time_col = None
-        for col in df.columns:
-            if col.lower() in ("time", "datetime", "timestamp"):
-                time_col = col
+        header_idx = 0
+        for i, l in enumerate(lines[:10]):
+            l_lower = l.lower()
+            if "time" in l_lower or "symbol" in l_lower or "pcr" in l_lower or "ltp" in l_lower:
+                header_idx = i
                 break
-        if not time_col and len(df.columns) > 0:
-            time_col = df.columns[0]
+
+        csv_data_stream = "\n".join(lines[header_idx:])
+        reader = csv.DictReader(io.StringIO(csv_data_stream))
 
         snapshots = []
-        for idx, row in df.iterrows():
-            time_val = str(row.get(time_col, "")).strip()
-            if not time_val or time_val.lower() in ("nan", "none", "", "0.0"):
+        for row in reader:
+            if not row:
                 continue
+            # Regex cleaning to remove leading non-alphanumeric chars (like hidden BOM \ufeff)
+            norm_r = {re.sub(r'^[^\w]+', '', str(k)).strip().lower(): str(v).strip() for k, v in row.items() if k is not None}
 
             def safe_num(primary_name, alt_names=[], default=0.0):
-                for name in [primary_name] + alt_names:
-                    for c in df.columns:
-                        if c.lower() == name.lower() or c.lower().replace(" ", "") == name.lower().replace(" ", ""):
-                            val = row.get(c)
+                names = [primary_name.lower()] + [a.lower() for a in alt_names]
+                for n in names:
+                    if n in norm_r:
+                        val_str = norm_r[n].replace(",", "").strip()
+                        try:
+                            return float(val_str)
+                        except (ValueError, TypeError):
+                            pass
+                    n_nospace = n.replace(" ", "")
+                    for k_key, k_val in norm_r.items():
+                        if k_key.replace(" ", "") == n_nospace:
                             try:
-                                return float(str(val).replace(",", "").strip())
+                                return float(k_val.replace(",", "").strip())
                             except (ValueError, TypeError):
-                                return default
+                                pass
                 return default
+
+            time_val = str(norm_r.get("time", norm_r.get("datetime", norm_r.get("timestamp", ""))))
+            if not time_val or time_val.lower() in ("nan", "none", "", "0.0"):
+                continue
 
             snapshot = {
                 "timestamp": parse_timestamp(time_val),
                 "datetime": time_val,
                 "formatted_time": format_time_str(time_val),
-                "symbol": str(row.get("Symbol", symbol.upper())),
-                "spot_price": safe_num("Price LTP", ["Price LTP", "spot_price", "ltp"]),
+                "symbol": str(norm_r.get("symbol", symbol.upper())),
+                "spot_price": safe_num("Price LTP", ["spot_price", "ltp"]),
                 "atm_strike": safe_num("ATM Strike", ["atm_strike"]),
                 "pcr": safe_num("PCR"),
                 "ce_oi": safe_num("CE OI"),
@@ -886,7 +896,6 @@ ANALYSIS_HTML_TEMPLATE = """
                         return;
                     }
 
-                    // Dual-axis option for Price LTP / PCR
                     if (metric === "price_pcr") {
                         historyChartObj.options.scales.y1.display = true;
                         const spotVals = snapshots.map(s => s.spot_price);
