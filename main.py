@@ -288,7 +288,6 @@ def fetch_history_from_gsheet(symbol="NIFTY"):
         if not snapshots:
             return [], "Google Sheet connected but no valid data rows were found matching expected columns."
 
-        # Reverse snapshots list so newest sheet entry plots on far right chronologically
         return snapshots[::-1], None
 
     except Exception as e:
@@ -891,7 +890,18 @@ ANALYSIS_HTML_TEMPLATE = """
             return data.map((_, i) => Number((slope * i + intercept).toFixed(2)));
         }
 
-        // Custom Plugin to draw 'B' / 'S' Signal Labels above Main Volatility line points
+        function calcAverage(arr) {
+            if (!arr || arr.length === 0) return 0;
+            const sum = arr.reduce((a, b) => a + (parseFloat(b) || 0), 0);
+            return sum / arr.length;
+        }
+
+        function fmtNum(val) {
+            if (val === undefined || val === null || isNaN(val)) return "0";
+            return Number(val).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+
+        // Custom Plugin: Draw 'B' / 'S' Signal Labels above Main Volatility line points
         const signalLabelPlugin = {
             id: 'signalLabelPlugin',
             afterDatasetsDraw: (chart) => {
@@ -919,6 +929,38 @@ ANALYSIS_HTML_TEMPLATE = """
             }
         };
 
+        // Custom Plugin: Fills light green area above 0 and light red area below 0 on Chart 3
+        const zeroLineBackgroundPlugin = {
+            id: 'zeroLineBackgroundPlugin',
+            beforeDraw: (chart) => {
+                const { ctx, chartArea, scales } = chart;
+                if (!chartArea || !scales || !scales.y) return;
+
+                const { top, bottom, left, right } = chartArea;
+                const yScale = scales.y;
+
+                ctx.save();
+                let yZero = yScale.getPixelForValue(0);
+
+                if (yZero < top) yZero = top;
+                if (yZero > bottom) yZero = bottom;
+
+                // Green area above 0 (top of chart down to yZero)
+                if (yZero > top) {
+                    ctx.fillStyle = 'rgba(34, 197, 94, 0.08)';
+                    ctx.fillRect(left, top, right - left, yZero - top);
+                }
+
+                // Red area below 0 (yZero down to bottom of chart)
+                if (yZero < bottom) {
+                    ctx.fillStyle = 'rgba(239, 68, 68, 0.08)';
+                    ctx.fillRect(left, yZero, right - left, bottom - yZero);
+                }
+
+                ctx.restore();
+            }
+        };
+
         function initSignalChart() {
             const ctx = document.getElementById('signalChart').getContext('2d');
             signalChartObj = new Chart(ctx, {
@@ -936,7 +978,7 @@ ANALYSIS_HTML_TEMPLATE = """
                         tooltip: { mode: 'index', intersect: false }
                     }
                 },
-                plugins: [signalLabelPlugin]
+                plugins: [zeroLineBackgroundPlugin, signalLabelPlugin]
             });
             loadSignalChart();
         }
@@ -1064,30 +1106,37 @@ ANALYSIS_HTML_TEMPLATE = """
                         return;
                     }
 
+                    // SWAPPED VERTICAL AXES: PCR on Left (y), Price LTP on Right (y1)
                     if (metric === "price_pcr") {
+                        historyChartObj.options.scales.y.position = 'left';
                         historyChartObj.options.scales.y1.display = true;
+                        historyChartObj.options.scales.y1.position = 'right';
+
                         const spotVals = snapshots.map(s => s.spot_price);
                         const pcrVals = snapshots.map(s => s.pcr);
 
+                        const avgSpot = calcAverage(spotVals);
+                        const avgPcr = calcAverage(pcrVals);
+
                         datasets.push({
-                            label: 'Relation 1: Price LTP',
+                            label: `Relation 1: Price LTP (Avg: ${fmtNum(avgSpot)})`,
                             data: spotVals,
                             borderColor: '#facc15',
                             backgroundColor: 'rgba(250, 204, 21, 0.1)',
                             borderWidth: 2,
                             tension: 0.2,
-                            yAxisID: 'y',
+                            yAxisID: 'y1', // Right Side Axis
                             fill: true
                         });
 
                         datasets.push({
-                            label: 'Relation 2: PCR',
+                            label: `Relation 2: PCR (Avg: ${avgPcr.toFixed(2)})`,
                             data: pcrVals,
                             borderColor: '#38bdf8',
                             backgroundColor: 'rgba(56, 189, 248, 0.1)',
                             borderWidth: 2,
                             tension: 0.2,
-                            yAxisID: 'y1',
+                            yAxisID: 'y', // Left Side Axis
                             fill: false
                         });
 
@@ -1098,7 +1147,7 @@ ANALYSIS_HTML_TEMPLATE = """
                             borderDash: [6, 4],
                             borderWidth: 2,
                             pointRadius: 0,
-                            yAxisID: 'y',
+                            yAxisID: 'y1',
                             fill: false
                         });
                     }
@@ -1123,8 +1172,11 @@ ANALYSIS_HTML_TEMPLATE = """
                         const ceVals = snapshots.map(s => s[cfg.key1] || 0);
                         const peVals = snapshots.map(s => s[cfg.key2] || 0);
 
+                        const avg1 = calcAverage(ceVals);
+                        const avg2 = calcAverage(peVals);
+
                         datasets.push({
-                            label: `Relation 1: ${cfg.r1}`,
+                            label: `Relation 1: ${cfg.r1} (Avg: ${fmtNum(avg1)})`,
                             data: ceVals,
                             borderColor: '#ef4444',
                             backgroundColor: 'rgba(239, 68, 68, 0.1)',
@@ -1134,7 +1186,7 @@ ANALYSIS_HTML_TEMPLATE = """
                         });
 
                         datasets.push({
-                            label: `Relation 2: ${cfg.r2}`,
+                            label: `Relation 2: ${cfg.r2} (Avg: ${fmtNum(avg2)})`,
                             data: peVals,
                             borderColor: '#22c55e',
                             backgroundColor: 'rgba(34, 197, 94, 0.1)',
@@ -1661,7 +1713,6 @@ def api_history():
     if not snapshots:
         return jsonify({"history": [], "count": 0})
 
-    # Data Day Range Filter
     day_map = {
         "1week": 7 * 86400,
         "2week": 14 * 86400,
