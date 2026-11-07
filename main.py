@@ -124,7 +124,7 @@ def get_valid_token():
         return token
     return perform_single_auth()
 
-# --- REBUILT GOOGLE SHEET HISTORICAL DATA LOADER (PURE PYTHON CSV) ---
+# --- GOOGLE SHEET HISTORICAL & SIGNAL DATA LOADER ---
 def parse_timestamp(dt_str):
     if not dt_str:
         return 0
@@ -211,7 +211,6 @@ def fetch_history_from_gsheet(symbol="NIFTY"):
         for row in reader:
             if not row:
                 continue
-            # Regex cleaning to remove leading non-alphanumeric chars (like hidden BOM \ufeff)
             norm_r = {re.sub(r'^[^\w]+', '', str(k)).strip().lower(): str(v).strip() for k, v in row.items() if k is not None}
 
             def safe_num(primary_name, alt_names=[], default=0.0):
@@ -231,6 +230,17 @@ def fetch_history_from_gsheet(symbol="NIFTY"):
                             except (ValueError, TypeError):
                                 pass
                 return default
+
+            def safe_str(primary_name, alt_names=[]):
+                names = [primary_name.lower()] + [a.lower() for a in alt_names]
+                for n in names:
+                    if n in norm_r:
+                        return norm_r[n]
+                    n_nospace = n.replace(" ", "")
+                    for k_key, k_val in norm_r.items():
+                        if k_key.replace(" ", "") == n_nospace:
+                            return k_val
+                return ""
 
             time_val = str(norm_r.get("time", norm_r.get("datetime", norm_r.get("timestamp", ""))))
             if not time_val or time_val.lower() in ("nan", "none", "", "0.0"):
@@ -266,15 +276,19 @@ def fetch_history_from_gsheet(symbol="NIFTY"):
                 "pe_ask": safe_num("PE Ask"),
                 "ce_ltp": safe_num("CE LTP"),
                 "pe_ltp": safe_num("PE LTP"),
-                "ce_ask_qty": safe_num("CE Ask", ["CE Ask Qty"]),
-                "pe_bid_qty": safe_num("PE Bid", ["PE Bid Qty"])
+                # Main Signal Columns (AE:AI)
+                "min_roc": safe_num("Min ROC (Buy)", ["min_roc", "min roc"]),
+                "max_roc": safe_num("Max ROC (Sell)", ["max_roc", "max roc"]),
+                "cross_roc": safe_num("Cross ROC Sig", ["cross_roc_sig", "cross roc"]),
+                "main_volatility": safe_num("Main Volatility", ["main_vol", "volatility"]),
+                "new_signal": safe_str("New Signal", ["signal", "sig"])
             }
             snapshots.append(snapshot)
 
         if not snapshots:
             return [], "Google Sheet connected but no valid data rows were found matching expected columns."
 
-        # Reverse snapshots list so that newest entries at top of sheet plot on the far right of the timeline
+        # Reverse snapshots list so newest sheet entry plots on far right chronologically
         return snapshots[::-1], None
 
     except Exception as e:
@@ -699,8 +713,8 @@ ANALYSIS_HTML_TEMPLATE = """
 
         <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Bar Chart Metric:</label>
         <select id="metricSelector" onchange="updateChartMetric()">
-            <option value="depth_qty" selected>1 - Order Book Depth Quantity (Call Ask Qty vs Put Bid Qty)</option>
-            <option value="oi_chg">Change in Open Interest (Chg in OI)</option>
+            <option value="oi_chg" selected>Change in Open Interest (Chg in OI)</option>
+            <option value="depth_qty">1 - Order Book Depth Quantity (Call Ask Qty vs Put Bid Qty)</option>
             <option value="oi">Open Interest (CE vs PE)</option>
             <option value="vol">Trading Volume</option>
             <option value="delta">Delta Exposure</option>
@@ -759,7 +773,7 @@ ANALYSIS_HTML_TEMPLATE = """
     <!-- CHART 1: ORDER BOOK DEPTH QUANTITY & STRIKE BAR CHART -->
     <div class="chart-box">
         <div class="chart-header">
-            <div class="chart-title" id="chartHeaderTitle">1 - Order Book Depth Quantity (Call Ask Qty vs Put Bid Qty)</div>
+            <div class="chart-title" id="chartHeaderTitle">Change in Open Interest (Chg in OI)</div>
             <span style="color: #facc15; font-size: 13px; font-weight: bold;">★ Yellow Line = Spot ATM Strike | Dashed Lines = Linear Trendlines</span>
         </div>
         <canvas id="analysisChart" style="max-height: 480px;"></canvas>
@@ -771,7 +785,7 @@ ANALYSIS_HTML_TEMPLATE = """
             <div style="display: flex; align-items: center; gap: 15px;">
                 <span class="chart-title">2 - 📈 Historical Snapshot Trend (Google Sheet Memory)</span>
             </div>
-            <div style="display: flex; gap: 12px; align-items: center;">
+            <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
                 <label style="color: #94a3b8; font-weight: bold;">Head of Dropdown:</label>
                 <select id="historyMetricSelector" onchange="loadHistoricalChart()">
                     <option value="price_pcr" selected>Price LTP / PCR</option>
@@ -788,7 +802,15 @@ ANALYSIS_HTML_TEMPLATE = """
                     <option value="ltp">LTP AVG (CE LTP vs PE LTP)</option>
                 </select>
 
-                <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Interval:</label>
+                <label style="color: #94a3b8; font-weight: bold; margin-left: 6px;">Data Day Range:</label>
+                <select id="historyDayRangeSelector" onchange="loadHistoricalChart()">
+                    <option value="1week" selected>1 Week</option>
+                    <option value="2week">2 Week</option>
+                    <option value="1month">1 Month</option>
+                    <option value="3month">3 Month</option>
+                </select>
+
+                <label style="color: #94a3b8; font-weight: bold; margin-left: 6px;">Interval:</label>
                 <select id="historyTimeframeSelector" onchange="loadHistoricalChart()">
                     <option value="5minute" selected>5 Min</option>
                     <option value="15minute">15 Min</option>
@@ -803,6 +825,34 @@ ANALYSIS_HTML_TEMPLATE = """
         <canvas id="historyChart" style="max-height: 420px;"></canvas>
     </div>
 
+    <!-- CHART 3: MAIN SIGNAL CHART (COLUMNS AE TO AI) -->
+    <div class="chart-box">
+        <div class="chart-header">
+            <div style="display: flex; align-items: center; gap: 15px;">
+                <span class="chart-title">3 - 🚀 Main Signal</span>
+            </div>
+            <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+                <label style="color: #94a3b8; font-weight: bold;">Data Day Range:</label>
+                <select id="signalDayRangeSelector" onchange="loadSignalChart()">
+                    <option value="1week" selected>1 Week</option>
+                    <option value="2week">2 Week</option>
+                    <option value="1month">1 Month</option>
+                    <option value="3month">3 Month</option>
+                </select>
+
+                <label style="color: #94a3b8; font-weight: bold; margin-left: 6px;">Interval:</label>
+                <select id="signalTimeframeSelector" onchange="loadSignalChart()">
+                    <option value="5minute" selected>5 Min</option>
+                    <option value="15minute">15 Min</option>
+                    <option value="30minute">30 Min</option>
+                    <option value="60minute">1 Hour</option>
+                    <option value="day">1 Day</option>
+                </select>
+            </div>
+        </div>
+        <canvas id="signalChart" style="max-height: 420px;"></canvas>
+    </div>
+
     <script>
         let currentSymbol = "{{ symbol }}";
         let currentExpiry = "{{ expiry }}";
@@ -810,6 +860,7 @@ ANALYSIS_HTML_TEMPLATE = """
         let currentAtmStrike = {{ atm_strike }};
         let myChart = null;
         let historyChartObj = null;
+        let signalChartObj = null;
 
         function switchSymbol(newSym) {
             currentSymbol = newSym;
@@ -840,6 +891,130 @@ ANALYSIS_HTML_TEMPLATE = """
             return data.map((_, i) => Number((slope * i + intercept).toFixed(2)));
         }
 
+        // Custom Plugin to draw 'B' / 'S' Signal Labels above Main Volatility line points
+        const signalLabelPlugin = {
+            id: 'signalLabelPlugin',
+            afterDatasetsDraw: (chart) => {
+                const { ctx } = chart;
+                chart.data.datasets.forEach((dataset, datasetIndex) => {
+                    if (dataset.label === 'Main Volatility') {
+                        const meta = chart.getDatasetMeta(datasetIndex);
+                        const signals = dataset.signalLabels || [];
+                        meta.data.forEach((element, index) => {
+                            const sig = signals[index];
+                            if (sig && (sig.toUpperCase() === 'B' || sig.toUpperCase() === 'S')) {
+                                const { x, y } = element.tooltipPosition();
+                                ctx.save();
+                                const isBuy = sig.toUpperCase() === 'B';
+                                ctx.fillStyle = isBuy ? '#22c55e' : '#ef4444';
+                                ctx.font = 'bold 12px Segoe UI';
+                                ctx.textAlign = 'center';
+                                ctx.textBaseline = 'bottom';
+                                ctx.fillText(sig.toUpperCase(), x, y - 6);
+                                ctx.restore();
+                            }
+                        });
+                    }
+                });
+            }
+        };
+
+        function initSignalChart() {
+            const ctx = document.getElementById('signalChart').getContext('2d');
+            signalChartObj = new Chart(ctx, {
+                type: 'line',
+                data: { labels: [], datasets: [] },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } },
+                        y: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } }
+                    },
+                    plugins: {
+                        legend: { labels: { color: '#f8fafc', font: { size: 13 } } },
+                        tooltip: { mode: 'index', intersect: false }
+                    }
+                },
+                plugins: [signalLabelPlugin]
+            });
+            loadSignalChart();
+        }
+
+        function loadSignalChart() {
+            const dayRange = document.getElementById('signalDayRangeSelector').value;
+            const timeframe = document.getElementById('signalTimeframeSelector').value;
+
+            fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&day_range=${dayRange}`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.error) {
+                        signalChartObj.data.labels = [data.error];
+                        signalChartObj.data.datasets = [{ label: 'Status / Error', data: [0], borderColor: '#ef4444' }];
+                        signalChartObj.update();
+                        return;
+                    }
+
+                    const snapshots = data.history || [];
+                    const times = snapshots.map(s => s.formatted_time || s.datetime);
+
+                    if (snapshots.length === 0) {
+                        signalChartObj.data.labels = ["No data found for Main Signal."];
+                        signalChartObj.data.datasets = [{ label: 'Status', data: [0], borderColor: '#94a3b8' }];
+                        signalChartObj.update();
+                        return;
+                    }
+
+                    const minRocVals = snapshots.map(s => s.min_roc || 0);
+                    const maxRocVals = snapshots.map(s => s.max_roc || 0);
+                    const crossRocVals = snapshots.map(s => s.cross_roc || 0);
+                    const mainVolVals = snapshots.map(s => s.main_volatility || 0);
+                    const newSignals = snapshots.map(s => s.new_signal || "");
+
+                    signalChartObj.data.labels = times;
+                    signalChartObj.data.datasets = [
+                        {
+                            label: 'Min ROC (Buy)',
+                            data: minRocVals,
+                            borderColor: '#4ade80', // Light Green
+                            backgroundColor: 'rgba(74, 222, 128, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.2
+                        },
+                        {
+                            label: 'Max ROC (Sell)',
+                            data: maxRocVals,
+                            borderColor: '#ef4444', // Red
+                            backgroundColor: 'rgba(239, 68, 68, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.2
+                        },
+                        {
+                            label: 'Cross ROC Sig',
+                            data: crossRocVals,
+                            borderColor: '#facc15', // Yellow
+                            backgroundColor: 'rgba(250, 204, 21, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.2
+                        },
+                        {
+                            label: 'Main Volatility',
+                            data: mainVolVals,
+                            signalLabels: newSignals,
+                            borderColor: '#38bdf8', // Sky Blue
+                            backgroundColor: 'rgba(56, 189, 248, 0.1)',
+                            borderWidth: 3,
+                            pointRadius: 4,
+                            pointHoverRadius: 6,
+                            tension: 0.2
+                        }
+                    ];
+
+                    signalChartObj.update();
+                })
+                .catch(err => console.error("Signal chart error:", err));
+        }
+
         function initHistoryChart() {
             const ctx = document.getElementById('historyChart').getContext('2d');
             historyChartObj = new Chart(ctx, {
@@ -864,18 +1039,15 @@ ANALYSIS_HTML_TEMPLATE = """
 
         function loadHistoricalChart() {
             const metric = document.getElementById('historyMetricSelector').value;
+            const dayRange = document.getElementById('historyDayRangeSelector').value;
             const timeframe = document.getElementById('historyTimeframeSelector').value;
 
-            fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&metric=${metric}`)
+            fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&metric=${metric}&day_range=${dayRange}`)
                 .then(res => res.json())
                 .then(data => {
                     if (data.error) {
                         historyChartObj.data.labels = [data.error];
-                        historyChartObj.data.datasets = [{
-                            label: 'Status / Error',
-                            data: [0],
-                            borderColor: '#ef4444'
-                        }];
+                        historyChartObj.data.datasets = [{ label: 'Status / Error', data: [0], borderColor: '#ef4444' }];
                         historyChartObj.update();
                         return;
                     }
@@ -887,11 +1059,7 @@ ANALYSIS_HTML_TEMPLATE = """
 
                     if (snapshots.length === 0) {
                         historyChartObj.data.labels = ["No data found in Google Sheet."];
-                        historyChartObj.data.datasets = [{
-                            label: 'Status',
-                            data: [0],
-                            borderColor: '#94a3b8'
-                        }];
+                        historyChartObj.data.datasets = [{ label: 'Status', data: [0], borderColor: '#94a3b8' }];
                         historyChartObj.update();
                         return;
                     }
@@ -1218,6 +1386,7 @@ ANALYSIS_HTML_TEMPLATE = """
                 .then(data => {
                     renderPageData(data);
                     loadHistoricalChart();
+                    loadSignalChart();
                 })
                 .catch(err => {
                     console.error("Auto Sync Error:", err);
@@ -1230,6 +1399,8 @@ ANALYSIS_HTML_TEMPLATE = """
 
         try { initChart(); } catch(e) { console.error("Bar Chart Init Error:", e); }
         try { initHistoryChart(); } catch(e) { console.error("History Chart Init Error:", e); }
+        try { initSignalChart(); } catch(e) { console.error("Signal Chart Init Error:", e); }
+
         renderPageData({
             rows: rawRows,
             spot_price: {{ spot_price }},
@@ -1480,11 +1651,28 @@ def live_trade_position():
 def api_history():
     symbol = request.args.get("symbol", "NIFTY").upper()
     timeframe = request.args.get("timeframe", "5minute")
+    day_range = request.args.get("day_range", "1week").lower()
 
     snapshots, err = fetch_history_from_gsheet(symbol)
 
     if err:
         return jsonify({"history": [], "count": 0, "error": err})
+
+    if not snapshots:
+        return jsonify({"history": [], "count": 0})
+
+    # Data Day Range Filter
+    day_map = {
+        "1week": 7 * 86400,
+        "2week": 14 * 86400,
+        "1month": 30 * 86400,
+        "3month": 90 * 86400
+    }
+    max_ts = max((s["timestamp"] for s in snapshots if s["timestamp"] > 0), default=0)
+
+    if max_ts > 0 and day_range in day_map:
+        cutoff = max_ts - day_map[day_range]
+        snapshots = [s for s in snapshots if s["timestamp"] >= cutoff or s["timestamp"] == 0]
 
     if timeframe == "5minute" or not snapshots:
         return jsonify({"history": snapshots, "count": len(snapshots)})
@@ -1609,7 +1797,8 @@ def download_history_csv():
         "CE OI", "PE OI", "CE Chg in OI", "PE Chg in OI", "CE Vol", "PE Vol",
         "CE IV", "PE IV", "CE Delta", "PE Delta",
         "CE Theta", "PE Theta", "CE Vega", "PE Vega",
-        "CE Gamma", "PE Gamma", "CE Ask", "PE Bid"
+        "CE Gamma", "PE Gamma", "CE Ask", "PE Bid",
+        "Min ROC (Buy)", "Max ROC (Sell)", "Cross ROC Sig", "Main Volatility", "New Signal"
     ])
 
     for s in snapshots:
@@ -1620,7 +1809,8 @@ def download_history_csv():
             s.get("ce_vol"), s.get("pe_vol"),
             s.get("ce_iv"), s.get("pe_iv"), s.get("ce_delta"), s.get("pe_delta"),
             s.get("ce_theta"), s.get("pe_theta"), s.get("ce_vega"), s.get("pe_vega"),
-            s.get("ce_gamma"), s.get("pe_gamma"), s.get("ce_ask"), s.get("pe_bid")
+            s.get("ce_gamma"), s.get("pe_gamma"), s.get("ce_ask"), s.get("pe_bid"),
+            s.get("min_roc"), s.get("max_roc"), s.get("cross_roc"), s.get("main_volatility"), s.get("new_signal")
         ])
 
     output = Response(si.getvalue(), mimetype="text/csv")
