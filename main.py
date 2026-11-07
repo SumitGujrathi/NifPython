@@ -276,7 +276,6 @@ def fetch_history_from_gsheet(symbol="NIFTY"):
                 "pe_ask": safe_num("PE Ask"),
                 "ce_ltp": safe_num("CE LTP"),
                 "pe_ltp": safe_num("PE LTP"),
-                # Main Signal Columns (AE:AI)
                 "min_roc": safe_num("Min ROC (Buy)", ["min_roc", "min roc"]),
                 "max_roc": safe_num("Max ROC (Sell)", ["max_roc", "max roc"]),
                 "cross_roc": safe_num("Cross ROC Sig", ["cross_roc_sig", "cross roc"]),
@@ -927,15 +926,12 @@ ANALYSIS_HTML_TEMPLATE = """
 
                 ctx.save();
                 if (zeroY >= top && zeroY <= bottom) {
-                    // Light green background above 0 line (> 0)
                     ctx.fillStyle = 'rgba(34, 197, 94, 0.08)';
                     ctx.fillRect(left, top, right - left, zeroY - top);
 
-                    // Light red background below 0 line (< 0)
                     ctx.fillStyle = 'rgba(239, 68, 68, 0.08)';
                     ctx.fillRect(left, zeroY, right - left, bottom - zeroY);
 
-                    // Bold yellow 0 line
                     ctx.beginPath();
                     ctx.moveTo(left, zeroY);
                     ctx.lineTo(right, zeroY);
@@ -1103,7 +1099,6 @@ ANALYSIS_HTML_TEMPLATE = """
                         historyChartObj.options.scales.y1.display = true;
                         const spotVals = snapshots.map(s => s.spot_price);
                         const pcrVals = snapshots.map(s => s.pcr);
-                        const avgVals = spotVals.map((v, i) => (v + (pcrVals[i] || 0)) / 2);
 
                         // PCR on LEFT axis (y)
                         datasets.push({
@@ -1127,18 +1122,6 @@ ANALYSIS_HTML_TEMPLATE = """
                             tension: 0.2,
                             yAxisID: 'y1',
                             fill: true
-                        });
-
-                        // Average Line in Sky Blue (#38bdf8)
-                        datasets.push({
-                            label: 'Average (Price & PCR)',
-                            data: avgVals,
-                            borderColor: '#38bdf8',
-                            backgroundColor: 'rgba(56, 189, 248, 0.1)',
-                            borderWidth: 2,
-                            tension: 0.2,
-                            yAxisID: 'y1',
-                            fill: false
                         });
 
                         // Price Trend on RIGHT axis (y1)
@@ -1195,12 +1178,12 @@ ANALYSIS_HTML_TEMPLATE = """
                             yAxisID: 'y'
                         });
 
-                        // Sky Blue Average Line
+                        // Yellow Average Line (#facc15)
                         datasets.push({
                             label: `Average (${cfg.r1} & ${cfg.r2})`,
                             data: avgVals,
-                            borderColor: '#38bdf8', // Sky Blue
-                            backgroundColor: 'rgba(56, 189, 248, 0.1)',
+                            borderColor: '#facc15', // Yellow Line Color
+                            backgroundColor: 'rgba(250, 204, 21, 0.1)',
                             borderWidth: 2,
                             tension: 0.2,
                             yAxisID: 'y',
