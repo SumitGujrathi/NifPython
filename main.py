@@ -306,7 +306,6 @@ def fetch_upstox_positions():
     }
 
     try:
-        # Fetch Positions
         pos_url = "https://api.upstox.com/v2/portfolio/short-term-positions"
         pos_res = requests.get(pos_url, headers=headers, timeout=10)
 
@@ -320,7 +319,6 @@ def fetch_upstox_positions():
 
         positions_raw = pos_res.json().get("data", []) if pos_res.status_code == 200 else []
 
-        # Fetch Order History
         ord_url = "https://api.upstox.com/v2/order/retrieve-all"
         ord_res = requests.get(ord_url, headers=headers, timeout=10)
         orders_raw = ord_res.json().get("data", []) if ord_res.status_code == 200 else []
@@ -769,7 +767,7 @@ ANALYSIS_HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- CHART 1: ORDER BOOK DEPTH QUANTITY & STRIKE BAR CHART -->
+    <!-- CHART 1: STRIKE BAR CHART -->
     <div class="chart-box">
         <div class="chart-header">
             <div class="chart-title" id="chartHeaderTitle">Change in Open Interest (Chg in OI)</div>
@@ -890,18 +888,7 @@ ANALYSIS_HTML_TEMPLATE = """
             return data.map((_, i) => Number((slope * i + intercept).toFixed(2)));
         }
 
-        function calcAverage(arr) {
-            if (!arr || arr.length === 0) return 0;
-            const sum = arr.reduce((a, b) => a + (parseFloat(b) || 0), 0);
-            return sum / arr.length;
-        }
-
-        function fmtNum(val) {
-            if (val === undefined || val === null || isNaN(val)) return "0";
-            return Number(val).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-        }
-
-        // Custom Plugin: Draw 'B' / 'S' Signal Labels above Main Volatility line points
+        // Custom Plugin 1: Draw White 'B' / 'S' Signal Labels above Main Volatility line points
         const signalLabelPlugin = {
             id: 'signalLabelPlugin',
             afterDatasetsDraw: (chart) => {
@@ -915,9 +902,8 @@ ANALYSIS_HTML_TEMPLATE = """
                             if (sig && (sig.toUpperCase() === 'B' || sig.toUpperCase() === 'S')) {
                                 const { x, y } = element.tooltipPosition();
                                 ctx.save();
-                                const isBuy = sig.toUpperCase() === 'B';
-                                ctx.fillStyle = isBuy ? '#22c55e' : '#ef4444';
-                                ctx.font = 'bold 12px Segoe UI';
+                                ctx.fillStyle = '#ffffff'; // White label text
+                                ctx.font = 'bold 13px Segoe UI';
                                 ctx.textAlign = 'center';
                                 ctx.textBaseline = 'bottom';
                                 ctx.fillText(sig.toUpperCase(), x, y - 6);
@@ -929,34 +915,41 @@ ANALYSIS_HTML_TEMPLATE = """
             }
         };
 
-        // Custom Plugin: Fills light green area above 0 and light red area below 0 on Chart 3
-        const zeroLineBackgroundPlugin = {
-            id: 'zeroLineBackgroundPlugin',
+        // Custom Plugin 2: Background shading for >0 (Light Green) & <0 (Light Red) and Bold Yellow 0 Line
+        const zeroLinePlugin = {
+            id: 'zeroLinePlugin',
             beforeDraw: (chart) => {
                 const { ctx, chartArea, scales } = chart;
-                if (!chartArea || !scales || !scales.y) return;
-
+                if (!scales || !scales.y || !chartArea) return;
                 const { top, bottom, left, right } = chartArea;
-                const yScale = scales.y;
+                const y = scales.y;
+                const zeroY = y.getPixelForValue(0);
 
                 ctx.save();
-                let yZero = yScale.getPixelForValue(0);
-
-                if (yZero < top) yZero = top;
-                if (yZero > bottom) yZero = bottom;
-
-                // Green area above 0 (top of chart down to yZero)
-                if (yZero > top) {
+                if (zeroY >= top && zeroY <= bottom) {
+                    // Light green background above 0 line (> 0)
                     ctx.fillStyle = 'rgba(34, 197, 94, 0.08)';
-                    ctx.fillRect(left, top, right - left, yZero - top);
-                }
+                    ctx.fillRect(left, top, right - left, zeroY - top);
 
-                // Red area below 0 (yZero down to bottom of chart)
-                if (yZero < bottom) {
+                    // Light red background below 0 line (< 0)
                     ctx.fillStyle = 'rgba(239, 68, 68, 0.08)';
-                    ctx.fillRect(left, yZero, right - left, bottom - yZero);
-                }
+                    ctx.fillRect(left, zeroY, right - left, bottom - zeroY);
 
+                    // Bold yellow 0 line
+                    ctx.beginPath();
+                    ctx.moveTo(left, zeroY);
+                    ctx.lineTo(right, zeroY);
+                    ctx.lineWidth = 3;
+                    ctx.strokeStyle = '#facc15';
+                    ctx.setLineDash([]);
+                    ctx.stroke();
+                } else if (zeroY > bottom) {
+                    ctx.fillStyle = 'rgba(34, 197, 94, 0.08)';
+                    ctx.fillRect(left, top, right - left, bottom - top);
+                } else if (zeroY < top) {
+                    ctx.fillStyle = 'rgba(239, 68, 68, 0.08)';
+                    ctx.fillRect(left, top, right - left, bottom - top);
+                }
                 ctx.restore();
             }
         };
@@ -978,7 +971,7 @@ ANALYSIS_HTML_TEMPLATE = """
                         tooltip: { mode: 'index', intersect: false }
                     }
                 },
-                plugins: [zeroLineBackgroundPlugin, signalLabelPlugin]
+                plugins: [zeroLinePlugin, signalLabelPlugin]
             });
             loadSignalChart();
         }
@@ -1106,40 +1099,49 @@ ANALYSIS_HTML_TEMPLATE = """
                         return;
                     }
 
-                    // SWAPPED VERTICAL AXES: PCR on Left (y), Price LTP on Right (y1)
                     if (metric === "price_pcr") {
-                        historyChartObj.options.scales.y.position = 'left';
                         historyChartObj.options.scales.y1.display = true;
-                        historyChartObj.options.scales.y1.position = 'right';
-
                         const spotVals = snapshots.map(s => s.spot_price);
                         const pcrVals = snapshots.map(s => s.pcr);
+                        const avgVals = spotVals.map((v, i) => (v + (pcrVals[i] || 0)) / 2);
 
-                        const avgSpot = calcAverage(spotVals);
-                        const avgPcr = calcAverage(pcrVals);
-
+                        // PCR on LEFT axis (y)
                         datasets.push({
-                            label: `Relation 1: Price LTP (Avg: ${fmtNum(avgSpot)})`,
+                            label: 'Relation 2: PCR',
+                            data: pcrVals,
+                            borderColor: '#06b6d4',
+                            backgroundColor: 'rgba(6, 182, 212, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.2,
+                            yAxisID: 'y',
+                            fill: false
+                        });
+
+                        // Price LTP on RIGHT axis (y1)
+                        datasets.push({
+                            label: 'Relation 1: Price LTP',
                             data: spotVals,
                             borderColor: '#facc15',
                             backgroundColor: 'rgba(250, 204, 21, 0.1)',
                             borderWidth: 2,
                             tension: 0.2,
-                            yAxisID: 'y1', // Right Side Axis
+                            yAxisID: 'y1',
                             fill: true
                         });
 
+                        // Average Line in Sky Blue (#38bdf8)
                         datasets.push({
-                            label: `Relation 2: PCR (Avg: ${avgPcr.toFixed(2)})`,
-                            data: pcrVals,
+                            label: 'Average (Price & PCR)',
+                            data: avgVals,
                             borderColor: '#38bdf8',
                             backgroundColor: 'rgba(56, 189, 248, 0.1)',
                             borderWidth: 2,
                             tension: 0.2,
-                            yAxisID: 'y', // Left Side Axis
+                            yAxisID: 'y1',
                             fill: false
                         });
 
+                        // Price Trend on RIGHT axis (y1)
                         datasets.push({
                             label: 'Price Trend',
                             data: computeLinearTrend(spotVals),
@@ -1171,12 +1173,10 @@ ANALYSIS_HTML_TEMPLATE = """
                         const cfg = metricMap[metric] || metricMap["oi"];
                         const ceVals = snapshots.map(s => s[cfg.key1] || 0);
                         const peVals = snapshots.map(s => s[cfg.key2] || 0);
-
-                        const avg1 = calcAverage(ceVals);
-                        const avg2 = calcAverage(peVals);
+                        const avgVals = ceVals.map((v, i) => (v + (peVals[i] || 0)) / 2);
 
                         datasets.push({
-                            label: `Relation 1: ${cfg.r1} (Avg: ${fmtNum(avg1)})`,
+                            label: `Relation 1: ${cfg.r1}`,
                             data: ceVals,
                             borderColor: '#ef4444',
                             backgroundColor: 'rgba(239, 68, 68, 0.1)',
@@ -1186,13 +1186,25 @@ ANALYSIS_HTML_TEMPLATE = """
                         });
 
                         datasets.push({
-                            label: `Relation 2: ${cfg.r2} (Avg: ${fmtNum(avg2)})`,
+                            label: `Relation 2: ${cfg.r2}`,
                             data: peVals,
                             borderColor: '#22c55e',
                             backgroundColor: 'rgba(34, 197, 94, 0.1)',
                             borderWidth: 2,
                             tension: 0.2,
                             yAxisID: 'y'
+                        });
+
+                        // Sky Blue Average Line
+                        datasets.push({
+                            label: `Average (${cfg.r1} & ${cfg.r2})`,
+                            data: avgVals,
+                            borderColor: '#38bdf8', // Sky Blue
+                            backgroundColor: 'rgba(56, 189, 248, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.2,
+                            yAxisID: 'y',
+                            fill: false
                         });
 
                         datasets.push({
@@ -1603,7 +1615,6 @@ POSITIONS_HTML_TEMPLATE = """
                     updateCardPnl("valUnrealisedPnl", "cardUnrealisedPnlBox", data.unrealised_pnl);
                     updateCardPnl("valRealisedPnl", "cardRealisedPnlBox", data.realised_pnl);
 
-                    // Update Positions Table
                     const posBody = document.getElementById("positionsBody");
                     if (data.positions && data.positions.length > 0) {
                         let html = "";
@@ -1629,7 +1640,6 @@ POSITIONS_HTML_TEMPLATE = """
                         posBody.innerHTML = `<tr><td colspan="8" style="color: #94a3b8;">No open or closed positions found for today.</td></tr>`;
                     }
 
-                    // Update Orders Table
                     const ordBody = document.getElementById("ordersBody");
                     if (data.orders && data.orders.length > 0) {
                         let html = "";
