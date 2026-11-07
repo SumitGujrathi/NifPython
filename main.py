@@ -3,6 +3,7 @@ import time
 import io
 import csv
 import json
+import re
 import threading
 import urllib.parse
 from datetime import datetime, timezone, timedelta
@@ -128,7 +129,12 @@ def parse_timestamp(dt_str):
     if not dt_str:
         return 0
     dt_str = str(dt_str).strip()
-    for fmt in ("%m/%d/%Y %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M", "%d/%m/%Y %H:%M"):
+    date_formats = (
+        "%m/%d/%Y %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", 
+        "%m/%d/%Y %H:%M", "%d/%m/%Y %H:%M",
+        "%m/%d/%y %H:%M:%S", "%d/%m/%y %H:%M:%S", "%m/%d/%y %H:%M", "%d/%m/%y %H:%M"
+    )
+    for fmt in date_formats:
         try:
             dt = datetime.strptime(dt_str, fmt)
             return int(dt.timestamp())
@@ -173,7 +179,7 @@ def fetch_history_from_gsheet(symbol="NIFTY"):
                 if text.startswith("<!DOCTYPE") or "<html" in text.lower() or "google-site-verification" in text:
                     last_err = "Google Sheet is private. Set Sharing permissions to 'Anyone with the link can view'."
                     continue
-                if len(text) > 30 and ("Time" in text or "LTP" in text or "PCR" in text or "Symbol" in text):
+                if len(text) > 30 and ("time" in text.lower() or "ltp" in text.lower() or "pcr" in text.lower() or "symbol" in text.lower()):
                     raw_csv = text
                     break
             else:
@@ -188,7 +194,9 @@ def fetch_history_from_gsheet(symbol="NIFTY"):
 
     snapshots = []
     try:
-        lines = [line for line in raw_csv.splitlines() if line.strip()]
+        # Strip Byte Order Mark (\ufeff) from header line and raw csv
+        clean_csv = raw_csv.lstrip('\ufeff')
+        lines = [line.strip().lstrip('\ufeff') for line in clean_csv.splitlines() if line.strip()]
         header_idx = 0
         for i, l in enumerate(lines[:10]):
             l_lower = l.lower()
@@ -202,7 +210,8 @@ def fetch_history_from_gsheet(symbol="NIFTY"):
         for row in reader:
             if not row:
                 continue
-            norm_r = {str(k).strip().lower(): str(v).strip() for k, v in row.items() if k is not None}
+            # Regex cleaning to remove leading non-alphanumeric chars (like hidden BOM \ufeff)
+            norm_r = {re.sub(r'^[^\w]+', '', str(k)).strip().lower(): str(v).strip() for k, v in row.items() if k is not None}
 
             def get_val(possible_keys, default=0.0):
                 for pk in possible_keys:
@@ -1236,11 +1245,12 @@ POSITIONS_HTML_TEMPLATE = """
 <html>
 <head>
     <title>Upstox Private Live Trade & Positions Dashboard</title>
-    <meta http-equiv="refresh" content="10">
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #0b1329; color: #f8fafc; }
         h2 { color: #38bdf8; margin-bottom: 5px; }
-        .subtitle { color: #94a3b8; font-size: 13px; margin-bottom: 20px; }
+        .subtitle { color: #94a3b8; font-size: 13px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }
+        .timer-badge { background: #0284c7; color: #ffffff; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
+        
         .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 18px; margin-bottom: 25px; }
         .card { background: #1e293b; padding: 18px; border-radius: 10px; border-left: 5px solid #3b82f6; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
         .card-title { font-size: 12px; color: #94a3b8; text-transform: uppercase; font-weight: bold; margin-bottom: 6px; }
@@ -1264,24 +1274,25 @@ POSITIONS_HTML_TEMPLATE = """
 </head>
 <body>
     <h2>🔐 Private Live Trade & Positions Dashboard</h2>
-    <div class="subtitle">Real-time Upstox Portfolio & Executed Order Log — Unlisted Endpoint</div>
+    <div class="subtitle">
+        <span>Real-time Upstox Portfolio & Executed Order Log — Background Auto-Sync</span>
+        <span class="timer-badge" id="syncBadge">Auto Sync: <span id="countdown">10</span>s</span>
+    </div>
 
-    {% if error %}
-        <div class="error-msg">Error Fetching Positions: {{ error }}</div>
-    {% endif %}
+    <div id="errorContainer" class="error-msg" style="display: none;"></div>
 
     <div class="metrics-grid">
-        <div class="card {% if total_pnl >= 0 %}pnl-green{% else %}pnl-red{% endif %}">
+        <div class="card" id="cardTotalPnlBox">
             <div class="card-title">Total Overall P&L</div>
-            <div class="card-value">₹ {{ "{:,.2f}".format(total_pnl) }}</div>
+            <div class="card-value" id="valTotalPnl">₹ 0.00</div>
         </div>
-        <div class="card {% if unrealised_pnl >= 0 %}pnl-green{% else %}pnl-red{% endif %}">
+        <div class="card" id="cardUnrealisedPnlBox">
             <div class="card-title">Unrealised P&L (Live Positions)</div>
-            <div class="card-value">₹ {{ "{:,.2f}".format(unrealised_pnl) }}</div>
+            <div class="card-value" id="valUnrealisedPnl">₹ 0.00</div>
         </div>
-        <div class="card {% if realised_pnl >= 0 %}pnl-green{% else %}pnl-red{% endif %}">
+        <div class="card" id="cardRealisedPnlBox">
             <div class="card-title">Realised P&L (Booked Today)</div>
-            <div class="card-value">₹ {{ "{:,.2f}".format(realised_pnl) }}</div>
+            <div class="card-value" id="valRealisedPnl">₹ 0.00</div>
         </div>
     </div>
 
@@ -1300,31 +1311,8 @@ POSITIONS_HTML_TEMPLATE = """
                     <th>P&L (₹)</th>
                 </tr>
             </thead>
-            <tbody>
-                {% if positions %}
-                    {% for p in positions %}
-                    <tr>
-                        <td>
-                            {% if p.status == 'OPEN' %}
-                                <span class="status-open">OPEN</span>
-                            {% else %}
-                                <span class="status-closed">CLOSED</span>
-                            {% endif %}
-                        </td>
-                        <td><strong>{{ p.trading_symbol }}</strong></td>
-                        <td>{{ p.product }}</td>
-                        <td><strong>{{ p.quantity }}</strong></td>
-                        <td>₹ {{ p.buy_price }}</td>
-                        <td>₹ {{ p.sell_price }}</td>
-                        <td>₹ {{ p.ltp }}</td>
-                        <td style="font-weight: bold; color: {% if p.pnl >= 0 %}#22c55e{% else %}#ef4444{% endif %};">
-                            ₹ {{ "{:,.2f}".format(p.pnl) }}
-                        </td>
-                    </tr>
-                    {% endfor %}
-                {% else %}
-                    <tr><td colspan="8" style="color: #94a3b8;">No open or closed positions found for today.</td></tr>
-                {% endif %}
+            <tbody id="positionsBody">
+                <tr><td colspan="8" style="color: #94a3b8;">Loading positions...</td></tr>
             </tbody>
         </table>
     </div>
@@ -1343,27 +1331,118 @@ POSITIONS_HTML_TEMPLATE = """
                     <th>Order ID</th>
                 </tr>
             </thead>
-            <tbody>
-                {% if orders %}
-                    {% for o in orders %}
-                    <tr>
-                        <td style="font-size: 12px; color: #94a3b8;">{{ o.order_timestamp }}</td>
-                        <td><strong>{{ o.trading_symbol }}</strong></td>
-                        <td style="font-weight: bold; color: {% if o.transaction_type == 'BUY' %}#38bdf8{% else %}#f43f5e{% endif %};">
-                            {{ o.transaction_type }}
-                        </td>
-                        <td>{{ o.quantity }}</td>
-                        <td>₹ {{ o.average_price or o.price }}</td>
-                        <td><strong>{{ o.status }}</strong></td>
-                        <td style="font-size: 11px; color: #64748b;">{{ o.order_id }}</td>
-                    </tr>
-                    {% endfor %}
-                {% else %}
-                    <tr><td colspan="7" style="color: #94a3b8;">No trades executed today.</td></tr>
-                {% endif %}
+            <tbody id="ordersBody">
+                <tr><td colspan="7" style="color: #94a3b8;">Loading order log...</td></tr>
             </tbody>
         </table>
     </div>
+
+    <script>
+        let timerSeconds = 10;
+        let isSyncing = false;
+
+        function updateCardPnl(elementId, cardId, value) {
+            const el = document.getElementById(elementId);
+            const card = document.getElementById(cardId);
+            const num = parseFloat(value) || 0;
+            const formatted = num.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            
+            el.innerText = `₹ ${formatted}`;
+            if (num >= 0) {
+                card.className = "card pnl-green";
+            } else {
+                card.className = "card pnl-red";
+            }
+        }
+
+        function fetchPositionsInBackground() {
+            isSyncing = true;
+            document.getElementById("syncBadge").innerText = "Syncing...";
+
+            fetch('/api/positions')
+                .then(res => res.json())
+                .then(data => {
+                    const errEl = document.getElementById("errorContainer");
+                    if (data.error) {
+                        errEl.style.display = "block";
+                        errEl.innerText = "Error Fetching Positions: " + data.error;
+                    } else {
+                        errEl.style.display = "none";
+                    }
+
+                    updateCardPnl("valTotalPnl", "cardTotalPnlBox", data.total_pnl);
+                    updateCardPnl("valUnrealisedPnl", "cardUnrealisedPnlBox", data.unrealised_pnl);
+                    updateCardPnl("valRealisedPnl", "cardRealisedPnlBox", data.realised_pnl);
+
+                    // Update Positions Table
+                    const posBody = document.getElementById("positionsBody");
+                    if (data.positions && data.positions.length > 0) {
+                        let html = "";
+                        data.positions.forEach(p => {
+                            const pnlNum = parseFloat(p.pnl) || 0;
+                            const pnlColor = pnlNum >= 0 ? '#22c55e' : '#ef4444';
+                            const badge = p.status === 'OPEN' ? '<span class="status-open">OPEN</span>' : '<span class="status-closed">CLOSED</span>';
+                            const formattedPnl = pnlNum.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+                            html += `<tr>
+                                <td>${badge}</td>
+                                <td><strong>${p.trading_symbol}</strong></td>
+                                <td>${p.product}</td>
+                                <td><strong>${p.quantity}</strong></td>
+                                <td>₹ ${p.buy_price}</td>
+                                <td>₹ ${p.sell_price}</td>
+                                <td>₹ ${p.ltp}</td>
+                                <td style="font-weight: bold; color: ${pnlColor};">₹ ${formattedPnl}</td>
+                            </tr>`;
+                        });
+                        posBody.innerHTML = html;
+                    } else {
+                        posBody.innerHTML = `<tr><td colspan="8" style="color: #94a3b8;">No open or closed positions found for today.</td></tr>`;
+                    }
+
+                    // Update Orders Table
+                    const ordBody = document.getElementById("ordersBody");
+                    if (data.orders && data.orders.length > 0) {
+                        let html = "";
+                        data.orders.forEach(o => {
+                            const typeColor = o.transaction_type === 'BUY' ? '#38bdf8' : '#f43f5e';
+                            html += `<tr>
+                                <td style="font-size: 12px; color: #94a3b8;">${o.order_timestamp}</td>
+                                <td><strong>${o.trading_symbol}</strong></td>
+                                <td style="font-weight: bold; color: ${typeColor};">${o.transaction_type}</td>
+                                <td>${o.quantity}</td>
+                                <td>₹ ${o.average_price || o.price}</td>
+                                <td><strong>${o.status}</strong></td>
+                                <td style="font-size: 11px; color: #64748b;">${o.order_id}</td>
+                            </tr>`;
+                        });
+                        ordBody.innerHTML = html;
+                    } else {
+                        ordBody.innerHTML = `<tr><td colspan="7" style="color: #94a3b8;">No trades executed today.</td></tr>`;
+                    }
+                })
+                .catch(err => console.error("Position sync error:", err))
+                .finally(() => {
+                    isSyncing = false;
+                    document.getElementById("syncBadge").innerHTML = 'Auto Sync: <span id="countdown">' + timerSeconds + '</span>s';
+                });
+        }
+
+        function startTimer() {
+            setInterval(() => {
+                if (isSyncing) return;
+                timerSeconds--;
+                if (timerSeconds <= 0) {
+                    timerSeconds = 10;
+                    fetchPositionsInBackground();
+                }
+                document.getElementById("countdown").innerText = timerSeconds;
+            }, 1000);
+        }
+
+        fetchPositionsInBackground();
+        startTimer();
+    </script>
 </body>
 </html>
 """
@@ -1373,19 +1452,23 @@ POSITIONS_HTML_TEMPLATE = """
 def health():
     return "OK", 200
 
+@app.route("/api/positions")
+def api_positions():
+    """Background API route fetching live Upstox positions and order log."""
+    positions, orders, total_pnl, realised_pnl, unrealised_pnl, error = fetch_upstox_positions()
+    return jsonify({
+        "positions": positions,
+        "orders": orders,
+        "total_pnl": total_pnl,
+        "realised_pnl": realised_pnl,
+        "unrealised_pnl": unrealised_pnl,
+        "error": error
+    })
+
 @app.route("/Live_Trade_Position", methods=["GET"])
 def live_trade_position():
     """Unlisted private route for real-time portfolio, trade logs & P&L."""
-    positions, orders, total_pnl, realised_pnl, unrealised_pnl, error = fetch_upstox_positions()
-    return render_template_string(
-        POSITIONS_HTML_TEMPLATE,
-        positions=positions,
-        orders=orders,
-        total_pnl=total_pnl,
-        realised_pnl=realised_pnl,
-        unrealised_pnl=unrealised_pnl,
-        error=error
-    )
+    return render_template_string(POSITIONS_HTML_TEMPLATE)
 
 @app.route("/api/history")
 def api_history():
