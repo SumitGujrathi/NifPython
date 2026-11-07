@@ -8,6 +8,7 @@ import threading
 import urllib.parse
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import pandas as pd
 import requests
 import pyotp
 from flask import Flask, render_template_string, request, Response, jsonify
@@ -124,7 +125,7 @@ def get_valid_token():
         return token
     return perform_single_auth()
 
-# --- GOOGLE SHEET HISTORICAL DATA LOADER ---
+# --- REBUILT GOOGLE SHEET HISTORICAL DATA LOADER ---
 def parse_timestamp(dt_str):
     if not dt_str:
         return 0
@@ -155,9 +156,8 @@ def format_time_str(time_raw):
     return time_str
 
 def fetch_history_from_gsheet(symbol="NIFTY"):
-    symbol_upper = symbol.upper()
     sheet_id = SPREADSHEET_ID or "1fpXdodshvwHcduwffOhEK54K-a7a4TmOZF2Q-EgVRzM"
-    candidate_sheets = ["NITY", "NIFTY", symbol_upper, "Sheet1", ""]
+    candidate_sheets = ["NIFTY", "NITY", symbol.upper(), "Sheet1", ""]
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -175,11 +175,11 @@ def fetch_history_from_gsheet(symbol="NIFTY"):
         try:
             res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 200:
-                text = res.text.strip()
-                if text.startswith("<!DOCTYPE") or "<html" in text.lower() or "google-site-verification" in text:
+                text = res.text.strip().lstrip('\ufeff')
+                if text.startswith("<!DOCTYPE") or "<html" in text.lower():
                     last_err = "Google Sheet is private. Set Sharing permissions to 'Anyone with the link can view'."
                     continue
-                if len(text) > 30 and ("time" in text.lower() or "ltp" in text.lower() or "pcr" in text.lower() or "symbol" in text.lower()):
+                if len(text) > 30:
                     raw_csv = text
                     break
             else:
@@ -192,103 +192,84 @@ def fetch_history_from_gsheet(symbol="NIFTY"):
         print(f"[GSheet Error] {err_msg}")
         return [], err_msg
 
-    snapshots = []
     try:
-        # Strip Byte Order Mark (\ufeff) from header line and raw csv
-        clean_csv = raw_csv.lstrip('\ufeff')
-        lines = [line.strip().lstrip('\ufeff') for line in clean_csv.splitlines() if line.strip()]
-        header_idx = 0
-        for i, l in enumerate(lines[:10]):
-            l_lower = l.lower()
-            if "time" in l_lower or "symbol" in l_lower or "pcr" in l_lower or "ltp" in l_lower:
-                header_idx = i
+        df = pd.read_csv(io.StringIO(raw_csv))
+        if df.empty:
+            return [], "Google Sheet CSV is empty."
+
+        # Clean column names by removing BOM bytes and extra whitespace
+        df.columns = [re.sub(r'^[^\w]+', '', str(c)).strip() for c in df.columns]
+
+        # Determine time column
+        time_col = None
+        for col in df.columns:
+            if col.lower() in ("time", "datetime", "timestamp"):
+                time_col = col
                 break
+        if not time_col and len(df.columns) > 0:
+            time_col = df.columns[0]
 
-        csv_data_stream = "\n".join(lines[header_idx:])
-        reader = csv.DictReader(io.StringIO(csv_data_stream))
-
-        for row in reader:
-            if not row:
+        snapshots = []
+        for idx, row in df.iterrows():
+            time_val = str(row.get(time_col, "")).strip()
+            if not time_val or time_val.lower() in ("nan", "none", "", "0.0"):
                 continue
-            # Regex cleaning to remove leading non-alphanumeric chars (like hidden BOM \ufeff)
-            norm_r = {re.sub(r'^[^\w]+', '', str(k)).strip().lower(): str(v).strip() for k, v in row.items() if k is not None}
 
-            def get_val(possible_keys, default=0.0):
-                for pk in possible_keys:
-                    pk_lower = pk.lower()
-                    if pk_lower in norm_r:
-                        val_str = norm_r[pk_lower].replace(",", "")
-                        try:
-                            return float(val_str)
-                        except (ValueError, TypeError):
-                            if val_str:
-                                return val_str
+            def safe_num(primary_name, alt_names=[], default=0.0):
+                for name in [primary_name] + alt_names:
+                    for c in df.columns:
+                        if c.lower() == name.lower() or c.lower().replace(" ", "") == name.lower().replace(" ", ""):
+                            val = row.get(c)
+                            try:
+                                return float(str(val).replace(",", "").strip())
+                            except (ValueError, TypeError):
+                                return default
                 return default
-
-            time_val = str(get_val(["time", "datetime", "timestamp"], ""))
-            if not time_val or time_val == "0.0":
-                continue
-
-            spot_val = get_val(["price ltp", "spot_price", "spot price", "ltp"], 0.0)
-            atm_val = get_val(["atm strike", "atm_strike", "strike"], 0.0)
-            pcr_val = get_val(["pcr"], 0.0)
-            ce_oi_val = get_val(["ce oi", "ce_oi"], 0.0)
-            pe_oi_val = get_val(["pe oi", "pe_oi"], 0.0)
-            ce_oi_chg_val = get_val(["ce chg in oi", "ce_oi_chg", "ce oi chg"], 0.0)
-            pe_oi_chg_val = get_val(["pe chg in oi", "pe_oi_chg", "pe oi chg"], 0.0)
-            ce_vol_val = get_val(["ce vol", "ce_vol"], 0.0)
-            pe_vol_val = get_val(["pe vol", "pe_vol"], 0.0)
-            ce_iv_val = get_val(["ce iv", "ce_iv"], 0.0)
-            pe_iv_val = get_val(["pe iv", "pe_iv"], 0.0)
-            ce_delta_val = get_val(["ce delta", "ce_delta"], 0.0)
-            pe_delta_val = get_val(["pe delta", "pe_delta"], 0.0)
-            ce_theta_val = get_val(["ce theta", "ce_theta"], 0.0)
-            pe_theta_val = get_val(["pe theta", "pe_theta"], 0.0)
-            ce_vega_val = get_val(["ce vega", "ce_vega"], 0.0)
-            pe_vega_val = get_val(["pe vega", "pe_vega"], 0.0)
-            ce_gamma_val = get_val(["ce gamma", "ce_gamma"], 0.0)
-            pe_gamma_val = get_val(["pe gamma", "pe_gamma"], 0.0)
-            ce_ask_val = get_val(["ce ask", "ce_ask_qty", "ce ask qty"], 0.0)
-            pe_bid_val = get_val(["pe bid", "pe_bid_qty", "pe bid qty"], 0.0)
-            sym_val = str(get_val(["symbol"], symbol_upper))
 
             snapshot = {
                 "timestamp": parse_timestamp(time_val),
                 "datetime": time_val,
                 "formatted_time": format_time_str(time_val),
-                "symbol": sym_val,
-                "spot_price": float(spot_val) if isinstance(spot_val, (int, float)) else 0.0,
-                "atm_strike": float(atm_val) if isinstance(atm_val, (int, float)) else 0.0,
-                "pcr": float(pcr_val) if isinstance(pcr_val, (int, float)) else 0.0,
-                "ce_oi": float(ce_oi_val) if isinstance(ce_oi_val, (int, float)) else 0.0,
-                "pe_oi": float(pe_oi_val) if isinstance(pe_oi_val, (int, float)) else 0.0,
-                "ce_oi_chg": float(ce_oi_chg_val) if isinstance(ce_oi_chg_val, (int, float)) else 0.0,
-                "pe_oi_chg": float(pe_oi_chg_val) if isinstance(pe_oi_chg_val, (int, float)) else 0.0,
-                "ce_vol": float(ce_vol_val) if isinstance(ce_vol_val, (int, float)) else 0.0,
-                "pe_vol": float(pe_vol_val) if isinstance(pe_vol_val, (int, float)) else 0.0,
-                "ce_iv": float(ce_iv_val) if isinstance(ce_iv_val, (int, float)) else 0.0,
-                "pe_iv": float(pe_iv_val) if isinstance(pe_iv_val, (int, float)) else 0.0,
-                "ce_delta": float(ce_delta_val) if isinstance(ce_delta_val, (int, float)) else 0.0,
-                "pe_delta": float(pe_delta_val) if isinstance(pe_delta_val, (int, float)) else 0.0,
-                "ce_theta": float(ce_theta_val) if isinstance(ce_theta_val, (int, float)) else 0.0,
-                "pe_theta": float(pe_theta_val) if isinstance(pe_theta_val, (int, float)) else 0.0,
-                "ce_vega": float(ce_vega_val) if isinstance(ce_vega_val, (int, float)) else 0.0,
-                "pe_vega": float(pe_vega_val) if isinstance(pe_vega_val, (int, float)) else 0.0,
-                "ce_gamma": float(ce_gamma_val) if isinstance(ce_gamma_val, (int, float)) else 0.0,
-                "pe_gamma": float(pe_gamma_val) if isinstance(pe_gamma_val, (int, float)) else 0.0,
-                "ce_ask_qty": float(ce_ask_val) if isinstance(ce_ask_val, (int, float)) else 0.0,
-                "pe_bid_qty": float(pe_bid_val) if isinstance(pe_bid_val, (int, float)) else 0.0,
+                "symbol": str(row.get("Symbol", symbol.upper())),
+                "spot_price": safe_num("Price LTP", ["Price LTP", "spot_price", "ltp"]),
+                "atm_strike": safe_num("ATM Strike", ["atm_strike"]),
+                "pcr": safe_num("PCR"),
+                "ce_oi": safe_num("CE OI"),
+                "pe_oi": safe_num("PE OI"),
+                "ce_oi_chg": safe_num("CE Chg in OI", ["CE Chng OI", "CE Chg OI"]),
+                "pe_oi_chg": safe_num("PE Chg in OI", ["PE Chng OI", "PE Chg OI"]),
+                "ce_vol": safe_num("CE Vol"),
+                "pe_vol": safe_num("PE Vol"),
+                "ce_iv": safe_num("CE IV"),
+                "pe_iv": safe_num("PE IV"),
+                "ce_delta": safe_num("CE Delta"),
+                "pe_delta": safe_num("PE Delta"),
+                "ce_theta": safe_num("CE Theta"),
+                "pe_theta": safe_num("PE Theta"),
+                "ce_vega": safe_num("CE Vega"),
+                "pe_vega": safe_num("PE Vega"),
+                "ce_gamma": safe_num("CE Gamma"),
+                "pe_gamma": safe_num("PE Gamma"),
+                "ce_bid": safe_num("CE Bid"),
+                "pe_bid": safe_num("PE Bid"),
+                "ce_ask": safe_num("CE Ask"),
+                "pe_ask": safe_num("PE Ask"),
+                "ce_ltp": safe_num("CE LTP"),
+                "pe_ltp": safe_num("PE LTP"),
+                "ce_ask_qty": safe_num("CE Ask", ["CE Ask Qty"]),
+                "pe_bid_qty": safe_num("PE Bid", ["PE Bid Qty"])
             }
             snapshots.append(snapshot)
+
+        if not snapshots:
+            return [], "Google Sheet connected but no valid data rows were found matching expected columns."
+
+        # Reverse snapshots list so that newest entries at top of sheet plot on the far right of the timeline
+        return snapshots[::-1], None
+
     except Exception as e:
         print(f"[GSheet Parsing Exception]: {e}")
         return [], f"Parsing error reading Google Sheet CSV: {e}"
-
-    if not snapshots:
-        return [], "Google Sheet connected but no valid data rows were found matching expected columns."
-
-    # Reverse snapshot list so line chart progresses chronologically (oldest on left -> newest on right)
-    return snapshots[::-1], None
 
 # --- UPSTOX LIVE TRADE & POSITION FETCHING ---
 def fetch_upstox_positions():
@@ -781,19 +762,20 @@ ANALYSIS_HTML_TEMPLATE = """
                 <span class="chart-title">2 - 📈 Historical Snapshot Trend (Google Sheet Memory)</span>
             </div>
             <div style="display: flex; gap: 12px; align-items: center;">
-                <label style="color: #94a3b8; font-weight: bold;">Trend Metric:</label>
+                <label style="color: #94a3b8; font-weight: bold;">Head of Dropdown:</label>
                 <select id="historyMetricSelector" onchange="loadHistoricalChart()">
-                    <option value="spot_price">Live Spot Price (Index)</option>
-                    <option value="oi" selected>Open Interest (CE vs PE)</option>
-                    <option value="oi_chg">Change in Open Interest (CE vs PE)</option>
-                    <option value="vol">Trading Volume (CE vs PE)</option>
-                    <option value="pcr">Put-Call Ratio (PCR)</option>
-                    <option value="iv">Implied Volatility (IV CE vs PE)</option>
-                    <option value="delta">Delta Exposure (CE vs PE)</option>
-                    <option value="theta">Theta Decay (CE vs PE)</option>
-                    <option value="vega">Vega Exposure (CE vs PE)</option>
-                    <option value="gamma">Gamma Exposure (CE vs PE)</option>
-                    <option value="depth_qty">Order Book Depth (Ask Qty vs Bid Qty)</option>
+                    <option value="price_pcr" selected>Price LTP / PCR</option>
+                    <option value="oi">Open Interest (CE OI vs PE OI)</option>
+                    <option value="oi_chg">Change OI (CE Chng OI vs PE Chng OI)</option>
+                    <option value="vol">Vol (CE Vol vs PE Vol)</option>
+                    <option value="iv">Volatility (CE IV vs PE IV)</option>
+                    <option value="delta">Delta (CE Delta vs PE Delta)</option>
+                    <option value="theta">Theta (CE Theta vs PE Theta)</option>
+                    <option value="vega">Vega (CE Vega vs PE Vega)</option>
+                    <option value="gamma">Gamma (CE Gamma vs PE Gamma)</option>
+                    <option value="bid">BID (CE Bid vs PE Bid)</option>
+                    <option value="ask">ASK (CE Ask vs PE Ask)</option>
+                    <option value="ltp">LTP AVG (CE LTP vs PE LTP)</option>
                 </select>
 
                 <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Interval:</label>
@@ -858,7 +840,8 @@ ANALYSIS_HTML_TEMPLATE = """
                     maintainAspectRatio: false,
                     scales: {
                         x: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } },
-                        y: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } }
+                        y: { position: 'left', ticks: { color: '#94a3b8' }, grid: { color: '#334155' } },
+                        y1: { position: 'right', display: false, ticks: { color: '#38bdf8' }, grid: { drawOnChartArea: false } }
                     },
                     plugins: {
                         legend: { labels: { color: '#f8fafc', font: { size: 13 } } },
@@ -903,91 +886,105 @@ ANALYSIS_HTML_TEMPLATE = """
                         return;
                     }
 
-                    if (metric === "spot_price") {
+                    // Dual-axis option for Price LTP / PCR
+                    if (metric === "price_pcr") {
+                        historyChartObj.options.scales.y1.display = true;
                         const spotVals = snapshots.map(s => s.spot_price);
+                        const pcrVals = snapshots.map(s => s.pcr);
+
                         datasets.push({
-                            label: 'Spot Price',
+                            label: 'Relation 1: Price LTP',
                             data: spotVals,
                             borderColor: '#facc15',
                             backgroundColor: 'rgba(250, 204, 21, 0.1)',
                             borderWidth: 2,
                             tension: 0.2,
+                            yAxisID: 'y',
                             fill: true
                         });
+
                         datasets.push({
-                            label: 'Spot Linear Trend',
+                            label: 'Relation 2: PCR',
+                            data: pcrVals,
+                            borderColor: '#38bdf8',
+                            backgroundColor: 'rgba(56, 189, 248, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.2,
+                            yAxisID: 'y1',
+                            fill: false
+                        });
+
+                        datasets.push({
+                            label: 'Price Trend',
                             data: computeLinearTrend(spotVals),
                             borderColor: '#ca8a04',
                             borderDash: [6, 4],
                             borderWidth: 2,
                             pointRadius: 0,
-                            fill: false
-                        });
-                    }
-                    else if (metric === "pcr") {
-                        const pcrVals = snapshots.map(s => s.pcr);
-                        datasets.push({
-                            label: 'Put-Call Ratio (PCR)',
-                            data: pcrVals,
-                            borderColor: '#38bdf8',
-                            borderWidth: 2,
-                            tension: 0.2
-                        });
-                        datasets.push({
-                            label: 'PCR Linear Trend',
-                            data: computeLinearTrend(pcrVals),
-                            borderColor: '#0284c7',
-                            borderDash: [6, 4],
-                            borderWidth: 2,
-                            pointRadius: 0,
+                            yAxisID: 'y',
                             fill: false
                         });
                     }
                     else {
-                        let keyCe = `ce_${metric}`, keyPe = `pe_${metric}`;
-                        let titleCe = `Call (CE) ${metric.toUpperCase()}`, titlePe = `Put (PE) ${metric.toUpperCase()}`;
+                        historyChartObj.options.scales.y1.display = false;
 
-                        if (metric === "depth_qty") {
-                            keyCe = "ce_ask_qty"; keyPe = "pe_bid_qty";
-                            titleCe = "Call Ask Qty (Sell Vol)"; titlePe = "Put Bid Qty (Buy Vol)";
-                        }
+                        const metricMap = {
+                            "oi": { key1: "ce_oi", key2: "pe_oi", r1: "CE OI", r2: "PE OI" },
+                            "oi_chg": { key1: "ce_oi_chg", key2: "pe_oi_chg", r1: "CE Chng OI", r2: "PE Chng OI" },
+                            "vol": { key1: "ce_vol", key2: "pe_vol", r1: "CE Vol", r2: "PE Vol" },
+                            "iv": { key1: "ce_iv", key2: "pe_iv", r1: "CE IV", r2: "PE IV" },
+                            "delta": { key1: "ce_delta", key2: "pe_delta", r1: "CE Delta", r2: "PE Delta" },
+                            "theta": { key1: "ce_theta", key2: "pe_theta", r1: "CE Theta", r2: "PE Theta" },
+                            "vega": { key1: "ce_vega", key2: "pe_vega", r1: "CE Vega", r2: "PE Vega" },
+                            "gamma": { key1: "ce_gamma", key2: "pe_gamma", r1: "CE Gamma", r2: "PE Gamma" },
+                            "bid": { key1: "ce_bid", key2: "pe_bid", r1: "CE Bid", r2: "PE Bid" },
+                            "ask": { key1: "ce_ask", key2: "pe_ask", r1: "CE Ask", r2: "PE Ask" },
+                            "ltp": { key1: "ce_ltp", key2: "pe_ltp", r1: "CE LTP", r2: "PE LTP" }
+                        };
 
-                        const ceVals = snapshots.map(s => s[keyCe] || 0);
-                        const peVals = snapshots.map(s => s[keyPe] || 0);
+                        const cfg = metricMap[metric] || metricMap["oi"];
+                        const ceVals = snapshots.map(s => s[cfg.key1] || 0);
+                        const peVals = snapshots.map(s => s[cfg.key2] || 0);
 
                         datasets.push({
-                            label: titleCe,
+                            label: `Relation 1: ${cfg.r1}`,
                             data: ceVals,
                             borderColor: '#ef4444',
                             backgroundColor: 'rgba(239, 68, 68, 0.1)',
                             borderWidth: 2,
-                            tension: 0.2
+                            tension: 0.2,
+                            yAxisID: 'y'
                         });
+
                         datasets.push({
-                            label: titlePe,
+                            label: `Relation 2: ${cfg.r2}`,
                             data: peVals,
                             borderColor: '#22c55e',
                             backgroundColor: 'rgba(34, 197, 94, 0.1)',
                             borderWidth: 2,
-                            tension: 0.2
+                            tension: 0.2,
+                            yAxisID: 'y'
                         });
 
                         datasets.push({
-                            label: `${titleCe} Trend`,
+                            label: `${cfg.r1} Trend`,
                             data: computeLinearTrend(ceVals),
                             borderColor: '#f87171',
                             borderDash: [6, 4],
                             borderWidth: 2,
                             pointRadius: 0,
+                            yAxisID: 'y',
                             fill: false
                         });
+
                         datasets.push({
-                            label: `${titlePe} Trend`,
+                            label: `${cfg.r2} Trend`,
                             data: computeLinearTrend(peVals),
                             borderColor: '#4ade80',
                             borderDash: [6, 4],
                             borderWidth: 2,
                             pointRadius: 0,
+                            yAxisID: 'y',
                             fill: false
                         });
                     }
@@ -1211,7 +1208,7 @@ ANALYSIS_HTML_TEMPLATE = """
                 .then(res => res.json())
                 .then(data => {
                     renderPageData(data);
-                    loadHistoricalChart(); // Triggers live auto-sync for Google Sheet trend chart as well
+                    loadHistoricalChart();
                 })
                 .catch(err => {
                     console.error("Auto Sync Error:", err);
@@ -1603,7 +1600,7 @@ def download_history_csv():
         "CE OI", "PE OI", "CE Chg in OI", "PE Chg in OI", "CE Vol", "PE Vol",
         "CE IV", "PE IV", "CE Delta", "PE Delta",
         "CE Theta", "PE Theta", "CE Vega", "PE Vega",
-        "CE Gamma", "PE Gamma", "CE Ask Qty (Depth)", "PE Bid Qty (Depth)"
+        "CE Gamma", "PE Gamma", "CE Ask", "PE Bid"
     ])
 
     for s in snapshots:
@@ -1614,7 +1611,7 @@ def download_history_csv():
             s.get("ce_vol"), s.get("pe_vol"),
             s.get("ce_iv"), s.get("pe_iv"), s.get("ce_delta"), s.get("pe_delta"),
             s.get("ce_theta"), s.get("pe_theta"), s.get("ce_vega"), s.get("pe_vega"),
-            s.get("ce_gamma"), s.get("pe_gamma"), s.get("ce_ask_qty"), s.get("pe_bid_qty")
+            s.get("ce_gamma"), s.get("pe_gamma"), s.get("ce_ask"), s.get("pe_bid")
         ])
 
     output = Response(si.getvalue(), mimetype="text/csv")
