@@ -800,7 +800,9 @@ ANALYSIS_HTML_TEMPLATE = """
 
                 <label style="color: #94a3b8; font-weight: bold; margin-left: 6px;">Data Day Range:</label>
                 <select id="historyDayRangeSelector" onchange="loadHistoricalChart()">
-                    <option value="1week" selected>1 Week</option>
+                    <option value="1day" selected>1 Day</option>
+                    <option value="3day">3 Day</option>
+                    <option value="1week">1 Week</option>
                     <option value="2week">2 Week</option>
                     <option value="1month">1 Month</option>
                     <option value="3month">3 Month</option>
@@ -830,7 +832,9 @@ ANALYSIS_HTML_TEMPLATE = """
             <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
                 <label style="color: #94a3b8; font-weight: bold;">Data Day Range:</label>
                 <select id="signalDayRangeSelector" onchange="loadSignalChart()">
-                    <option value="1week" selected>1 Week</option>
+                    <option value="1day" selected>1 Day</option>
+                    <option value="3day">3 Day</option>
+                    <option value="1week">1 Week</option>
                     <option value="2week">2 Week</option>
                     <option value="1month">1 Month</option>
                     <option value="3month">3 Month</option>
@@ -1182,7 +1186,7 @@ ANALYSIS_HTML_TEMPLATE = """
                         datasets.push({
                             label: `Average (${cfg.r1} & ${cfg.r2})`,
                             data: avgVals,
-                            borderColor: '#facc15', // Yellow Line Color
+                            borderColor: '#facc15',
                             backgroundColor: 'rgba(250, 204, 21, 0.1)',
                             borderWidth: 2,
                             tension: 0.2,
@@ -1696,7 +1700,7 @@ def live_trade_position():
 def api_history():
     symbol = request.args.get("symbol", "NIFTY").upper()
     timeframe = request.args.get("timeframe", "5minute")
-    day_range = request.args.get("day_range", "1week").lower()
+    day_range = request.args.get("day_range", "1day").lower()
 
     snapshots, err = fetch_history_from_gsheet(symbol)
 
@@ -1707,6 +1711,8 @@ def api_history():
         return jsonify({"history": [], "count": 0})
 
     day_map = {
+        "1day": 1 * 86400,
+        "3day": 3 * 86400,
         "1week": 7 * 86400,
         "2week": 14 * 86400,
         "1month": 30 * 86400,
