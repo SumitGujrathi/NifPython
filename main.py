@@ -154,9 +154,13 @@ def format_time_str(time_raw):
         return f"{t_parts[0]}:{t_parts[1]}"
     return time_str
 
-def fetch_history_from_gsheet(symbol="NIFTY"):
+def fetch_history_from_gsheet(symbol="NIFTY", sheet_name=None):
     sheet_id = SPREADSHEET_ID or "1fpXdodshvwHcduwffOhEK54K-a7a4TmOZF2Q-EgVRzM"
-    candidate_sheets = ["NIFTY", "NITY", symbol.upper(), "Sheet1", ""]
+    
+    if sheet_name:
+        candidate_sheets = [sheet_name, sheet_name.upper(), symbol.upper(), "Sheet1", ""]
+    else:
+        candidate_sheets = ["NIFTY" if "BANK" not in symbol.upper() else "BANKNIFTY", symbol.upper(), "Sheet1", ""]
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -165,9 +169,9 @@ def fetch_history_from_gsheet(symbol="NIFTY"):
     raw_csv = None
     last_err = None
 
-    for sheet_name in candidate_sheets:
-        if sheet_name:
-            url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={urllib.parse.quote(sheet_name)}"
+    for s_name in candidate_sheets:
+        if s_name:
+            url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={urllib.parse.quote(s_name)}"
         else:
             url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
 
@@ -200,7 +204,7 @@ def fetch_history_from_gsheet(symbol="NIFTY"):
         header_idx = 0
         for i, l in enumerate(lines[:10]):
             l_lower = l.lower()
-            if "time" in l_lower or "symbol" in l_lower or "pcr" in l_lower or "ltp" in l_lower:
+            if "time" in l_lower or "symbol" in l_lower or "pcr" in l_lower or "ltp" in l_lower or "min roc" in l_lower:
                 header_idx = i
                 break
 
@@ -242,7 +246,7 @@ def fetch_history_from_gsheet(symbol="NIFTY"):
                             return k_val
                 return ""
 
-            time_val = str(norm_r.get("time", norm_r.get("datetime", norm_r.get("timestamp", ""))))
+            time_val = str(norm_r.get("time", norm_r.get("datetime", norm_r.get("timestamp", norm_r.get("date & time", norm_r.get("date and time", ""))))))
             if not time_val or time_val.lower() in ("nan", "none", "", "0.0"):
                 continue
 
@@ -285,7 +289,7 @@ def fetch_history_from_gsheet(symbol="NIFTY"):
             snapshots.append(snapshot)
 
         if not snapshots:
-            return [], "Google Sheet connected but no valid data rows were found matching expected columns."
+            return [], f"Google Sheet connected ({sheet_name or symbol}) but no valid data rows were found."
 
         return snapshots[::-1], None
 
@@ -552,10 +556,10 @@ MAIN_HTML_TEMPLATE = """
         th { background-color: #343a40; color: white; position: sticky; top: 0; }
         tr:nth-child(even){ background-color: #f8f9fa; }
         
-        .ce-header { background-color: #dc3545 !important; color: white; }
-        .pe-header { background-color: #28a745 !important; color: white; }
-        .ce-cell { background-color: #fff5f5; }
-        .pe-cell { background-color: #f0fff4; }
+        .ce-header { background-color: #28a745 !important; color: white; }
+        .pe-header { background-color: #dc3545 !important; color: white; }
+        .ce-cell { background-color: #f0fff4; }
+        .pe-cell { background-color: #fff5f5; }
         .greek-col { font-size: 12px; color: #495057; }
         .order-col { font-size: 12px; color: #495057; }
         
@@ -679,8 +683,8 @@ ANALYSIS_HTML_TEMPLATE = """
         .card-value { font-size: 22px; font-weight: bold; color: #f8fafc; }
         .sentiment-bar-container { background: #1e293b; border: 1px solid #334155; padding: 15px; border-radius: 10px; margin-bottom: 25px; }
         .gauge-flex { display: flex; height: 24px; border-radius: 12px; overflow: hidden; margin-top: 10px; }
-        .gauge-ce { background-color: #ef4444; height: 100%; transition: width 0.4s ease; }
-        .gauge-pe { background-color: #22c55e; height: 100%; transition: width 0.4s ease; }
+        .gauge-ce { background-color: #22c55e; height: 100%; transition: width 0.4s ease; }
+        .gauge-pe { background-color: #ef4444; height: 100%; transition: width 0.4s ease; }
         .chart-box { background: #1e293b; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); margin-bottom: 30px; position: relative; }
         .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px; }
         .chart-title { font-size: 18px; font-weight: bold; color: #f8fafc; }
@@ -734,13 +738,13 @@ ANALYSIS_HTML_TEMPLATE = """
             <div class="card-title">Put-Call Ratio (PCR)</div>
             <div class="card-value" id="cardPcr">{{ pcr }}</div>
         </div>
-        <div class="card" style="border-left-color: #ef4444;">
-            <div class="card-title">Major Resistance (Max Call OI)</div>
-            <div class="card-value" id="maxCallStrike" style="color: #ef4444;">-</div>
-        </div>
         <div class="card" style="border-left-color: #22c55e;">
+            <div class="card-title">Major Resistance (Max Call OI)</div>
+            <div class="card-value" id="maxCallStrike" style="color: #22c55e;">-</div>
+        </div>
+        <div class="card" style="border-left-color: #ef4444;">
             <div class="card-title">Major Support (Max Put OI)</div>
-            <div class="card-value" id="maxPutStrike" style="color: #22c55e;">-</div>
+            <div class="card-value" id="maxPutStrike" style="color: #ef4444;">-</div>
         </div>
         <div class="card" style="border-left-color: #a855f7;">
             <div class="card-title">Last Updated (IST)</div>
@@ -751,9 +755,9 @@ ANALYSIS_HTML_TEMPLATE = """
     <!-- DYNAMIC METRIC SENTIMENT GAUGE -->
     <div class="sentiment-bar-container">
         <div style="display: flex; justify-content: space-between; font-weight: bold; margin-bottom: 8px;">
-            <span style="color: #ef4444;" id="gaugeCeLabel">CALL (CE) TOTAL: -</span>
+            <span style="color: #22c55e;" id="gaugeCeLabel">CALL (CE) TOTAL: -</span>
             <span style="color: #38bdf8;" id="gaugeMetricName">SELECTED METRIC COMPARISON</span>
-            <span style="color: #22c55e;" id="gaugePeLabel">PUT (PE) TOTAL: -</span>
+            <span style="color: #ef4444;" id="gaugePeLabel">PUT (PE) TOTAL: -</span>
         </div>
         <div class="gauge-flex">
             <div id="gaugeCeBar" class="gauge-ce" style="width: 50%;"></div>
@@ -823,7 +827,7 @@ ANALYSIS_HTML_TEMPLATE = """
         <canvas id="historyChart" style="max-height: 420px;"></canvas>
     </div>
 
-    <!-- CHART 3: MAIN SIGNAL CHART (COLUMNS AE TO AI) -->
+    <!-- CHART 3: MAIN SIGNAL CHART (COLUMNS AD TO AI) -->
     <div class="chart-box">
         <div class="chart-header">
             <div style="display: flex; align-items: center; gap: 15px;">
@@ -846,7 +850,6 @@ ANALYSIS_HTML_TEMPLATE = """
                     <option value="15minute">15 Min</option>
                     <option value="30minute">30 Min</option>
                     <option value="60minute">1 Hour</option>
-                    <option value="day">1 Day</option>
                 </select>
             </div>
         </div>
@@ -980,7 +983,7 @@ ANALYSIS_HTML_TEMPLATE = """
             const dayRange = document.getElementById('signalDayRangeSelector').value;
             const timeframe = document.getElementById('signalTimeframeSelector').value;
 
-            fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&day_range=${dayRange}`)
+            fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&day_range=${dayRange}&chart_type=signal`)
                 .then(res => res.json())
                 .then(data => {
                     if (data.error) {
@@ -1011,15 +1014,15 @@ ANALYSIS_HTML_TEMPLATE = """
                         {
                             label: 'Min ROC (Buy)',
                             data: minRocVals,
-                            borderColor: '#4ade80', // Light Green
-                            backgroundColor: 'rgba(74, 222, 128, 0.1)',
+                            borderColor: '#22c55e', // Green for CE/Buy
+                            backgroundColor: 'rgba(34, 197, 94, 0.1)',
                             borderWidth: 2,
                             tension: 0.2
                         },
                         {
                             label: 'Max ROC (Sell)',
                             data: maxRocVals,
-                            borderColor: '#ef4444', // Red
+                            borderColor: '#ef4444', // Red for PE/Sell
                             backgroundColor: 'rgba(239, 68, 68, 0.1)',
                             borderWidth: 2,
                             tension: 0.2
@@ -1077,7 +1080,7 @@ ANALYSIS_HTML_TEMPLATE = """
             const dayRange = document.getElementById('historyDayRangeSelector').value;
             const timeframe = document.getElementById('historyTimeframeSelector').value;
 
-            fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&metric=${metric}&day_range=${dayRange}`)
+            fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&metric=${metric}&day_range=${dayRange}&chart_type=history`)
                 .then(res => res.json())
                 .then(data => {
                     if (data.error) {
@@ -1162,21 +1165,23 @@ ANALYSIS_HTML_TEMPLATE = """
                         const peVals = snapshots.map(s => s[cfg.key2] || 0);
                         const avgVals = ceVals.map((v, i) => (v + (peVals[i] || 0)) / 2);
 
+                        // CE = Green
                         datasets.push({
                             label: `Relation 1: ${cfg.r1}`,
                             data: ceVals,
-                            borderColor: '#ef4444',
-                            backgroundColor: 'rgba(239, 68, 68, 0.1)',
+                            borderColor: '#22c55e',
+                            backgroundColor: 'rgba(34, 197, 94, 0.1)',
                             borderWidth: 2,
                             tension: 0.2,
                             yAxisID: 'y'
                         });
 
+                        // PE = Red
                         datasets.push({
                             label: `Relation 2: ${cfg.r2}`,
                             data: peVals,
-                            borderColor: '#22c55e',
-                            backgroundColor: 'rgba(34, 197, 94, 0.1)',
+                            borderColor: '#ef4444',
+                            backgroundColor: 'rgba(239, 68, 68, 0.1)',
                             borderWidth: 2,
                             tension: 0.2,
                             yAxisID: 'y'
@@ -1194,10 +1199,11 @@ ANALYSIS_HTML_TEMPLATE = """
                             fill: false
                         });
 
+                        // CE Trend = Light Green
                         datasets.push({
                             label: `${cfg.r1} Trend`,
                             data: computeLinearTrend(ceVals),
-                            borderColor: '#f87171',
+                            borderColor: '#4ade80',
                             borderDash: [6, 4],
                             borderWidth: 2,
                             pointRadius: 0,
@@ -1205,10 +1211,11 @@ ANALYSIS_HTML_TEMPLATE = """
                             fill: false
                         });
 
+                        // PE Trend = Light Red
                         datasets.push({
                             label: `${cfg.r2} Trend`,
                             data: computeLinearTrend(peVals),
-                            borderColor: '#4ade80',
+                            borderColor: '#f87171',
                             borderDash: [6, 4],
                             borderWidth: 2,
                             pointRadius: 0,
@@ -1296,10 +1303,10 @@ ANALYSIS_HTML_TEMPLATE = """
                 data: {
                     labels: rawRows.map(r => r.strike),
                     datasets: [
-                        { type: 'bar', label: 'Calls (CE)', data: [], backgroundColor: 'rgba(239, 68, 68, 0.85)', borderColor: '#ef4444', borderWidth: 1 },
-                        { type: 'bar', label: 'Puts (PE)', data: [], backgroundColor: 'rgba(34, 197, 94, 0.85)', borderColor: '#22c55e', borderWidth: 1 },
-                        { type: 'line', label: 'CE Trend', data: [], borderColor: '#f87171', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, fill: false },
-                        { type: 'line', label: 'PE Trend', data: [], borderColor: '#4ade80', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, fill: false }
+                        { type: 'bar', label: 'Calls (CE)', data: [], backgroundColor: 'rgba(34, 197, 94, 0.85)', borderColor: '#22c55e', borderWidth: 1 },
+                        { type: 'bar', label: 'Puts (PE)', data: [], backgroundColor: 'rgba(239, 68, 68, 0.85)', borderColor: '#ef4444', borderWidth: 1 },
+                        { type: 'line', label: 'CE Trend', data: [], borderColor: '#4ade80', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, fill: false },
+                        { type: 'line', label: 'PE Trend', data: [], borderColor: '#f87171', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, fill: false }
                     ]
                 },
                 options: {
@@ -1331,42 +1338,42 @@ ANALYSIS_HTML_TEMPLATE = """
             if (selected === "depth_qty") {
                 metricTitle = "1 - Order Book Depth Quantity (Call Ask Qty vs Put Bid Qty)";
                 ceLabel = "Call Ask Qty (Sell Vol)"; peLabel = "Put Bid Qty (Buy Vol)";
-                ceColor = 'rgba(236, 72, 153, 0.85)'; peColor = 'rgba(168, 85, 247, 0.85)';
+                ceColor = 'rgba(34, 197, 94, 0.85)'; peColor = 'rgba(239, 68, 68, 0.85)';
                 ceData = rawRows.map(r => r.ce_ask_qty);
                 peData = rawRows.map(r => r.pe_bid_qty);
             }
             else if (selected === "oi_chg") {
                 metricTitle = "Change in Open Interest (Chg in OI)";
                 ceLabel = "Call Chg in OI"; peLabel = "Put Chg in OI";
-                ceColor = 'rgba(225, 29, 72, 0.85)'; peColor = 'rgba(16, 185, 129, 0.85)';
+                ceColor = 'rgba(34, 197, 94, 0.85)'; peColor = 'rgba(239, 68, 68, 0.85)';
                 ceData = rawRows.map(r => r.ce_oi_chg);
                 peData = rawRows.map(r => r.pe_oi_chg);
             }
             else if (selected === "oi") {
                 metricTitle = "Open Interest (CE vs PE)";
                 ceLabel = "Call OI"; peLabel = "Put OI";
-                ceColor = 'rgba(239, 68, 68, 0.85)'; peColor = 'rgba(34, 197, 94, 0.85)';
+                ceColor = 'rgba(34, 197, 94, 0.85)'; peColor = 'rgba(239, 68, 68, 0.85)';
                 ceData = rawRows.map(r => r.ce_oi);
                 peData = rawRows.map(r => r.pe_oi);
             }
             else if (selected === "vol") {
                 metricTitle = "Trading Volume";
                 ceLabel = "Call Volume"; peLabel = "Put Volume";
-                ceColor = 'rgba(249, 115, 22, 0.85)'; peColor = 'rgba(14, 165, 233, 0.85)';
+                ceColor = 'rgba(34, 197, 94, 0.85)'; peColor = 'rgba(239, 68, 68, 0.85)';
                 ceData = rawRows.map(r => r.ce_vol);
                 peData = rawRows.map(r => r.pe_vol);
             }
             else if (selected === "delta") {
                 metricTitle = "Option Delta Exposure";
                 ceLabel = "Call Delta"; peLabel = "Put Delta";
-                ceColor = 'rgba(239, 68, 68, 0.85)'; peColor = 'rgba(34, 197, 94, 0.85)';
+                ceColor = 'rgba(34, 197, 94, 0.85)'; peColor = 'rgba(239, 68, 68, 0.85)';
                 ceData = rawRows.map(r => r.ce_delta);
                 peData = rawRows.map(r => r.pe_delta);
             }
             else if (selected === "theta") {
                 metricTitle = "Theta Time Decay Rate";
                 ceLabel = "Call Theta"; peLabel = "Put Theta";
-                ceColor = 'rgba(234, 179, 8, 0.85)'; peColor = 'rgba(168, 85, 247, 0.85)';
+                ceColor = 'rgba(34, 197, 94, 0.85)'; peColor = 'rgba(239, 68, 68, 0.85)';
                 ceData = rawRows.map(r => r.ce_theta);
                 peData = rawRows.map(r => r.pe_theta);
             }
@@ -1385,9 +1392,11 @@ ANALYSIS_HTML_TEMPLATE = """
 
             myChart.data.datasets[2].label = `${ceLabel} Trend`;
             myChart.data.datasets[2].data = computeLinearTrend(ceData);
+            myChart.data.datasets[2].borderColor = '#4ade80';
 
             myChart.data.datasets[3].label = `${peLabel} Trend`;
             myChart.data.datasets[3].data = computeLinearTrend(peData);
+            myChart.data.datasets[3].borderColor = '#f87171';
 
             myChart.update();
 
@@ -1701,8 +1710,26 @@ def api_history():
     symbol = request.args.get("symbol", "NIFTY").upper()
     timeframe = request.args.get("timeframe", "5minute")
     day_range = request.args.get("day_range", "1day").lower()
+    chart_type = request.args.get("chart_type", "history").lower()
 
-    snapshots, err = fetch_history_from_gsheet(symbol)
+    sym_clean = "BANKNIFTY" if "BANK" in symbol else "NIFTY"
+
+    if chart_type == "signal":
+        tf = timeframe.lower()
+        if "15" in tf:
+            tf_str = "15_MIN"
+        elif "30" in tf:
+            tf_str = "30_MIN"
+        elif "60" in tf or "1h" in tf or "hour" in tf or "hr" in tf or "day" in tf:
+            tf_str = "1_HR"
+        else:
+            tf_str = "5_MIN"
+            
+        target_sheet = f"{sym_clean}_{tf_str}"
+    else:
+        target_sheet = sym_clean
+
+    snapshots, err = fetch_history_from_gsheet(symbol, sheet_name=target_sheet)
 
     if err:
         return jsonify({"history": [], "count": 0, "error": err})
