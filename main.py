@@ -25,7 +25,9 @@ TOTP_KEY = os.getenv("UPSTOX_TOTP_KEY")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1fpXdodshvwHcduwffOhEK54K-a7a4TmOZF2Q-EgVRzM")
 
 SESSION_FILE_PATH = "/tmp/upstox_session.json"
+AUTO_ORDER_STATE_PATH = "/tmp/upstox_auto_order_state.json"
 AUTH_THREAD_LOCK = threading.Lock()
+ORDER_EXECUTION_LOCK = threading.Lock()
 
 INSTRUMENT_KEYS = {
     "NIFTY": "NSE_INDEX|Nifty 50",
@@ -123,6 +125,427 @@ def get_valid_token():
     if token:
         return token
     return perform_single_auth()
+
+# --- DASHBOARD SHEET ORDER CONFIGURATION & EXECUTION ENGINE ---
+def get_ist_today_str():
+    ist_tz = timezone(timedelta(hours=5, minutes=30))
+    return datetime.now(ist_tz).strftime("%Y-%m-%d")
+
+def load_auto_order_state():
+    today_str = get_ist_today_str()
+    try:
+        if os.path.exists(AUTO_ORDER_STATE_PATH):
+            with open(AUTO_ORDER_STATE_PATH, "r") as f:
+                data = json.load(f)
+                if data.get("date") == today_str:
+                    return data
+    except Exception as e:
+        print(f"[Order State Warning] Read failed: {e}")
+    return {"date": today_str, "executed_symbols": {}, "last_auto_result": None, "cancelled_signatures": []}
+
+def save_auto_order_state(state):
+    try:
+        with open(AUTO_ORDER_STATE_PATH, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f"[Order State Warning] Write failed: {e}")
+
+def round_tick(price, tick=0.05):
+    if price is None or price <= 0:
+        return 0.05
+    return round(round(price / tick) * tick, 2)
+
+def fetch_dashboard_order_config():
+    """Fetches cells B16:B27 from Google Sheet tab 'DASHBOARD'."""
+    sheet_id = SPREADSHEET_ID or "1fpXdodshvwHcduwffOhEK54K-a7a4TmOZF2Q-EgVRzM"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    urls = [
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet=DASHBOARD&range=A16:B27",
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet=DASHBOARD"
+    ]
+
+    raw_csv = None
+    last_err = None
+
+    for url in urls:
+        try:
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code == 200:
+                text = res.text.strip().lstrip('\ufeff')
+                if text.startswith("<!DOCTYPE") or "<html" in text.lower():
+                    last_err = "Google Sheet is private. Set sharing to 'Anyone with the link can view'."
+                    continue
+                if len(text) > 10:
+                    raw_csv = text
+                    break
+            else:
+                last_err = f"HTTP {res.status_code} fetching DASHBOARD sheet."
+        except Exception as e:
+            last_err = f"Network error fetching DASHBOARD sheet: {e}"
+
+    if not raw_csv:
+        return None, last_err or "Could not fetch DASHBOARD sheet."
+
+    try:
+        lines = [line.strip().lstrip('\ufeff') for line in raw_csv.splitlines() if line.strip()]
+        rows = list(csv.reader(io.StringIO("\n".join(lines))))
+
+        label_map = {}
+        for r in rows:
+            if len(r) >= 2:
+                k = re.sub(r'[^a-z0-9]+', '_', r[0].strip().lower()).strip('_')
+                v = r[1].strip()
+                if k:
+                    label_map[k] = v
+
+        def get_val(keys, pos_idx):
+            for k in keys:
+                if k in label_map:
+                    return label_map[k]
+            if len(rows) == 12 and pos_idx < len(rows) and len(rows[pos_idx]) >= 2:
+                return rows[pos_idx][1].strip()
+            if len(rows) >= 27 and (15 + pos_idx) < len(rows) and len(rows[15 + pos_idx]) >= 2:
+                return rows[15 + pos_idx][1].strip()
+            return ""
+
+        manual_raw = get_val(["manual_order"], 0)
+        manual_mode = "Auto" if manual_raw.strip().lower() == "auto" else "Manual"
+
+        want_raw = get_val(["want_to_trade"], 1).strip().upper()
+        want_to_trade = "YES" if want_raw == "YES" else "NO"
+
+        amt_raw = get_val(["amount_to_be_invest", "amount_to_invest"], 2).replace(",", "").strip()
+        amount_to_invest = float(amt_raw) if amt_raw else 0.0
+
+        sym_raw = get_val(["symbol"], 3).strip().upper()
+        symbol = "BANKNIFTY" if "BANK" in sym_raw else "NIFTY"
+
+        expiry_month = get_val(["expiry_month"], 4).strip().upper()
+
+        strike_raw = get_val(["strike_price"], 5).replace(",", "").strip()
+        strike_price = int(float(strike_raw)) if strike_raw else 0
+
+        opt_raw = get_val(["option_type"], 6).strip().upper()
+        option_type = opt_raw if opt_raw in ("CE", "PE") else "CE"
+
+        txn_raw = get_val(["transaction_type"], 7).strip().upper()
+        transaction_type = txn_raw if txn_raw in ("BUY", "SELL") else "BUY"
+
+        qty_raw = get_val(["quantity"], 8).replace(",", "").strip()
+        quantity = int(float(qty_raw)) if qty_raw else 0
+
+        prod_raw = get_val(["product"], 9).strip().upper()
+        product = "I" if prod_raw in ("I", "INTRADAY", "MIS") else "D"
+
+        sl_raw = get_val(["sl_percent"], 10).replace("%", "").strip()
+        sl_percent = float(sl_raw) if sl_raw != "" else None
+
+        tgt_raw = get_val(["target_percent"], 11).replace("%", "").strip()
+        target_percent = float(tgt_raw) if tgt_raw != "" else None
+
+        cfg = {
+            "manual_order": manual_mode,
+            "manual_order_raw": manual_raw or manual_mode,
+            "want_to_trade": want_to_trade,
+            "amount_to_invest": amount_to_invest,
+            "symbol": symbol,
+            "expiry_month": expiry_month,
+            "strike_price": strike_price,
+            "option_type": option_type,
+            "transaction_type": transaction_type,
+            "quantity": quantity,
+            "product": product,
+            "sl_percent": sl_percent,
+            "target_percent": target_percent
+        }
+        return cfg, None
+
+    except Exception as e:
+        return None, f"Error parsing DASHBOARD sheet B16:B27: {e}"
+
+def resolve_monthly_expiry_date(symbol, expiry_month, headers):
+    """Fetches option contracts and picks the last expiry date in the requested month."""
+    instrument_key = INSTRUMENT_KEYS.get(symbol, "NSE_INDEX|Nifty 50")
+    expiry_url = f"https://api.upstox.com/v2/option/contract?instrument_key={urllib.parse.quote(instrument_key)}"
+    res = requests.get(expiry_url, headers=headers, timeout=10)
+    if res.status_code != 200:
+        return None, f"Failed fetching option expiries: {res.text}"
+
+    expiries = sorted(list(set(item["expiry"] for item in res.json().get("data", []))))
+    if not expiries:
+        return None, f"No option expiries found for {symbol}."
+
+    month_lookup = {
+        "JAN": 1, "JANUARY": 1, "01": 1, "1": 1,
+        "FEB": 2, "FEBRUARY": 2, "02": 2, "2": 2,
+        "MAR": 3, "MARCH": 3, "03": 3, "3": 3,
+        "APR": 4, "APRIL": 4, "04": 4, "4": 4,
+        "MAY": 5, "05": 5, "5": 5,
+        "JUN": 6, "JUNE": 6, "06": 6, "6": 6,
+        "JUL": 7, "JULY": 7, "07": 7, "7": 7,
+        "AUG": 8, "AUGUST": 8, "08": 8, "8": 8,
+        "SEP": 9, "SEPT": 9, "SEPTEMBER": 9, "09": 9, "9": 9,
+        "OCT": 10, "OCTOBER": 10, "10": 10,
+        "NOV": 11, "NOVEMBER": 11, "11": 11,
+        "DEC": 12, "DECEMBER": 12, "12": 12
+    }
+
+    today_str = get_ist_today_str()
+    future_expiries = [e for e in expiries if e >= today_str] or expiries
+
+    target_m = month_lookup.get(str(expiry_month).strip().upper())
+    if not target_m:
+        # Check if exact YYYY-MM-DD was provided
+        if expiry_month in expiries:
+            return expiry_month, None
+        return future_expiries[0], None
+
+    matching = [e for e in future_expiries if int(e.split("-")[1]) == target_m]
+    if matching:
+        first_year = sorted(list(set(e.split("-")[0] for e in matching)))[0]
+        year_matches = [e for e in matching if e.startswith(first_year)]
+        return max(year_matches), None
+
+    return None, f"No expiry dates found in month '{expiry_month}' for {symbol}."
+
+def prepare_evaluated_order(cfg):
+    """
+    Resolves monthly expiry, checks live LTP across strikes, enforces 'Amount to be Invest'
+    by stepping to next OTM strike if needed, and computes SL & Target prices.
+    """
+    token = get_valid_token()
+    if not token:
+        return None, "Upstox token unavailable or authentication paused."
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+
+    symbol = cfg["symbol"]
+    expiry_date, exp_err = resolve_monthly_expiry_date(symbol, cfg["expiry_month"], headers)
+    if exp_err or not expiry_date:
+        return None, exp_err or "Could not resolve monthly expiry date."
+
+    instrument_key = INSTRUMENT_KEYS.get(symbol, "NSE_INDEX|Nifty 50")
+    _, chain_data = fetch_single_expiry_chain(instrument_key, expiry_date, headers)
+    if not chain_data:
+        return None, f"Empty option chain returned for {symbol} expiry {expiry_date}."
+
+    opt_type = cfg["option_type"]  # CE or PE
+    req_strike = cfg["strike_price"]
+    qty = cfg["quantity"]
+    max_invest = cfg["amount_to_invest"]
+
+    if qty <= 0:
+        return None, "Invalid quantity (0) in DASHBOARD cell B24."
+
+    # Build strike list with instrument_key and live LTP
+    candidates = []
+    for item in chain_data:
+        st = item.get("strike_price", 0)
+        leg = item.get("call_options", {}) if opt_type == "CE" else item.get("put_options", {})
+        leg = leg or {}
+        mkt = leg.get("market_data", {}) or {}
+        ltp = float(mkt.get("ltp", 0) or 0)
+        inst_token = leg.get("instrument_key", "")
+        if inst_token and ltp > 0:
+            candidates.append({
+                "strike": st,
+                "ltp": ltp,
+                "instrument_token": inst_token
+            })
+
+    if not candidates:
+        return None, f"No active {opt_type} contracts with live LTP found for {symbol} ({expiry_date})."
+
+    # Sort strikes for OTM stepping if budget is exceeded:
+    # For CE: step upwards (e.g., 25700 -> 25750 -> 25800 -> 25900)
+    # For PE: step downwards (e.g., 25700 -> 25650 -> 25600 -> 25500)
+    if opt_type == "CE":
+        ordered = sorted([c for c in candidates if c["strike"] >= req_strike], key=lambda x: x["strike"])
+    else:
+        ordered = sorted([c for c in candidates if c["strike"] <= req_strike], key=lambda x: x["strike"], reverse=True)
+
+    if not ordered:
+        # Fallback to closest strike available
+        ordered = sorted(candidates, key=lambda x: abs(x["strike"] - req_strike))
+
+    selected = None
+    stepped_strikes = []
+    for c in ordered:
+        total_cost = round(c["ltp"] * qty, 2)
+        if max_invest <= 0 or total_cost <= max_invest:
+            selected = c
+            selected["total_cost"] = total_cost
+            break
+        else:
+            stepped_strikes.append(f"{int(c['strike'])} (₹{total_cost:,.0f})")
+
+    if not selected:
+        return None, f"Budget Exceeded: Even furthest {opt_type} strike exceeds Amount to be Invest (₹{max_invest:,.0f}). Checked: {', '.join(stepped_strikes[:4])}"
+
+    entry_price = round_tick(selected["ltp"])
+    total_investment = round(entry_price * qty, 2)
+    txn_type = cfg["transaction_type"]
+
+    # Calculate Stop Loss (if not blank)
+    sl_percent = cfg["sl_percent"]
+    sl_price = None
+    if sl_percent is not None and sl_percent > 0:
+        if txn_type == "BUY":
+            sl_price = round_tick(entry_price * (1.0 - sl_percent / 100.0))
+        else:
+            sl_price = round_tick(entry_price * (1.0 + sl_percent / 100.0))
+
+    # Calculate Target (if not blank)
+    target_percent = cfg["target_percent"]
+    target_price = None
+    if target_percent is not None and target_percent > 0:
+        if txn_type == "BUY":
+            target_price = round_tick(entry_price * (1.0 + target_percent / 100.0))
+        else:
+            target_price = round_tick(entry_price * (1.0 - target_percent / 100.0))
+
+    strike_adjusted = (int(selected["strike"]) != int(req_strike))
+    signature = f"{cfg['manual_order']}|{symbol}|{expiry_date}|{int(selected['strike'])}|{opt_type}|{txn_type}|{qty}|{cfg['product']}|{sl_percent}|{target_percent}"
+
+    evaluated = {
+        "signature": signature,
+        "manual_order": cfg["manual_order"],
+        "want_to_trade": cfg["want_to_trade"],
+        "symbol": symbol,
+        "expiry_month": cfg["expiry_month"],
+        "expiry_date": expiry_date,
+        "requested_strike": int(req_strike),
+        "selected_strike": int(selected["strike"]),
+        "strike_adjusted": strike_adjusted,
+        "stepped_reason": f"Adjusted from {int(req_strike)} to fit ₹{max_invest:,.0f} budget" if strike_adjusted else "Exact requested strike within budget",
+        "option_type": opt_type,
+        "transaction_type": txn_type,
+        "quantity": qty,
+        "product": cfg["product"],
+        "product_label": "Normal / Delivery (D)" if cfg["product"] == "D" else "Intraday (I)",
+        "instrument_token": selected["instrument_token"],
+        "entry_price": entry_price,
+        "amount_to_invest": max_invest,
+        "total_investment": total_investment,
+        "sl_percent": sl_percent,
+        "sl_price": sl_price,
+        "target_percent": target_percent,
+        "target_price": target_price
+    }
+    return evaluated, None
+
+def submit_upstox_evaluated_order(evaluated_order):
+    """Places either a GTT Multi-Leg order (when SL or Target exists) or a standard Limit order."""
+    token = get_valid_token()
+    if not token:
+        return False, "Authentication token missing or paused."
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+
+    sl_price = evaluated_order.get("sl_price")
+    target_price = evaluated_order.get("target_price")
+    entry_price = evaluated_order["entry_price"]
+    qty = evaluated_order["quantity"]
+    product = evaluated_order["product"]
+    inst_token = evaluated_order["instrument_token"]
+    txn_type = evaluated_order["transaction_type"]
+
+    try:
+        if sl_price is not None or target_price is not None:
+            # Upstox v3 GTT MULTIPLE Order (Entry + Target and/or Stoploss)
+            rules = [
+                {
+                    "strategy": "ENTRY",
+                    "trigger_type": "IMMEDIATE",
+                    "trigger_price": entry_price
+                }
+            ]
+            if target_price is not None:
+                rules.append({
+                    "strategy": "TARGET",
+                    "trigger_type": "IMMEDIATE",
+                    "trigger_price": target_price
+                })
+            if sl_price is not None:
+                rules.append({
+                    "strategy": "STOPLOSS",
+                    "trigger_type": "IMMEDIATE",
+                    "trigger_price": sl_price
+                })
+
+            payload = {
+                "type": "MULTIPLE",
+                "quantity": qty,
+                "product": product,
+                "rules": rules,
+                "instrument_token": inst_token,
+                "transaction_type": txn_type
+            }
+            url = "https://api.upstox.com/v3/order/gtt/place"
+            res = requests.post(url, json=payload, headers=headers, timeout=12)
+            resp_json = res.json() if res.content else {}
+
+            if res.status_code == 200 and resp_json.get("status") == "success":
+                gtt_ids = resp_json.get("data", {}).get("gtt_order_ids", [])
+                return True, f"GTT Multi-Leg Order Placed! ID(s): {', '.join(gtt_ids) if gtt_ids else 'Confirmed'} | Entry: ₹{entry_price} | SL: {sl_price or 'Blank'} | Target: {target_price or 'Blank'}"
+            else:
+                err_detail = resp_json.get("errors", [{}])[0].get("message") if isinstance(resp_json.get("errors"), list) and resp_json.get("errors") else res.text
+                return False, f"Upstox GTT Order Rejected ({res.status_code}): {err_detail}"
+
+        else:
+            # Both SL and Target are blank -> Place pure Fixed Limit Order at live LTP
+            payload = {
+                "quantity": qty,
+                "product": product,
+                "validity": "DAY",
+                "price": entry_price,
+                "tag": "DASHBOARD_ORDER",
+                "instrument_token": inst_token,
+                "order_type": "LIMIT",
+                "transaction_type": txn_type,
+                "disclosed_quantity": 0,
+                "trigger_price": 0,
+                "is_amo": False
+            }
+            url = "https://api.upstox.com/v2/order/place"
+            res = requests.post(url, json=payload, headers=headers, timeout=12)
+            resp_json = res.json() if res.content else {}
+
+            if res.status_code == 200 and resp_json.get("status") == "success":
+                order_id = resp_json.get("data", {}).get("order_id", "Confirmed")
+                return True, f"Limit Order Placed! Order ID: {order_id} | Entry: ₹{entry_price} | SL & Target: Blank (Self-Monitored)"
+            else:
+                err_detail = resp_json.get("errors", [{}])[0].get("message") if isinstance(resp_json.get("errors"), list) and resp_json.get("errors") else res.text
+                return False, f"Upstox Limit Order Rejected ({res.status_code}): {err_detail}"
+
+    except Exception as e:
+        return False, f"Order API Exception: {e}"
+
+def check_existing_symbol_trade(symbol, positions, orders):
+    """Checks if an open/closed position or non-rejected order already exists today for symbol."""
+    sym_upper = symbol.upper()
+    for p in positions:
+        ts = str(p.get("trading_symbol", "")).upper()
+        if ts.startswith(sym_upper):
+            return True, f"Existing position found ({p.get('trading_symbol')}, Status: {p.get('status')})"
+
+    for o in orders:
+        ts = str(o.get("trading_symbol", "")).upper()
+        st = str(o.get("status", "")).lower()
+        if ts.startswith(sym_upper) and st not in ("rejected", "cancelled"):
+            return True, f"Existing order found today ({o.get('trading_symbol')}, Status: {o.get('status')})"
+
+    return False, None
 
 # --- GOOGLE SHEET HISTORICAL & SIGNAL DATA LOADER ---
 def parse_timestamp(dt_str):
@@ -896,7 +1319,6 @@ ANALYSIS_HTML_TEMPLATE = """
             return data.map((_, i) => Number((slope * i + intercept).toFixed(2)));
         }
 
-        // Custom Plugin 1: Draw White 'B' / 'S' Signal Labels above Main Volatility line points
         const signalLabelPlugin = {
             id: 'signalLabelPlugin',
             afterDatasetsDraw: (chart) => {
@@ -923,7 +1345,6 @@ ANALYSIS_HTML_TEMPLATE = """
             }
         };
 
-        // Custom Plugin 2: Background shading for >0 (Light Green) & <0 (Light Red) and Bold Yellow 0 Line
         const zeroLinePlugin = {
             id: 'zeroLinePlugin',
             beforeDraw: (chart) => {
@@ -1324,13 +1745,9 @@ ANALYSIS_HTML_TEMPLATE = """
                 data: {
                     labels: rawRows.map(r => r.strike),
                     datasets: [
-                        // Left Bar = PE (Green)
                         { type: 'bar', label: 'Puts (PE)', data: [], backgroundColor: 'rgba(34, 197, 94, 0.85)', borderColor: '#22c55e', borderWidth: 1 },
-                        // Right Bar = CE (Red)
                         { type: 'bar', label: 'Calls (CE)', data: [], backgroundColor: 'rgba(239, 68, 68, 0.85)', borderColor: '#ef4444', borderWidth: 1 },
-                        // PE Trend = Light Green
                         { type: 'line', label: 'PE Trend', data: [], borderColor: '#4ade80', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, fill: false },
-                        // CE Trend = Light Red
                         { type: 'line', label: 'CE Trend', data: [], borderColor: '#f87171', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, fill: false }
                     ]
                 },
@@ -1408,24 +1825,20 @@ ANALYSIS_HTML_TEMPLATE = """
 
             myChart.data.labels = strikes;
             
-            // Left Bar: Put (PE) - Green
             myChart.data.datasets[0].label = peLabel;
             myChart.data.datasets[0].data = peData;
             myChart.data.datasets[0].backgroundColor = peColor;
             myChart.data.datasets[0].borderColor = '#22c55e';
 
-            // Right Bar: Call (CE) - Red
             myChart.data.datasets[1].label = ceLabel;
             myChart.data.datasets[1].data = ceData;
             myChart.data.datasets[1].backgroundColor = ceColor;
             myChart.data.datasets[1].borderColor = '#ef4444';
 
-            // PE Trend - Light Green
             myChart.data.datasets[2].label = `${peLabel} Trend`;
             myChart.data.datasets[2].data = computeLinearTrend(peData);
             myChart.data.datasets[2].borderColor = '#4ade80';
 
-            // CE Trend - Light Red
             myChart.data.datasets[3].label = `${ceLabel} Trend`;
             myChart.data.datasets[3].data = computeLinearTrend(ceData);
             myChart.data.datasets[3].borderColor = '#f87171';
@@ -1517,9 +1930,114 @@ POSITIONS_HTML_TEMPLATE = """
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #0b1329; color: #f8fafc; }
         h2 { color: #38bdf8; margin-bottom: 5px; }
-        .subtitle { color: #94a3b8; font-size: 13px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }
+        .subtitle { color: #94a3b8; font-size: 13px; margin-bottom: 18px; display: flex; justify-content: space-between; align-items: center; }
         .timer-badge { background: #0284c7; color: #ffffff; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
         
+        /* TOP MANUAL/AUTO CONDITION BAR */
+        .condition-bar {
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 10px;
+            padding: 14px 18px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        .badge-mode-auto { background: #065f46; color: #34d399; padding: 5px 12px; border-radius: 6px; font-weight: bold; font-size: 13px; border: 1px solid #10b981; }
+        .badge-mode-manual { background: #78350f; color: #fbbf24; padding: 5px 12px; border-radius: 6px; font-weight: bold; font-size: 13px; border: 1px solid #f59e0b; }
+        .badge-want-yes { background: #1e3a8a; color: #60a5fa; padding: 5px 10px; border-radius: 6px; font-weight: bold; font-size: 12px; }
+        .badge-want-no { background: #334155; color: #94a3b8; padding: 5px 10px; border-radius: 6px; font-weight: bold; font-size: 12px; }
+
+        /* MANUAL ORDER APPROVAL PANEL */
+        .order-approval-box {
+            background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+            border: 2px solid #f59e0b;
+            border-radius: 12px;
+            padding: 18px 22px;
+            margin-bottom: 24px;
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.4);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+        .order-details-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+            gap: 12px;
+            flex: 1;
+            min-width: 300px;
+        }
+        .order-field {
+            background: #0f172a;
+            padding: 8px 12px;
+            border-radius: 6px;
+            border: 1px solid #334155;
+        }
+        .order-field-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; font-weight: 600; }
+        .order-field-val { font-size: 14px; font-weight: bold; color: #f8fafc; margin-top: 2px; }
+        
+        .order-actions-corner {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            min-width: 150px;
+            align-items: stretch;
+        }
+        .btn-place-order {
+            background-color: #22c55e;
+            color: #052e16;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 8px;
+            font-weight: 800;
+            font-size: 14px;
+            cursor: pointer;
+            text-align: center;
+            transition: opacity 0.2s;
+        }
+        .btn-place-order:hover { opacity: 0.9; }
+        .btn-place-order:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-cancel-order {
+            background-color: #ef4444;
+            color: #ffffff;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-weight: 700;
+            font-size: 13px;
+            cursor: pointer;
+            text-align: center;
+            transition: opacity 0.2s;
+        }
+        .btn-cancel-order:hover { opacity: 0.9; }
+        .btn-reset-preview {
+            background-color: #334155;
+            color: #e2e8f0;
+            border: 1px solid #475569;
+            padding: 5px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .toast-banner {
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin-bottom: 18px;
+            font-weight: 600;
+            font-size: 13px;
+            display: none;
+        }
+        .toast-success { background: #064e3b; color: #6ee7b7; border: 1px solid #10b981; }
+        .toast-error { background: #450a0a; color: #fca5a5; border: 1px solid #ef4444; }
+        .toast-info { background: #1e3a8a; color: #93c5fd; border: 1px solid #3b82f6; }
+
         .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 18px; margin-bottom: 25px; }
         .card { background: #1e293b; padding: 18px; border-radius: 10px; border-left: 5px solid #3b82f6; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
         .card-title { font-size: 12px; color: #94a3b8; text-transform: uppercase; font-weight: bold; margin-bottom: 6px; }
@@ -1544,8 +2062,79 @@ POSITIONS_HTML_TEMPLATE = """
 <body>
     <h2>🔐 Private Live Trade & Positions Dashboard</h2>
     <div class="subtitle">
-        <span>Real-time Upstox Portfolio & Executed Order Log — Background Auto-Sync</span>
+        <span>Real-time Upstox Portfolio, Automated Google Sheet Order Engine & Executed Log</span>
         <span class="timer-badge" id="syncBadge">Auto Sync: <span id="countdown">10</span>s</span>
+    </div>
+
+    <!-- TOP MANUAL ORDER CONDITION BAR (B16) -->
+    <div class="condition-bar">
+        <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+            <span style="font-weight: bold; color: #e2e8f0; font-size: 14px;">Manual Order Condition (B16):</span>
+            <span id="badgeManualCondition" class="badge-mode-manual">LOADING...</span>
+            <span id="badgeWantToTrade" class="badge-want-no">Want to Trade (B17): -</span>
+            <span id="badgeMaxInvest" style="color: #94a3b8; font-size: 13px; font-weight: 600;">Max Invest (B18): -</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px;">
+            <span id="engineStatusText" style="font-size: 13px; color: #38bdf8; font-weight: 600;">Checking DASHBOARD sheet...</span>
+            <button id="btnResetPreview" class="btn-reset-preview" style="display: none;" onclick="resetCancelledPreview()">🔄 Reload Cancelled Order</button>
+        </div>
+    </div>
+
+    <!-- EXECUTION RESULT / NOTIFICATION BANNER -->
+    <div id="orderToastBanner" class="toast-banner"></div>
+
+    <!-- MANUAL ORDER APPROVAL PANEL (SHOWN WHEN B16 = MANUAL AND B17 = YES) -->
+    <div id="manualOrderPanel" class="order-approval-box" style="display: none;">
+        <div style="flex: 1;">
+            <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap;">
+                <span style="font-size: 16px; font-weight: 800; color: #fbbf24;">📋 Pending Manual Order Approval (DASHBOARD B16:B27)</span>
+                <span id="manualDuplicateBadge" style="display: none; background: #7f1d1d; color: #fca5a5; padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: bold;">⚠️ Duplicate / Existing Trade Active Today</span>
+            </div>
+            <div class="order-details-grid">
+                <div class="order-field">
+                    <div class="order-field-label">Symbol & Type</div>
+                    <div class="order-field-val" id="moSymbolType">-</div>
+                </div>
+                <div class="order-field">
+                    <div class="order-field-label">Expiry (Month → Date)</div>
+                    <div class="order-field-val" id="moExpiry">-</div>
+                </div>
+                <div class="order-field">
+                    <div class="order-field-label">Strike Price</div>
+                    <div class="order-field-val" id="moStrike">-</div>
+                </div>
+                <div class="order-field">
+                    <div class="order-field-label">Action & Qty</div>
+                    <div class="order-field-val" id="moActionQty">-</div>
+                </div>
+                <div class="order-field">
+                    <div class="order-field-label">Product Mode</div>
+                    <div class="order-field-val" id="moProduct">-</div>
+                </div>
+                <div class="order-field">
+                    <div class="order-field-label">Live Limit Price (LTP)</div>
+                    <div class="order-field-val" style="color: #38bdf8;" id="moEntryPrice">-</div>
+                </div>
+                <div class="order-field">
+                    <div class="order-field-label">Total Investment</div>
+                    <div class="order-field-val" style="color: #facc15;" id="moTotalInvest">-</div>
+                </div>
+                <div class="order-field">
+                    <div class="order-field-label">Stop Loss (B26)</div>
+                    <div class="order-field-val" style="color: #f87171;" id="moStopLoss">-</div>
+                </div>
+                <div class="order-field">
+                    <div class="order-field-label">Profit Target (B27)</div>
+                    <div class="order-field-val" style="color: #4ade80;" id="moTarget">-</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- FAR RIGHT CORNER ACTION BUTTONS -->
+        <div class="order-actions-corner">
+            <button id="btnPlaceOrder" class="btn-place-order" onclick="executeManualOrder()">✅ Place Order</button>
+            <button id="btnCancelOrder" class="btn-cancel-order" onclick="cancelManualOrder()">❌ Cancel</button>
+        </div>
     </div>
 
     <div id="errorContainer" class="error-msg" style="display: none;"></div>
@@ -1609,6 +2198,14 @@ POSITIONS_HTML_TEMPLATE = """
     <script>
         let timerSeconds = 10;
         let isSyncing = false;
+        let latestEvaluatedOrder = null;
+
+        function showToast(msg, type = 'info') {
+            const banner = document.getElementById("orderToastBanner");
+            banner.className = "toast-banner toast-" + type;
+            banner.innerText = msg;
+            banner.style.display = "block";
+        }
 
         function updateCardPnl(elementId, cardId, value) {
             const el = document.getElementById(elementId);
@@ -1624,6 +2221,127 @@ POSITIONS_HTML_TEMPLATE = """
             }
         }
 
+        function renderOrderEngineState(orderState) {
+            if (!orderState) return;
+
+            const modeBadge = document.getElementById("badgeManualCondition");
+            const wantBadge = document.getElementById("badgeWantToTrade");
+            const investBadge = document.getElementById("badgeMaxInvest");
+            const statusText = document.getElementById("engineStatusText");
+            const manualPanel = document.getElementById("manualOrderPanel");
+            const resetBtn = document.getElementById("btnResetPreview");
+
+            const mode = orderState.manual_order || "Manual";
+            modeBadge.innerText = mode.toUpperCase();
+            modeBadge.className = (mode.toLowerCase() === "auto") ? "badge-mode-auto" : "badge-mode-manual";
+
+            const want = orderState.want_to_trade || "NO";
+            wantBadge.innerText = `Want to Trade (B17): ${want}`;
+            wantBadge.className = (want === "YES") ? "badge-want-yes" : "badge-want-no";
+
+            const maxInv = orderState.amount_to_invest || 0;
+            investBadge.innerText = `Max Invest (B18): ₹${Number(maxInv).toLocaleString('en-IN')}`;
+            statusText.innerText = orderState.status_message || "";
+
+            if (orderState.auto_execution_notice) {
+                showToast(orderState.auto_execution_notice, orderState.auto_execution_ok ? "success" : "error");
+            }
+
+            if (orderState.is_cancelled) {
+                resetBtn.style.display = "inline-block";
+            } else {
+                resetBtn.style.display = "none";
+            }
+
+            if (orderState.show_manual_panel && orderState.evaluated_order) {
+                const ev = orderState.evaluated_order;
+                latestEvaluatedOrder = ev;
+                manualPanel.style.display = "flex";
+
+                document.getElementById("moSymbolType").innerText = `${ev.symbol} (${ev.option_type})`;
+                document.getElementById("moExpiry").innerText = `${ev.expiry_month} → ${ev.expiry_date}`;
+                
+                if (ev.strike_adjusted) {
+                    document.getElementById("moStrike").innerHTML = `${ev.selected_strike} <span style="color:#fbbf24; font-size:11px;">(Req: ${ev.requested_strike})</span>`;
+                } else {
+                    document.getElementById("moStrike").innerText = `${ev.selected_strike}`;
+                }
+
+                document.getElementById("moActionQty").innerText = `${ev.transaction_type} | Qty: ${ev.quantity}`;
+                document.getElementById("moProduct").innerText = ev.product_label;
+                document.getElementById("moEntryPrice").innerText = `₹ ${ev.entry_price}`;
+                document.getElementById("moTotalInvest").innerText = `₹ ${Number(ev.total_investment).toLocaleString('en-IN')}`;
+                
+                document.getElementById("moStopLoss").innerText = (ev.sl_price !== null && ev.sl_price !== undefined)
+                    ? `₹ ${ev.sl_price} (${ev.sl_percent}%)`
+                    : "Blank (Self-Monitor)";
+                
+                document.getElementById("moTarget").innerText = (ev.target_price !== null && ev.target_price !== undefined)
+                    ? `₹ ${ev.target_price} (${ev.target_percent}%)`
+                    : "Blank (Self-Monitor)";
+
+                const dupBadge = document.getElementById("manualDuplicateBadge");
+                dupBadge.style.display = orderState.duplicate_exists ? "inline-block" : "none";
+            } else {
+                manualPanel.style.display = "none";
+            }
+        }
+
+        function executeManualOrder() {
+            const btn = document.getElementById("btnPlaceOrder");
+            btn.disabled = true;
+            btn.innerText = "Placing Order...";
+
+            fetch('/api/manual_order_action', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'PLACE', evaluated_order: latestEvaluatedOrder })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    showToast("✅ " + data.message, "success");
+                } else {
+                    showToast("❌ " + data.message, "error");
+                }
+                fetchPositionsInBackground();
+            })
+            .catch(err => {
+                showToast("❌ Order Request Failed: " + err, "error");
+            })
+            .finally(() => {
+                btn.disabled = false;
+                btn.innerText = "✅ Place Order";
+            });
+        }
+
+        function cancelManualOrder() {
+            fetch('/api/manual_order_action', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'CANCEL', signature: latestEvaluatedOrder ? latestEvaluatedOrder.signature : "" })
+            })
+            .then(res => res.json())
+            .then(data => {
+                showToast("🚫 " + data.message, "info");
+                document.getElementById("manualOrderPanel").style.display = "none";
+                fetchPositionsInBackground();
+            })
+            .catch(err => console.error("Cancel error:", err));
+        }
+
+        function resetCancelledPreview() {
+            fetch('/api/manual_order_action', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'RESET' })
+            })
+            .then(res => res.json())
+            .then(() => {
+                fetchPositionsInBackground();
+            });
+        }
+
         function fetchPositionsInBackground() {
             isSyncing = true;
             document.getElementById("syncBadge").innerText = "Syncing...";
@@ -1637,6 +2355,10 @@ POSITIONS_HTML_TEMPLATE = """
                         errEl.innerText = "Error Fetching Positions: " + data.error;
                     } else {
                         errEl.style.display = "none";
+                    }
+
+                    if (data.order_engine) {
+                        renderOrderEngineState(data.order_engine);
                     }
 
                     updateCardPnl("valTotalPnl", "cardTotalPnlBox", data.total_pnl);
@@ -1719,16 +2441,118 @@ POSITIONS_HTML_TEMPLATE = """
 def health():
     return "OK", 200
 
+@app.route("/api/manual_order_action", methods=["POST"])
+def api_manual_order_action():
+    """Handles Place Order, Cancel, or Reset from /Live_Trade_Position when B16 = Manual."""
+    data = request.get_json(silent=True) or {}
+    action = str(data.get("action", "")).upper()
+
+    with ORDER_EXECUTION_LOCK:
+        state = load_auto_order_state()
+
+        if action == "CANCEL":
+            sig = data.get("signature", "")
+            if sig and sig not in state.get("cancelled_signatures", []):
+                state.setdefault("cancelled_signatures", []).append(sig)
+            save_auto_order_state(state)
+            return jsonify({"success": True, "message": "Manual order preview cancelled."})
+
+        if action == "RESET":
+            state["cancelled_signatures"] = []
+            save_auto_order_state(state)
+            return jsonify({"success": True, "message": "Cancelled state cleared."})
+
+        if action == "PLACE":
+            # Re-evaluate fresh from DASHBOARD sheet (or use provided payload) to ensure fresh LTP
+            cfg, cfg_err = fetch_dashboard_order_config()
+            if cfg_err or not cfg:
+                return jsonify({"success": False, "message": cfg_err or "Could not read DASHBOARD sheet."})
+
+            evaluated, eval_err = prepare_evaluated_order(cfg)
+            if eval_err or not evaluated:
+                return jsonify({"success": False, "message": eval_err or "Order evaluation failed."})
+
+            # In Manual mode, user explicitly allows multiple/duplicate orders
+            ok, msg = submit_upstox_evaluated_order(evaluated)
+            return jsonify({"success": ok, "message": msg, "evaluated_order": evaluated})
+
+    return jsonify({"success": False, "message": "Invalid action."})
+
 @app.route("/api/positions")
 def api_positions():
-    """Background API route fetching live Upstox positions and order log."""
+    """Background API route fetching live Upstox positions, order log, and DASHBOARD order engine."""
     positions, orders, total_pnl, realised_pnl, unrealised_pnl, error = fetch_upstox_positions()
+
+    order_engine_payload = {
+        "manual_order": "Manual",
+        "want_to_trade": "NO",
+        "amount_to_invest": 0,
+        "status_message": "Initializing...",
+        "show_manual_panel": False,
+        "evaluated_order": None,
+        "duplicate_exists": False,
+        "is_cancelled": False,
+        "auto_execution_notice": None,
+        "auto_execution_ok": False
+    }
+
+    with ORDER_EXECUTION_LOCK:
+        cfg, cfg_err = fetch_dashboard_order_config()
+        if cfg_err or not cfg:
+            order_engine_payload["status_message"] = cfg_err or "Unable to read DASHBOARD sheet."
+        else:
+            order_engine_payload["manual_order"] = cfg["manual_order"]
+            order_engine_payload["want_to_trade"] = cfg["want_to_trade"]
+            order_engine_payload["amount_to_invest"] = cfg["amount_to_invest"]
+
+            if cfg["want_to_trade"] != "YES":
+                order_engine_payload["status_message"] = "Trade Avoided — Want to Trade (B17) is not YES."
+            else:
+                evaluated, eval_err = prepare_evaluated_order(cfg)
+                if eval_err or not evaluated:
+                    order_engine_payload["status_message"] = eval_err or "Order evaluation skipped."
+                else:
+                    order_engine_payload["evaluated_order"] = evaluated
+                    dup_found, dup_reason = check_existing_symbol_trade(cfg["symbol"], positions, orders)
+                    order_engine_payload["duplicate_exists"] = dup_found
+
+                    state = load_auto_order_state()
+
+                    if cfg["manual_order"].lower() == "auto":
+                        # AUTO MODE: Strict single-order-per-day & no-duplicate guard
+                        already_auto_traded = cfg["symbol"] in state.get("executed_symbols", {})
+                        if dup_found or already_auto_traded:
+                            reason = dup_reason if dup_found else f"Auto order already executed today for {cfg['symbol']}."
+                            order_engine_payload["status_message"] = f"Skipped (Single Trade/Day Guard): {reason}"
+                        else:
+                            ok, exec_msg = submit_upstox_evaluated_order(evaluated)
+                            state.setdefault("executed_symbols", {})[cfg["symbol"]] = {
+                                "time": get_ist_today_str(),
+                                "success": ok,
+                                "message": exec_msg
+                            }
+                            save_auto_order_state(state)
+                            order_engine_payload["status_message"] = f"Auto Mode Executed: {exec_msg}"
+                            order_engine_payload["auto_execution_notice"] = f"AUTO ORDER: {exec_msg}"
+                            order_engine_payload["auto_execution_ok"] = ok
+                    else:
+                        # MANUAL MODE: Show approval panel with Place Order & Cancel buttons
+                        is_cancelled = evaluated["signature"] in state.get("cancelled_signatures", [])
+                        order_engine_payload["is_cancelled"] = is_cancelled
+                        if is_cancelled:
+                            order_engine_payload["show_manual_panel"] = False
+                            order_engine_payload["status_message"] = "Manual Order Cancelled by User (Click Reload to restore)."
+                        else:
+                            order_engine_payload["show_manual_panel"] = True
+                            order_engine_payload["status_message"] = f"Awaiting Manual Approval for {evaluated['symbol']} {evaluated['selected_strike']} {evaluated['option_type']} @ ₹{evaluated['entry_price']}"
+
     return jsonify({
         "positions": positions,
         "orders": orders,
         "total_pnl": total_pnl,
         "realised_pnl": realised_pnl,
         "unrealised_pnl": unrealised_pnl,
+        "order_engine": order_engine_payload,
         "error": error
     })
 
