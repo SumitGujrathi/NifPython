@@ -22,6 +22,7 @@ REDIRECT_URI = os.getenv("UPSTOX_REDIRECT_URI", "http://127.0.0.1:5000/")
 USER_ID = os.getenv("UPSTOX_USER_ID")
 PIN = os.getenv("UPSTOX_PIN")
 TOTP_KEY = os.getenv("UPSTOX_TOTP_KEY")
+ENV_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1fpXdodshvwHcduwffOhEK54K-a7a4TmOZF2Q-EgVRzM")
 
 SESSION_FILE_PATH = "/tmp/upstox_session.json"
@@ -39,6 +40,19 @@ AUTH_COOLDOWN = {
     "cooldown_duration": 1500  # 25 minutes safety lockout
 }
 
+def get_upstox_proxies():
+    """Returns proxy dict if STATIC_IP_PROXY_URL or QUOTAGUARDSHIELD_URL is set."""
+    proxy_url = (
+        os.getenv("STATIC_IP_PROXY_URL")
+        or os.getenv("QUOTAGUARDSHIELD_URL")
+        or os.getenv("HTTPS_PROXY")
+        or os.getenv("HTTP_PROXY")
+    )
+    if proxy_url and proxy_url.strip():
+        clean_proxy = proxy_url.strip()
+        return {"http": clean_proxy, "https": clean_proxy}
+    return None
+
 # --- PERSISTENT SESSION MANAGEMENT ---
 def load_session_token():
     try:
@@ -49,6 +63,9 @@ def load_session_token():
                     return data.get("access_token")
     except Exception as e:
         print(f"[Session Warning] Failed to read session token: {e}")
+
+    if ENV_ACCESS_TOKEN and ENV_ACCESS_TOKEN.strip():
+        return ENV_ACCESS_TOKEN.strip()
     return None
 
 def save_session_token(token):
@@ -68,11 +85,12 @@ def invalidate_session():
         except Exception:
             pass
 
-def perform_single_auth():
+def perform_single_auth(force_refresh=False):
     with AUTH_THREAD_LOCK:
-        existing_token = load_session_token()
-        if existing_token:
-            return existing_token
+        if not force_refresh:
+            existing_token = load_session_token()
+            if existing_token:
+                return existing_token
 
         current_time = time.time()
         if current_time - AUTH_COOLDOWN["last_failure_time"] < AUTH_COOLDOWN["cooldown_duration"]:
@@ -81,6 +99,8 @@ def perform_single_auth():
             return None
 
         if not all([CLIENT_ID, USER_ID, PIN, TOTP_KEY]):
+            if ENV_ACCESS_TOKEN and ENV_ACCESS_TOKEN.strip():
+                return ENV_ACCESS_TOKEN.strip()
             print("[Auth Error] Missing required Upstox Environment Variables!")
             return None
 
@@ -102,7 +122,7 @@ def perform_single_auth():
             }
 
             print("[Session Auth Attempt] Executing single TOTP login request...")
-            res = requests.post(totp_url, json=payload, headers=headers, timeout=10)
+            res = requests.post(totp_url, json=payload, headers=headers, proxies=get_upstox_proxies(), timeout=10)
 
             if res.status_code == 200:
                 json_data = res.json()
@@ -125,6 +145,121 @@ def get_valid_token():
     if token:
         return token
     return perform_single_auth()
+
+# --- STATIC IP DETECTION & UPSTOX WHITELIST MANAGEMENT ---
+def get_current_outbound_ip():
+    """Fetches the exact outbound IPv4 address seen by external servers (respecting proxy if set)."""
+    proxies = get_upstox_proxies()
+    for url in ("https://api.ipify.org?format=json", "https://ifconfig.me/ip"):
+        try:
+            res = requests.get(url, proxies=proxies, timeout=6)
+            if res.status_code == 200:
+                if "ipify" in url:
+                    return res.json().get("ip", "").strip()
+                return res.text.strip()
+        except Exception:
+            continue
+    return ""
+
+def fetch_upstox_static_ip_status():
+    """Checks server outbound IP against Upstox registered Primary/Secondary Static IPs."""
+    outbound_ip = get_current_outbound_ip()
+    proxy_active = bool(get_upstox_proxies())
+
+    token = get_valid_token()
+    if not token:
+        return {
+            "outbound_ip": outbound_ip,
+            "proxy_active": proxy_active,
+            "primary_ip": None,
+            "secondary_ip": None,
+            "is_matched": False,
+            "error": "Upstox access token unavailable."
+        }
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+    try:
+        res = requests.get("https://api.upstox.com/v2/user/ip", headers=headers, proxies=get_upstox_proxies(), timeout=8)
+        if res.status_code == 200:
+            data = res.json().get("data", {}) or {}
+            p_ip = data.get("primary_ip") or ""
+            s_ip = data.get("secondary_ip") or ""
+            matched = bool(outbound_ip and outbound_ip in (p_ip, s_ip))
+            return {
+                "outbound_ip": outbound_ip,
+                "proxy_active": proxy_active,
+                "primary_ip": p_ip,
+                "secondary_ip": s_ip,
+                "primary_ip_updated_at": data.get("primary_ip_updated_at"),
+                "is_matched": matched,
+                "error": None
+            }
+        else:
+            resp_json = res.json() if res.content else {}
+            err_msg = resp_json.get("errors", [{}])[0].get("message") if isinstance(resp_json.get("errors"), list) and resp_json.get("errors") else res.text
+            return {
+                "outbound_ip": outbound_ip,
+                "proxy_active": proxy_active,
+                "primary_ip": None,
+                "secondary_ip": None,
+                "is_matched": False,
+                "error": f"HTTP {res.status_code}: {err_msg}"
+            }
+    except Exception as e:
+        return {
+            "outbound_ip": outbound_ip,
+            "proxy_active": proxy_active,
+            "primary_ip": None,
+            "secondary_ip": None,
+            "is_matched": False,
+            "error": str(e)
+        }
+
+def update_upstox_static_ip(primary_ip, secondary_ip=None):
+    """Registers Primary (and optional Secondary) Static IP via Upstox PUT /v2/user/ip and refreshes session."""
+    token = get_valid_token()
+    if not token:
+        return False, "Upstox access token unavailable."
+
+    clean_primary = str(primary_ip or "").strip()
+    clean_secondary = str(secondary_ip or "").strip()
+
+    if not clean_primary:
+        return False, "Primary IP is required."
+
+    payload = {"primary_ip": clean_primary}
+    if clean_secondary and clean_secondary != clean_primary:
+        payload["secondary_ip"] = clean_secondary
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+    try:
+        res = requests.put(
+            "https://api.upstox.com/v2/user/ip",
+            json=payload,
+            headers=headers,
+            proxies=get_upstox_proxies(),
+            timeout=10
+        )
+        resp_json = res.json() if res.content else {}
+        if res.status_code == 200 and resp_json.get("status") == "success":
+            # Upstox invalidates active tokens upon Static IP update; re-auth immediately via TOTP
+            invalidate_session()
+            new_token = perform_single_auth(force_refresh=True)
+            reauth_note = "Session automatically refreshed via TOTP." if new_token else "Please update UPSTOX_ACCESS_TOKEN or re-authenticate."
+            return True, f"Static IP Registered ({clean_primary})! {reauth_note}"
+        else:
+            err_msg = resp_json.get("errors", [{}])[0].get("message") if isinstance(resp_json.get("errors"), list) and resp_json.get("errors") else res.text
+            return False, f"Upstox Rejected Static IP Update ({res.status_code}): {err_msg}"
+    except Exception as e:
+        return False, f"Static IP Update Exception: {e}"
 
 # --- DASHBOARD SHEET ORDER CONFIGURATION & EXECUTION ENGINE ---
 def get_ist_now():
@@ -198,7 +333,6 @@ def fetch_dashboard_order_config():
         lines = [line.lstrip('\ufeff') for line in raw_csv.splitlines() if line.strip()]
         grid = list(csv.reader(io.StringIO("\n".join(lines))))
 
-        # Strategy 1: Scan every cell in the grid for label matches and grab the value immediately to its right
         label_values = {}
         for r_idx, row in enumerate(grid):
             for c_idx, cell in enumerate(row):
@@ -208,7 +342,6 @@ def fetch_dashboard_order_config():
                     if norm_key not in label_values or val != "":
                         label_values[norm_key] = val
 
-        # Strategy 2: Positional fallback for B16:B27 (both 12-row range slice and full sheet)
         def get_b_cell(row_num_1based, rel_idx_16):
             if len(grid) == 12 and rel_idx_16 < 12 and len(grid[rel_idx_16]) >= 2:
                 val = str(grid[rel_idx_16][1]).strip()
@@ -449,7 +582,7 @@ def prepare_evaluated_order(cfg):
     return evaluated, None
 
 def submit_upstox_evaluated_order(evaluated_order):
-    """Places either a GTT Multi-Leg order (when SL or Target exists) or a standard Limit order."""
+    """Places either a GTT Multi-Leg order (when SL or Target exists) or a standard Limit order via static IP/proxy."""
     token = get_valid_token()
     if not token:
         return False, "Authentication token missing or paused."
@@ -459,6 +592,7 @@ def submit_upstox_evaluated_order(evaluated_order):
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}"
     }
+    proxies = get_upstox_proxies()
 
     sl_price = evaluated_order.get("sl_price")
     target_price = evaluated_order.get("target_price")
@@ -499,7 +633,7 @@ def submit_upstox_evaluated_order(evaluated_order):
                 "transaction_type": txn_type
             }
             url = "https://api.upstox.com/v3/order/gtt/place"
-            res = requests.post(url, json=payload, headers=headers, timeout=12)
+            res = requests.post(url, json=payload, headers=headers, proxies=proxies, timeout=12)
             resp_json = res.json() if res.content else {}
 
             if res.status_code == 200 and resp_json.get("status") == "success":
@@ -507,6 +641,9 @@ def submit_upstox_evaluated_order(evaluated_order):
                 return True, f"GTT Multi-Leg Order Placed! ID(s): {', '.join(gtt_ids) if gtt_ids else 'Confirmed'} | Entry: ₹{entry_price} | SL: {sl_price or 'Blank'} | Target: {target_price or 'Blank'}"
             else:
                 err_detail = resp_json.get("errors", [{}])[0].get("message") if isinstance(resp_json.get("errors"), list) and resp_json.get("errors") else res.text
+                if res.status_code == 403 and "static IP" in err_detail:
+                    cur_ip = get_current_outbound_ip()
+                    return False, f"Upstox Static IP Block (403): Outbound IP '{cur_ip}' is not registered. Click 'Register Server IP' above or configure STATIC_IP_PROXY_URL."
                 return False, f"Upstox GTT Order Rejected ({res.status_code}): {err_detail}"
 
         else:
@@ -523,15 +660,19 @@ def submit_upstox_evaluated_order(evaluated_order):
                 "trigger_price": 0,
                 "is_amo": False
             }
-            url = "https://api.upstox.com/v2/order/place"
-            res = requests.post(url, json=payload, headers=headers, timeout=12)
+            url = "https://api-hft.upstox.com/v3/order/place"
+            res = requests.post(url, json=payload, headers=headers, proxies=proxies, timeout=12)
             resp_json = res.json() if res.content else {}
 
             if res.status_code == 200 and resp_json.get("status") == "success":
-                order_id = resp_json.get("data", {}).get("order_id", "Confirmed")
+                order_ids = resp_json.get("data", {}).get("order_ids", [])
+                order_id = order_ids[0] if order_ids else resp_json.get("data", {}).get("order_id", "Confirmed")
                 return True, f"Limit Order Placed! Order ID: {order_id} | Entry: ₹{entry_price} | SL & Target: Blank (Self-Monitored)"
             else:
                 err_detail = resp_json.get("errors", [{}])[0].get("message") if isinstance(resp_json.get("errors"), list) and resp_json.get("errors") else res.text
+                if res.status_code == 403 and "static IP" in err_detail:
+                    cur_ip = get_current_outbound_ip()
+                    return False, f"Upstox Static IP Block (403): Outbound IP '{cur_ip}' is not registered. Click 'Register Server IP' above or configure STATIC_IP_PROXY_URL."
                 return False, f"Upstox Limit Order Rejected ({res.status_code}): {err_detail}"
 
     except Exception as e:
@@ -743,7 +884,7 @@ def fetch_upstox_positions():
 
         if pos_res.status_code == 401:
             invalidate_session()
-            token = perform_single_auth()
+            token = perform_single_auth(force_refresh=True)
             if not token:
                 return [], [], 0.0, 0.0, 0.0, "Session expired."
             headers["Authorization"] = f"Bearer {token}"
@@ -833,7 +974,7 @@ def fetch_option_chain(symbol, selected_expiry="ALL"):
 
         if exp_res.status_code == 401:
             invalidate_session()
-            token = perform_single_auth()
+            token = perform_single_auth(force_refresh=True)
             if not token:
                 return None, None, [], "Session expired and re-authentication paused."
             headers["Authorization"] = f"Bearer {token}"
@@ -1802,6 +1943,35 @@ POSITIONS_HTML_TEMPLATE = """
         .subtitle { color: #94a3b8; font-size: 13px; margin-bottom: 18px; display: flex; justify-content: space-between; align-items: center; }
         .timer-badge { background: #0284c7; color: #ffffff; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
         
+        /* STATIC IP WHITELIST BAR */
+        .static-ip-bar {
+            background: #131c31;
+            border: 1px solid #334155;
+            border-radius: 10px;
+            padding: 12px 18px;
+            margin-bottom: 14px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        .ip-chip { background: #0f172a; border: 1px solid #334155; padding: 4px 10px; border-radius: 6px; font-family: monospace; font-size: 13px; color: #38bdf8; }
+        .ip-ok { color: #34d399; font-weight: bold; font-size: 12px; }
+        .ip-warn { color: #fbbf24; font-weight: bold; font-size: 12px; }
+        .btn-register-ip {
+            background-color: #2563eb;
+            color: #ffffff;
+            border: none;
+            padding: 7px 14px;
+            border-radius: 6px;
+            font-weight: 700;
+            font-size: 12px;
+            cursor: pointer;
+        }
+        .btn-register-ip:hover { opacity: 0.9; }
+        .btn-register-ip:disabled { opacity: 0.5; cursor: not-allowed; }
+
         /* TOP MANUAL/AUTO CONDITION BAR */
         .condition-bar {
             background: #1e293b;
@@ -1933,6 +2103,21 @@ POSITIONS_HTML_TEMPLATE = """
     <div class="subtitle">
         <span>Real-time Upstox Portfolio, Automated Google Sheet Order Engine & Executed Log</span>
         <span class="timer-badge" id="syncBadge">Auto Sync: <span id="countdown">10</span>s</span>
+    </div>
+
+    <!-- UPSTOX STATIC IP STATUS & WHITELIST BAR -->
+    <div class="static-ip-bar">
+        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+            <span style="font-weight: bold; color: #e2e8f0; font-size: 13px;">🌐 Upstox Static IP Check:</span>
+            <span style="font-size: 12px; color: #94a3b8;">Server Outbound IP:</span>
+            <span id="txtOutboundIp" class="ip-chip">Checking...</span>
+            <span style="font-size: 12px; color: #94a3b8;">Upstox Registered IP:</span>
+            <span id="txtRegisteredIp" class="ip-chip">Checking...</span>
+            <span id="txtIpMatchStatus" class="ip-warn">Verifying...</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+            <button id="btnRegisterServerIp" class="btn-register-ip" onclick="registerCurrentServerIp()">⚡ Register Server IP with Upstox</button>
+        </div>
     </div>
 
     <!-- TOP MANUAL ORDER CONDITION BAR (B16) -->
@@ -2069,12 +2254,71 @@ POSITIONS_HTML_TEMPLATE = """
         let timerSeconds = 10;
         let isSyncing = false;
         let latestEvaluatedOrder = null;
+        let detectedOutboundIp = "";
 
         function showToast(msg, type = 'info') {
             const banner = document.getElementById("orderToastBanner");
             banner.className = "toast-banner toast-" + type;
             banner.innerText = msg;
             banner.style.display = "block";
+        }
+
+        function checkStaticIpStatus() {
+            fetch('/api/static_ip?_t=' + Date.now(), { cache: 'no-store' })
+                .then(res => res.json())
+                .then(data => {
+                    detectedOutboundIp = data.outbound_ip || "";
+                    document.getElementById("txtOutboundIp").innerText = detectedOutboundIp || "Unknown";
+                    const regText = data.primary_ip ? (data.secondary_ip ? `${data.primary_ip} / ${data.secondary_ip}` : data.primary_ip) : "Not Configured";
+                    document.getElementById("txtRegisteredIp").innerText = regText;
+
+                    const statusEl = document.getElementById("txtIpMatchStatus");
+                    if (data.is_matched) {
+                        statusEl.className = "ip-ok";
+                        statusEl.innerText = "✅ Static IP Matched (Orders Enabled)";
+                    } else if (data.error) {
+                        statusEl.className = "ip-warn";
+                        statusEl.innerText = "⚠️ " + data.error;
+                    } else {
+                        statusEl.className = "ip-warn";
+                        statusEl.innerText = "⚠️ IP Mismatch — Click Register Server IP (1 change/week limit)";
+                    }
+                })
+                .catch(err => console.error("Static IP check error:", err));
+        }
+
+        function registerCurrentServerIp() {
+            if (!detectedOutboundIp) {
+                showToast("❌ Server outbound IP could not be detected yet.", "error");
+                return;
+            }
+            if (!confirm(`Register '${detectedOutboundIp}' as your Upstox Primary Static IP?\\n\\nNote: Upstox allows changing Static IP only once per calendar week.`)) {
+                return;
+            }
+            const btn = document.getElementById("btnRegisterServerIp");
+            btn.disabled = true;
+            btn.innerText = "Registering IP...";
+
+            fetch('/api/static_ip', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ primary_ip: detectedOutboundIp })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    showToast("✅ " + data.message, "success");
+                } else {
+                    showToast("❌ " + data.message, "error");
+                }
+                checkStaticIpStatus();
+                fetchPositionsInBackground();
+            })
+            .catch(err => showToast("❌ Request failed: " + err, "error"))
+            .finally(() => {
+                btn.disabled = false;
+                btn.innerText = "⚡ Register Server IP with Upstox";
+            });
         }
 
         function updateCardPnl(elementId, cardId, value) {
@@ -2303,6 +2547,7 @@ POSITIONS_HTML_TEMPLATE = """
             }, 1000);
         }
 
+        checkStaticIpStatus();
         fetchPositionsInBackground();
         startTimer();
     </script>
@@ -2314,6 +2559,21 @@ POSITIONS_HTML_TEMPLATE = """
 @app.route("/health")
 def health():
     return "OK", 200
+
+@app.route("/api/static_ip", methods=["GET", "POST"])
+def api_static_ip():
+    """GET checks outbound IP vs Upstox registered Static IP; POST registers Primary/Secondary Static IP."""
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        primary_ip = data.get("primary_ip") or get_current_outbound_ip()
+        secondary_ip = data.get("secondary_ip")
+        ok, msg = update_upstox_static_ip(primary_ip, secondary_ip)
+        return jsonify({"success": ok, "message": msg})
+
+    status = fetch_upstox_static_ip_status()
+    resp = jsonify(status)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
 
 @app.route("/api/manual_order_action", methods=["POST"])
 def api_manual_order_action():
