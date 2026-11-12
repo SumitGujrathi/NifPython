@@ -683,8 +683,8 @@ ANALYSIS_HTML_TEMPLATE = """
         .card-value { font-size: 22px; font-weight: bold; color: #f8fafc; }
         .sentiment-bar-container { background: #1e293b; border: 1px solid #334155; padding: 15px; border-radius: 10px; margin-bottom: 25px; }
         .gauge-flex { display: flex; height: 24px; border-radius: 12px; overflow: hidden; margin-top: 10px; }
-        .gauge-ce { background-color: #22c55e; height: 100%; transition: width 0.4s ease; }
-        .gauge-pe { background-color: #ef4444; height: 100%; transition: width 0.4s ease; }
+        .gauge-pe { background-color: #22c55e; height: 100%; transition: width 0.4s ease; }
+        .gauge-ce { background-color: #ef4444; height: 100%; transition: width 0.4s ease; }
         .chart-box { background: #1e293b; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); margin-bottom: 30px; position: relative; }
         .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px; }
         .chart-title { font-size: 18px; font-weight: bold; color: #f8fafc; }
@@ -714,8 +714,8 @@ ANALYSIS_HTML_TEMPLATE = """
         <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Bar Chart Metric:</label>
         <select id="metricSelector" onchange="updateChartMetric()">
             <option value="oi_chg" selected>Change in Open Interest (Chg in OI)</option>
-            <option value="depth_qty">1 - Order Book Depth Quantity (Call Ask Qty vs Put Bid Qty)</option>
-            <option value="oi">Open Interest (CE vs PE)</option>
+            <option value="depth_qty">1 - Order Book Depth Quantity (Put Bid Qty vs Call Ask Qty)</option>
+            <option value="oi">Open Interest (PE vs CE)</option>
             <option value="vol">Trading Volume</option>
             <option value="delta">Delta Exposure</option>
             <option value="theta">Theta Time Decay</option>
@@ -738,13 +738,13 @@ ANALYSIS_HTML_TEMPLATE = """
             <div class="card-title">Put-Call Ratio (PCR)</div>
             <div class="card-value" id="cardPcr">{{ pcr }}</div>
         </div>
-        <div class="card" style="border-left-color: #22c55e;">
-            <div class="card-title">Major Resistance (Max Call OI)</div>
-            <div class="card-value" id="maxCallStrike" style="color: #22c55e;">-</div>
-        </div>
         <div class="card" style="border-left-color: #ef4444;">
+            <div class="card-title">Major Resistance (Max Call OI)</div>
+            <div class="card-value" id="maxCallStrike" style="color: #ef4444;">-</div>
+        </div>
+        <div class="card" style="border-left-color: #22c55e;">
             <div class="card-title">Major Support (Max Put OI)</div>
-            <div class="card-value" id="maxPutStrike" style="color: #ef4444;">-</div>
+            <div class="card-value" id="maxPutStrike" style="color: #22c55e;">-</div>
         </div>
         <div class="card" style="border-left-color: #a855f7;">
             <div class="card-title">Last Updated (IST)</div>
@@ -752,25 +752,25 @@ ANALYSIS_HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- DYNAMIC METRIC SENTIMENT GAUGE -->
+    <!-- DYNAMIC METRIC SENTIMENT GAUGE (PE LEFT GREEN | CE RIGHT RED) -->
     <div class="sentiment-bar-container">
         <div style="display: flex; justify-content: space-between; font-weight: bold; margin-bottom: 8px;">
-            <span style="color: #22c55e;" id="gaugeCeLabel">CALL (CE) TOTAL: -</span>
+            <span style="color: #22c55e;" id="gaugePeLabel">PUT (PE) TOTAL: -</span>
             <span style="color: #38bdf8;" id="gaugeMetricName">SELECTED METRIC COMPARISON</span>
-            <span style="color: #ef4444;" id="gaugePeLabel">PUT (PE) TOTAL: -</span>
+            <span style="color: #ef4444;" id="gaugeCeLabel">CALL (CE) TOTAL: -</span>
         </div>
         <div class="gauge-flex">
-            <div id="gaugeCeBar" class="gauge-ce" style="width: 50%;"></div>
             <div id="gaugePeBar" class="gauge-pe" style="width: 50%;"></div>
+            <div id="gaugeCeBar" class="gauge-ce" style="width: 50%;"></div>
         </div>
         <div style="display: flex; justify-content: space-between; color: #94a3b8; font-size: 12px; margin-top: 6px;">
-            <span id="gaugeCeAvg">Call Avg: -</span>
-            <span id="gaugeRatioText">Ratio: 1.00</span>
             <span id="gaugePeAvg">Put Avg: -</span>
+            <span id="gaugeRatioText">Ratio: 1.00</span>
+            <span id="gaugeCeAvg">Call Avg: -</span>
         </div>
     </div>
 
-    <!-- CHART 1: STRIKE BAR CHART -->
+    <!-- CHART 1: STRIKE BAR CHART (PE LEFT GREEN | CE RIGHT RED) -->
     <div class="chart-box">
         <div class="chart-header">
             <div class="chart-title" id="chartHeaderTitle">Change in Open Interest (Chg in OI)</div>
@@ -787,7 +787,7 @@ ANALYSIS_HTML_TEMPLATE = """
             </div>
             <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
                 <label style="color: #94a3b8; font-weight: bold;">Head of Dropdown:</label>
-                <select id="historyMetricSelector" onchange="loadHistoricalChart()">
+                <select id="historyMetricSelector" onchange="loadHistoricalChart(true)">
                     <option value="price_pcr" selected>Price LTP / PCR</option>
                     <option value="oi">Open Interest (CE OI vs PE OI)</option>
                     <option value="oi_chg">Change OI (CE Chng OI vs PE Chng OI)</option>
@@ -803,7 +803,7 @@ ANALYSIS_HTML_TEMPLATE = """
                 </select>
 
                 <label style="color: #94a3b8; font-weight: bold; margin-left: 6px;">Data Day Range:</label>
-                <select id="historyDayRangeSelector" onchange="loadHistoricalChart()">
+                <select id="historyDayRangeSelector" onchange="loadHistoricalChart(true)">
                     <option value="1day" selected>1 Day</option>
                     <option value="3day">3 Day</option>
                     <option value="1week">1 Week</option>
@@ -813,7 +813,7 @@ ANALYSIS_HTML_TEMPLATE = """
                 </select>
 
                 <label style="color: #94a3b8; font-weight: bold; margin-left: 6px;">Interval:</label>
-                <select id="historyTimeframeSelector" onchange="loadHistoricalChart()">
+                <select id="historyTimeframeSelector" onchange="loadHistoricalChart(true)">
                     <option value="5minute" selected>5 Min</option>
                     <option value="15minute">15 Min</option>
                     <option value="30minute">30 Min</option>
@@ -835,7 +835,7 @@ ANALYSIS_HTML_TEMPLATE = """
             </div>
             <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
                 <label style="color: #94a3b8; font-weight: bold;">Data Day Range:</label>
-                <select id="signalDayRangeSelector" onchange="loadSignalChart()">
+                <select id="signalDayRangeSelector" onchange="loadSignalChart(true)">
                     <option value="1day" selected>1 Day</option>
                     <option value="3day">3 Day</option>
                     <option value="1week">1 Week</option>
@@ -845,7 +845,7 @@ ANALYSIS_HTML_TEMPLATE = """
                 </select>
 
                 <label style="color: #94a3b8; font-weight: bold; margin-left: 6px;">Interval:</label>
-                <select id="signalTimeframeSelector" onchange="loadSignalChart()">
+                <select id="signalTimeframeSelector" onchange="loadSignalChart(true)">
                     <option value="5minute" selected>5 Min</option>
                     <option value="15minute">15 Min</option>
                     <option value="30minute">30 Min</option>
@@ -864,6 +864,8 @@ ANALYSIS_HTML_TEMPLATE = """
         let myChart = null;
         let historyChartObj = null;
         let signalChartObj = null;
+        let hasHistoryData = false;
+        let hasSignalData = false;
 
         function switchSymbol(newSym) {
             currentSymbol = newSym;
@@ -908,7 +910,7 @@ ANALYSIS_HTML_TEMPLATE = """
                             if (sig && (sig.toUpperCase() === 'B' || sig.toUpperCase() === 'S')) {
                                 const { x, y } = element.tooltipPosition();
                                 ctx.save();
-                                ctx.fillStyle = '#ffffff'; // White label text
+                                ctx.fillStyle = '#ffffff';
                                 ctx.font = 'bold 13px Segoe UI';
                                 ctx.textAlign = 'center';
                                 ctx.textBaseline = 'bottom';
@@ -965,6 +967,19 @@ ANALYSIS_HTML_TEMPLATE = """
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
+                    animation: false,
+                    animations: {
+                        colors: false,
+                        x: false,
+                        y: false
+                    },
+                    transitions: {
+                        active: {
+                            animation: {
+                                duration: 0
+                            }
+                        }
+                    },
                     scales: {
                         x: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } },
                         y: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } }
@@ -976,10 +991,10 @@ ANALYSIS_HTML_TEMPLATE = """
                 },
                 plugins: [zeroLinePlugin, signalLabelPlugin]
             });
-            loadSignalChart();
+            loadSignalChart(true);
         }
 
-        function loadSignalChart() {
+        function loadSignalChart(isManualChange = false) {
             const dayRange = document.getElementById('signalDayRangeSelector').value;
             const timeframe = document.getElementById('signalTimeframeSelector').value;
 
@@ -987,22 +1002,26 @@ ANALYSIS_HTML_TEMPLATE = """
                 .then(res => res.json())
                 .then(data => {
                     if (data.error) {
-                        signalChartObj.data.labels = [data.error];
-                        signalChartObj.data.datasets = [{ label: 'Status / Error', data: [0], borderColor: '#ef4444' }];
-                        signalChartObj.update();
+                        if (isManualChange || !hasSignalData) {
+                            signalChartObj.data.labels = [data.error];
+                            signalChartObj.data.datasets = [{ label: 'Status / Error', data: [0], borderColor: '#ef4444' }];
+                            signalChartObj.update('none');
+                        }
                         return;
                     }
 
                     const snapshots = data.history || [];
-                    const times = snapshots.map(s => s.formatted_time || s.datetime);
-
                     if (snapshots.length === 0) {
-                        signalChartObj.data.labels = ["No data found for Main Signal."];
-                        signalChartObj.data.datasets = [{ label: 'Status', data: [0], borderColor: '#94a3b8' }];
-                        signalChartObj.update();
+                        if (isManualChange || !hasSignalData) {
+                            signalChartObj.data.labels = ["No data found for Main Signal."];
+                            signalChartObj.data.datasets = [{ label: 'Status', data: [0], borderColor: '#94a3b8' }];
+                            signalChartObj.update('none');
+                        }
                         return;
                     }
 
+                    hasSignalData = true;
+                    const times = snapshots.map(s => s.formatted_time || s.datetime);
                     const minRocVals = snapshots.map(s => s.min_roc || 0);
                     const maxRocVals = snapshots.map(s => s.max_roc || 0);
                     const crossRocVals = snapshots.map(s => s.cross_roc || 0);
@@ -1014,7 +1033,7 @@ ANALYSIS_HTML_TEMPLATE = """
                         {
                             label: 'Min ROC (Buy)',
                             data: minRocVals,
-                            borderColor: '#22c55e', // Green for CE/Buy
+                            borderColor: '#22c55e',
                             backgroundColor: 'rgba(34, 197, 94, 0.1)',
                             borderWidth: 2,
                             tension: 0.2
@@ -1022,7 +1041,7 @@ ANALYSIS_HTML_TEMPLATE = """
                         {
                             label: 'Max ROC (Sell)',
                             data: maxRocVals,
-                            borderColor: '#ef4444', // Red for PE/Sell
+                            borderColor: '#ef4444',
                             backgroundColor: 'rgba(239, 68, 68, 0.1)',
                             borderWidth: 2,
                             tension: 0.2
@@ -1030,7 +1049,7 @@ ANALYSIS_HTML_TEMPLATE = """
                         {
                             label: 'Cross ROC Sig',
                             data: crossRocVals,
-                            borderColor: '#facc15', // Yellow
+                            borderColor: '#facc15',
                             backgroundColor: 'rgba(250, 204, 21, 0.1)',
                             borderWidth: 2,
                             tension: 0.2
@@ -1039,7 +1058,7 @@ ANALYSIS_HTML_TEMPLATE = """
                             label: 'Main Volatility',
                             data: mainVolVals,
                             signalLabels: newSignals,
-                            borderColor: '#38bdf8', // Sky Blue
+                            borderColor: '#38bdf8',
                             backgroundColor: 'rgba(56, 189, 248, 0.1)',
                             borderWidth: 3,
                             pointRadius: 4,
@@ -1048,7 +1067,7 @@ ANALYSIS_HTML_TEMPLATE = """
                         }
                     ];
 
-                    signalChartObj.update();
+                    signalChartObj.update('none');
                 })
                 .catch(err => console.error("Signal chart error:", err));
         }
@@ -1061,6 +1080,7 @@ ANALYSIS_HTML_TEMPLATE = """
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
+                    animation: false,
                     scales: {
                         x: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } },
                         y: { position: 'left', ticks: { color: '#94a3b8' }, grid: { color: '#334155' } },
@@ -1072,10 +1092,10 @@ ANALYSIS_HTML_TEMPLATE = """
                     }
                 }
             });
-            loadHistoricalChart();
+            loadHistoricalChart(true);
         }
 
-        function loadHistoricalChart() {
+        function loadHistoricalChart(isManualChange = false) {
             const metric = document.getElementById('historyMetricSelector').value;
             const dayRange = document.getElementById('historyDayRangeSelector').value;
             const timeframe = document.getElementById('historyTimeframeSelector').value;
@@ -1084,30 +1104,33 @@ ANALYSIS_HTML_TEMPLATE = """
                 .then(res => res.json())
                 .then(data => {
                     if (data.error) {
-                        historyChartObj.data.labels = [data.error];
-                        historyChartObj.data.datasets = [{ label: 'Status / Error', data: [0], borderColor: '#ef4444' }];
-                        historyChartObj.update();
+                        if (isManualChange || !hasHistoryData) {
+                            historyChartObj.data.labels = [data.error];
+                            historyChartObj.data.datasets = [{ label: 'Status / Error', data: [0], borderColor: '#ef4444' }];
+                            historyChartObj.update('none');
+                        }
                         return;
                     }
 
                     const snapshots = data.history || [];
-                    const times = snapshots.map(s => s.formatted_time || s.datetime);
-
-                    let datasets = [];
-
                     if (snapshots.length === 0) {
-                        historyChartObj.data.labels = ["No data found in Google Sheet."];
-                        historyChartObj.data.datasets = [{ label: 'Status', data: [0], borderColor: '#94a3b8' }];
-                        historyChartObj.update();
+                        if (isManualChange || !hasHistoryData) {
+                            historyChartObj.data.labels = ["No data found in Google Sheet."];
+                            historyChartObj.data.datasets = [{ label: 'Status', data: [0], borderColor: '#94a3b8' }];
+                            historyChartObj.update('none');
+                        }
                         return;
                     }
+
+                    hasHistoryData = true;
+                    const times = snapshots.map(s => s.formatted_time || s.datetime);
+                    let datasets = [];
 
                     if (metric === "price_pcr") {
                         historyChartObj.options.scales.y1.display = true;
                         const spotVals = snapshots.map(s => s.spot_price);
                         const pcrVals = snapshots.map(s => s.pcr);
 
-                        // PCR on LEFT axis (y)
                         datasets.push({
                             label: 'Relation 2: PCR',
                             data: pcrVals,
@@ -1119,7 +1142,6 @@ ANALYSIS_HTML_TEMPLATE = """
                             fill: false
                         });
 
-                        // Price LTP on RIGHT axis (y1)
                         datasets.push({
                             label: 'Relation 1: Price LTP',
                             data: spotVals,
@@ -1131,7 +1153,6 @@ ANALYSIS_HTML_TEMPLATE = """
                             fill: true
                         });
 
-                        // Price Trend on RIGHT axis (y1)
                         datasets.push({
                             label: 'Price Trend',
                             data: computeLinearTrend(spotVals),
@@ -1165,23 +1186,23 @@ ANALYSIS_HTML_TEMPLATE = """
                         const peVals = snapshots.map(s => s[cfg.key2] || 0);
                         const avgVals = ceVals.map((v, i) => (v + (peVals[i] || 0)) / 2);
 
-                        // CE = Green
+                        // CE = RED
                         datasets.push({
                             label: `Relation 1: ${cfg.r1}`,
                             data: ceVals,
-                            borderColor: '#22c55e',
-                            backgroundColor: 'rgba(34, 197, 94, 0.1)',
+                            borderColor: '#ef4444',
+                            backgroundColor: 'rgba(239, 68, 68, 0.1)',
                             borderWidth: 2,
                             tension: 0.2,
                             yAxisID: 'y'
                         });
 
-                        // PE = Red
+                        // PE = GREEN
                         datasets.push({
                             label: `Relation 2: ${cfg.r2}`,
                             data: peVals,
-                            borderColor: '#ef4444',
-                            backgroundColor: 'rgba(239, 68, 68, 0.1)',
+                            borderColor: '#22c55e',
+                            backgroundColor: 'rgba(34, 197, 94, 0.1)',
                             borderWidth: 2,
                             tension: 0.2,
                             yAxisID: 'y'
@@ -1199,11 +1220,11 @@ ANALYSIS_HTML_TEMPLATE = """
                             fill: false
                         });
 
-                        // CE Trend = Light Green
+                        // CE Trend = Light RED
                         datasets.push({
                             label: `${cfg.r1} Trend`,
                             data: computeLinearTrend(ceVals),
-                            borderColor: '#4ade80',
+                            borderColor: '#f87171',
                             borderDash: [6, 4],
                             borderWidth: 2,
                             pointRadius: 0,
@@ -1211,11 +1232,11 @@ ANALYSIS_HTML_TEMPLATE = """
                             fill: false
                         });
 
-                        // PE Trend = Light Red
+                        // PE Trend = Light GREEN
                         datasets.push({
                             label: `${cfg.r2} Trend`,
                             data: computeLinearTrend(peVals),
-                            borderColor: '#f87171',
+                            borderColor: '#4ade80',
                             borderDash: [6, 4],
                             borderWidth: 2,
                             pointRadius: 0,
@@ -1226,7 +1247,7 @@ ANALYSIS_HTML_TEMPLATE = """
 
                     historyChartObj.data.labels = times;
                     historyChartObj.data.datasets = datasets;
-                    historyChartObj.update();
+                    historyChartObj.update('none');
                 })
                 .catch(err => console.error("Historical chart error:", err));
         }
@@ -1303,15 +1324,20 @@ ANALYSIS_HTML_TEMPLATE = """
                 data: {
                     labels: rawRows.map(r => r.strike),
                     datasets: [
-                        { type: 'bar', label: 'Calls (CE)', data: [], backgroundColor: 'rgba(34, 197, 94, 0.85)', borderColor: '#22c55e', borderWidth: 1 },
-                        { type: 'bar', label: 'Puts (PE)', data: [], backgroundColor: 'rgba(239, 68, 68, 0.85)', borderColor: '#ef4444', borderWidth: 1 },
-                        { type: 'line', label: 'CE Trend', data: [], borderColor: '#4ade80', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, fill: false },
-                        { type: 'line', label: 'PE Trend', data: [], borderColor: '#f87171', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, fill: false }
+                        // Left Bar = PE (Green)
+                        { type: 'bar', label: 'Puts (PE)', data: [], backgroundColor: 'rgba(34, 197, 94, 0.85)', borderColor: '#22c55e', borderWidth: 1 },
+                        // Right Bar = CE (Red)
+                        { type: 'bar', label: 'Calls (CE)', data: [], backgroundColor: 'rgba(239, 68, 68, 0.85)', borderColor: '#ef4444', borderWidth: 1 },
+                        // PE Trend = Light Green
+                        { type: 'line', label: 'PE Trend', data: [], borderColor: '#4ade80', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, fill: false },
+                        // CE Trend = Light Red
+                        { type: 'line', label: 'CE Trend', data: [], borderColor: '#f87171', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, fill: false }
                     ]
                 },
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
+                    animation: false,
                     scales: {
                         x: { ticks: { color: '#94a3b8', font: { weight: 'bold' } }, grid: { color: '#334155' } },
                         y: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } }
@@ -1330,96 +1356,102 @@ ANALYSIS_HTML_TEMPLATE = """
             const titleEl = document.getElementById("chartHeaderTitle");
             const strikes = rawRows.map(r => r.strike);
 
-            let ceData = [], peData = [];
-            let ceLabel = "", peLabel = "";
-            let ceColor = "", peColor = "";
+            let peData = [], ceData = [];
+            let peLabel = "", ceLabel = "";
+            let peColor = "", ceColor = "";
             let metricTitle = "";
 
             if (selected === "depth_qty") {
-                metricTitle = "1 - Order Book Depth Quantity (Call Ask Qty vs Put Bid Qty)";
-                ceLabel = "Call Ask Qty (Sell Vol)"; peLabel = "Put Bid Qty (Buy Vol)";
-                ceColor = 'rgba(34, 197, 94, 0.85)'; peColor = 'rgba(239, 68, 68, 0.85)';
-                ceData = rawRows.map(r => r.ce_ask_qty);
+                metricTitle = "1 - Order Book Depth Quantity (Put Bid Qty vs Call Ask Qty)";
+                peLabel = "Put Bid Qty (Buy Vol)"; ceLabel = "Call Ask Qty (Sell Vol)";
+                peColor = 'rgba(34, 197, 94, 0.85)'; ceColor = 'rgba(239, 68, 68, 0.85)';
                 peData = rawRows.map(r => r.pe_bid_qty);
+                ceData = rawRows.map(r => r.ce_ask_qty);
             }
             else if (selected === "oi_chg") {
                 metricTitle = "Change in Open Interest (Chg in OI)";
-                ceLabel = "Call Chg in OI"; peLabel = "Put Chg in OI";
-                ceColor = 'rgba(34, 197, 94, 0.85)'; peColor = 'rgba(239, 68, 68, 0.85)';
-                ceData = rawRows.map(r => r.ce_oi_chg);
+                peLabel = "Put Chg in OI"; ceLabel = "Call Chg in OI";
+                peColor = 'rgba(34, 197, 94, 0.85)'; ceColor = 'rgba(239, 68, 68, 0.85)';
                 peData = rawRows.map(r => r.pe_oi_chg);
+                ceData = rawRows.map(r => r.ce_oi_chg);
             }
             else if (selected === "oi") {
-                metricTitle = "Open Interest (CE vs PE)";
-                ceLabel = "Call OI"; peLabel = "Put OI";
-                ceColor = 'rgba(34, 197, 94, 0.85)'; peColor = 'rgba(239, 68, 68, 0.85)';
-                ceData = rawRows.map(r => r.ce_oi);
+                metricTitle = "Open Interest (PE vs CE)";
+                peLabel = "Put OI"; ceLabel = "Call OI";
+                peColor = 'rgba(34, 197, 94, 0.85)'; ceColor = 'rgba(239, 68, 68, 0.85)';
                 peData = rawRows.map(r => r.pe_oi);
+                ceData = rawRows.map(r => r.ce_oi);
             }
             else if (selected === "vol") {
                 metricTitle = "Trading Volume";
-                ceLabel = "Call Volume"; peLabel = "Put Volume";
-                ceColor = 'rgba(34, 197, 94, 0.85)'; peColor = 'rgba(239, 68, 68, 0.85)';
-                ceData = rawRows.map(r => r.ce_vol);
+                peLabel = "Put Volume"; ceLabel = "Call Volume";
+                peColor = 'rgba(34, 197, 94, 0.85)'; ceColor = 'rgba(239, 68, 68, 0.85)';
                 peData = rawRows.map(r => r.pe_vol);
+                ceData = rawRows.map(r => r.ce_vol);
             }
             else if (selected === "delta") {
                 metricTitle = "Option Delta Exposure";
-                ceLabel = "Call Delta"; peLabel = "Put Delta";
-                ceColor = 'rgba(34, 197, 94, 0.85)'; peColor = 'rgba(239, 68, 68, 0.85)';
-                ceData = rawRows.map(r => r.ce_delta);
+                peLabel = "Put Delta"; ceLabel = "Call Delta";
+                peColor = 'rgba(34, 197, 94, 0.85)'; ceColor = 'rgba(239, 68, 68, 0.85)';
                 peData = rawRows.map(r => r.pe_delta);
+                ceData = rawRows.map(r => r.ce_delta);
             }
             else if (selected === "theta") {
                 metricTitle = "Theta Time Decay Rate";
-                ceLabel = "Call Theta"; peLabel = "Put Theta";
-                ceColor = 'rgba(34, 197, 94, 0.85)'; peColor = 'rgba(239, 68, 68, 0.85)';
-                ceData = rawRows.map(r => r.ce_theta);
+                peLabel = "Put Theta"; ceLabel = "Call Theta";
+                peColor = 'rgba(34, 197, 94, 0.85)'; ceColor = 'rgba(239, 68, 68, 0.85)';
                 peData = rawRows.map(r => r.pe_theta);
+                ceData = rawRows.map(r => r.ce_theta);
             }
 
             titleEl.innerText = metricTitle;
 
             myChart.data.labels = strikes;
             
-            myChart.data.datasets[0].label = ceLabel;
-            myChart.data.datasets[0].data = ceData;
-            myChart.data.datasets[0].backgroundColor = ceColor;
+            // Left Bar: Put (PE) - Green
+            myChart.data.datasets[0].label = peLabel;
+            myChart.data.datasets[0].data = peData;
+            myChart.data.datasets[0].backgroundColor = peColor;
+            myChart.data.datasets[0].borderColor = '#22c55e';
 
-            myChart.data.datasets[1].label = peLabel;
-            myChart.data.datasets[1].data = peData;
-            myChart.data.datasets[1].backgroundColor = peColor;
+            // Right Bar: Call (CE) - Red
+            myChart.data.datasets[1].label = ceLabel;
+            myChart.data.datasets[1].data = ceData;
+            myChart.data.datasets[1].backgroundColor = ceColor;
+            myChart.data.datasets[1].borderColor = '#ef4444';
 
-            myChart.data.datasets[2].label = `${ceLabel} Trend`;
-            myChart.data.datasets[2].data = computeLinearTrend(ceData);
+            // PE Trend - Light Green
+            myChart.data.datasets[2].label = `${peLabel} Trend`;
+            myChart.data.datasets[2].data = computeLinearTrend(peData);
             myChart.data.datasets[2].borderColor = '#4ade80';
 
-            myChart.data.datasets[3].label = `${peLabel} Trend`;
-            myChart.data.datasets[3].data = computeLinearTrend(peData);
+            // CE Trend - Light Red
+            myChart.data.datasets[3].label = `${ceLabel} Trend`;
+            myChart.data.datasets[3].data = computeLinearTrend(ceData);
             myChart.data.datasets[3].borderColor = '#f87171';
 
-            myChart.update();
+            myChart.update('none');
 
             const count = rawRows.length || 1;
-            const ceSum = ceData.reduce((a, b) => a + Math.abs(b), 0);
             const peSum = peData.reduce((a, b) => a + Math.abs(b), 0);
-            const ceAvg = (ceSum / count).toFixed(2);
+            const ceSum = ceData.reduce((a, b) => a + Math.abs(b), 0);
             const peAvg = (peSum / count).toFixed(2);
+            const ceAvg = (ceSum / count).toFixed(2);
             
-            const totalSum = ceSum + peSum;
-            const cePct = totalSum > 0 ? ((ceSum / totalSum) * 100).toFixed(1) : 50;
+            const totalSum = peSum + ceSum;
             const pePct = totalSum > 0 ? ((peSum / totalSum) * 100).toFixed(1) : 50;
+            const cePct = totalSum > 0 ? ((ceSum / totalSum) * 100).toFixed(1) : 50;
             const ratio = ceSum > 0 ? (peSum / ceSum).toFixed(2) : "0.00";
 
             document.getElementById("gaugeMetricName").innerText = metricTitle.toUpperCase();
-            document.getElementById("gaugeCeLabel").innerText = `CALL (CE) TOTAL: ${ceSum.toLocaleString()} (${cePct}%)`;
             document.getElementById("gaugePeLabel").innerText = `PUT (PE) TOTAL: ${peSum.toLocaleString()} (${pePct}%)`;
-            document.getElementById("gaugeCeAvg").innerText = `Call Avg: ${Number(ceAvg).toLocaleString()}`;
+            document.getElementById("gaugeCeLabel").innerText = `CALL (CE) TOTAL: ${ceSum.toLocaleString()} (${cePct}%)`;
             document.getElementById("gaugePeAvg").innerText = `Put Avg: ${Number(peAvg).toLocaleString()}`;
+            document.getElementById("gaugeCeAvg").innerText = `Call Avg: ${Number(ceAvg).toLocaleString()}`;
             document.getElementById("gaugeRatioText").innerText = `Put/Call Ratio: ${ratio}`;
 
-            document.getElementById("gaugeCeBar").style.width = `${cePct}%`;
             document.getElementById("gaugePeBar").style.width = `${pePct}%`;
+            document.getElementById("gaugeCeBar").style.width = `${cePct}%`;
         }
 
         let timerSeconds = 10;
@@ -1445,8 +1477,8 @@ ANALYSIS_HTML_TEMPLATE = """
                 .then(res => res.json())
                 .then(data => {
                     renderPageData(data);
-                    loadHistoricalChart();
-                    loadSignalChart();
+                    loadHistoricalChart(false);
+                    loadSignalChart(false);
                 })
                 .catch(err => {
                     console.error("Auto Sync Error:", err);
