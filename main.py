@@ -127,9 +127,12 @@ def get_valid_token():
     return perform_single_auth()
 
 # --- DASHBOARD SHEET ORDER CONFIGURATION & EXECUTION ENGINE ---
-def get_ist_today_str():
+def get_ist_now():
     ist_tz = timezone(timedelta(hours=5, minutes=30))
-    return datetime.now(ist_tz).strftime("%Y-%m-%d")
+    return datetime.now(ist_tz)
+
+def get_ist_today_str():
+    return get_ist_now().strftime("%Y-%m-%d")
 
 def load_auto_order_state():
     today_str = get_ist_today_str()
@@ -156,14 +159,17 @@ def round_tick(price, tick=0.05):
     return round(round(price / tick) * tick, 2)
 
 def fetch_dashboard_order_config():
-    """Fetches cells B16:B27 from Google Sheet tab 'DASHBOARD'."""
+    """Fetches cells B16:B27 from Google Sheet tab 'DASHBOARD' with cache-busting and headers=0."""
     sheet_id = SPREADSHEET_ID or "1fpXdodshvwHcduwffOhEK54K-a7a4TmOZF2Q-EgVRzM"
+    cache_buster = int(time.time() * 1000)
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache"
     }
     urls = [
-        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet=DASHBOARD&range=A16:B27",
-        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet=DASHBOARD"
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&headers=0&sheet=DASHBOARD&range=A16:Z27&_cb={cache_buster}",
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&headers=0&sheet=DASHBOARD&_cb={cache_buster}"
     ]
 
     raw_csv = None
@@ -177,7 +183,7 @@ def fetch_dashboard_order_config():
                 if text.startswith("<!DOCTYPE") or "<html" in text.lower():
                     last_err = "Google Sheet is private. Set sharing to 'Anyone with the link can view'."
                     continue
-                if len(text) > 10:
+                if len(text) > 5:
                     raw_csv = text
                     break
             else:
@@ -189,60 +195,70 @@ def fetch_dashboard_order_config():
         return None, last_err or "Could not fetch DASHBOARD sheet."
 
     try:
-        lines = [line.strip().lstrip('\ufeff') for line in raw_csv.splitlines() if line.strip()]
-        rows = list(csv.reader(io.StringIO("\n".join(lines))))
+        lines = [line.lstrip('\ufeff') for line in raw_csv.splitlines() if line.strip()]
+        grid = list(csv.reader(io.StringIO("\n".join(lines))))
 
-        label_map = {}
-        for r in rows:
-            if len(r) >= 2:
-                k = re.sub(r'[^a-z0-9]+', '_', r[0].strip().lower()).strip('_')
-                v = r[1].strip()
-                if k:
-                    label_map[k] = v
+        # Strategy 1: Scan every cell in the grid for label matches and grab the value immediately to its right
+        label_values = {}
+        for r_idx, row in enumerate(grid):
+            for c_idx, cell in enumerate(row):
+                norm_key = re.sub(r'[^a-z0-9]+', '_', str(cell).strip().lower()).strip('_')
+                if norm_key and c_idx + 1 < len(row):
+                    val = str(row[c_idx + 1]).strip()
+                    if norm_key not in label_values or val != "":
+                        label_values[norm_key] = val
 
-        def get_val(keys, pos_idx):
-            for k in keys:
-                if k in label_map:
-                    return label_map[k]
-            if len(rows) == 12 and pos_idx < len(rows) and len(rows[pos_idx]) >= 2:
-                return rows[pos_idx][1].strip()
-            if len(rows) >= 27 and (15 + pos_idx) < len(rows) and len(rows[15 + pos_idx]) >= 2:
-                return rows[15 + pos_idx][1].strip()
+        # Strategy 2: Positional fallback for B16:B27 (both 12-row range slice and full sheet)
+        def get_b_cell(row_num_1based, rel_idx_16):
+            if len(grid) == 12 and rel_idx_16 < 12 and len(grid[rel_idx_16]) >= 2:
+                val = str(grid[rel_idx_16][1]).strip()
+                if val != "":
+                    return val
+            if len(grid) >= 27 and len(grid[row_num_1based - 1]) >= 2:
+                val = str(grid[row_num_1based - 1][1]).strip()
+                if val != "":
+                    return val
             return ""
 
-        manual_raw = get_val(["manual_order"], 0)
+        def resolve_field(keys, row_num_1based, rel_idx_16):
+            for k in keys:
+                if k in label_values and label_values[k] != "":
+                    return label_values[k]
+            return get_b_cell(row_num_1based, rel_idx_16)
+
+        manual_raw = resolve_field(["manual_order"], 16, 0)
         manual_mode = "Auto" if manual_raw.strip().lower() == "auto" else "Manual"
 
-        want_raw = get_val(["want_to_trade"], 1).strip().upper()
-        want_to_trade = "YES" if want_raw == "YES" else "NO"
+        want_raw = resolve_field(["want_to_trade"], 17, 1).strip().upper()
+        want_to_trade = "YES" if want_raw in ("YES", "Y", "TRUE", "1") else "NO"
 
-        amt_raw = get_val(["amount_to_be_invest", "amount_to_invest"], 2).replace(",", "").strip()
+        amt_raw = resolve_field(["amount_to_be_invest", "amount_to_invest"], 18, 2).replace(",", "").strip()
         amount_to_invest = float(amt_raw) if amt_raw else 0.0
 
-        sym_raw = get_val(["symbol"], 3).strip().upper()
+        sym_raw = resolve_field(["symbol"], 19, 3).strip().upper()
         symbol = "BANKNIFTY" if "BANK" in sym_raw else "NIFTY"
 
-        expiry_month = get_val(["expiry_month"], 4).strip().upper()
+        expiry_month = resolve_field(["expiry_month"], 20, 4).strip().upper()
 
-        strike_raw = get_val(["strike_price"], 5).replace(",", "").strip()
+        strike_raw = resolve_field(["strike_price"], 21, 5).replace(",", "").strip()
         strike_price = int(float(strike_raw)) if strike_raw else 0
 
-        opt_raw = get_val(["option_type"], 6).strip().upper()
+        opt_raw = resolve_field(["option_type"], 22, 6).strip().upper()
         option_type = opt_raw if opt_raw in ("CE", "PE") else "CE"
 
-        txn_raw = get_val(["transaction_type"], 7).strip().upper()
+        txn_raw = resolve_field(["transaction_type"], 23, 7).strip().upper()
         transaction_type = txn_raw if txn_raw in ("BUY", "SELL") else "BUY"
 
-        qty_raw = get_val(["quantity"], 8).replace(",", "").strip()
+        qty_raw = resolve_field(["quantity"], 24, 8).replace(",", "").strip()
         quantity = int(float(qty_raw)) if qty_raw else 0
 
-        prod_raw = get_val(["product"], 9).strip().upper()
+        prod_raw = resolve_field(["product"], 25, 9).strip().upper()
         product = "I" if prod_raw in ("I", "INTRADAY", "MIS") else "D"
 
-        sl_raw = get_val(["sl_percent"], 10).replace("%", "").strip()
+        sl_raw = resolve_field(["sl_percent"], 26, 10).replace("%", "").strip()
         sl_percent = float(sl_raw) if sl_raw != "" else None
 
-        tgt_raw = get_val(["target_percent"], 11).replace("%", "").strip()
+        tgt_raw = resolve_field(["target_percent"], 27, 11).replace("%", "").strip()
         target_percent = float(tgt_raw) if tgt_raw != "" else None
 
         cfg = {
@@ -297,7 +313,6 @@ def resolve_monthly_expiry_date(symbol, expiry_month, headers):
 
     target_m = month_lookup.get(str(expiry_month).strip().upper())
     if not target_m:
-        # Check if exact YYYY-MM-DD was provided
         if expiry_month in expiries:
             return expiry_month, None
         return future_expiries[0], None
@@ -335,7 +350,7 @@ def prepare_evaluated_order(cfg):
     if not chain_data:
         return None, f"Empty option chain returned for {symbol} expiry {expiry_date}."
 
-    opt_type = cfg["option_type"]  # CE or PE
+    opt_type = cfg["option_type"]
     req_strike = cfg["strike_price"]
     qty = cfg["quantity"]
     max_invest = cfg["amount_to_invest"]
@@ -343,7 +358,6 @@ def prepare_evaluated_order(cfg):
     if qty <= 0:
         return None, "Invalid quantity (0) in DASHBOARD cell B24."
 
-    # Build strike list with instrument_key and live LTP
     candidates = []
     for item in chain_data:
         st = item.get("strike_price", 0)
@@ -362,16 +376,12 @@ def prepare_evaluated_order(cfg):
     if not candidates:
         return None, f"No active {opt_type} contracts with live LTP found for {symbol} ({expiry_date})."
 
-    # Sort strikes for OTM stepping if budget is exceeded:
-    # For CE: step upwards (e.g., 25700 -> 25750 -> 25800 -> 25900)
-    # For PE: step downwards (e.g., 25700 -> 25650 -> 25600 -> 25500)
     if opt_type == "CE":
         ordered = sorted([c for c in candidates if c["strike"] >= req_strike], key=lambda x: x["strike"])
     else:
         ordered = sorted([c for c in candidates if c["strike"] <= req_strike], key=lambda x: x["strike"], reverse=True)
 
     if not ordered:
-        # Fallback to closest strike available
         ordered = sorted(candidates, key=lambda x: abs(x["strike"] - req_strike))
 
     selected = None
@@ -392,7 +402,6 @@ def prepare_evaluated_order(cfg):
     total_investment = round(entry_price * qty, 2)
     txn_type = cfg["transaction_type"]
 
-    # Calculate Stop Loss (if not blank)
     sl_percent = cfg["sl_percent"]
     sl_price = None
     if sl_percent is not None and sl_percent > 0:
@@ -401,7 +410,6 @@ def prepare_evaluated_order(cfg):
         else:
             sl_price = round_tick(entry_price * (1.0 + sl_percent / 100.0))
 
-    # Calculate Target (if not blank)
     target_percent = cfg["target_percent"]
     target_price = None
     if target_percent is not None and target_percent > 0:
@@ -462,7 +470,6 @@ def submit_upstox_evaluated_order(evaluated_order):
 
     try:
         if sl_price is not None or target_price is not None:
-            # Upstox v3 GTT MULTIPLE Order (Entry + Target and/or Stoploss)
             rules = [
                 {
                     "strategy": "ENTRY",
@@ -503,7 +510,6 @@ def submit_upstox_evaluated_order(evaluated_order):
                 return False, f"Upstox GTT Order Rejected ({res.status_code}): {err_detail}"
 
         else:
-            # Both SL and Target are blank -> Place pure Fixed Limit Order at live LTP
             payload = {
                 "quantity": qty,
                 "product": product,
@@ -868,8 +874,7 @@ def fetch_option_chain(symbol, selected_expiry="ALL"):
 def process_option_data(symbol, selected_expiry="ALL"):
     chain_data, current_expiry, expiries, error = fetch_option_chain(symbol, selected_expiry)
     
-    ist_tz = timezone(timedelta(hours=5, minutes=30))
-    updated_time = datetime.now(ist_tz).strftime("%d/%m/%Y %H:%M:%S IST")
+    updated_time = get_ist_now().strftime("%d/%m/%Y %H:%M:%S IST")
 
     if error or not chain_data:
         return [], 0, 0, current_expiry or "ALL EXPIRIES (CONSOLIDATED)", expiries, updated_time, 0, 0, 0, error or "No option chain data available."
@@ -1175,7 +1180,6 @@ ANALYSIS_HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- DYNAMIC METRIC SENTIMENT GAUGE (PE LEFT GREEN | CE RIGHT RED) -->
     <div class="sentiment-bar-container">
         <div style="display: flex; justify-content: space-between; font-weight: bold; margin-bottom: 8px;">
             <span style="color: #22c55e;" id="gaugePeLabel">PUT (PE) TOTAL: -</span>
@@ -1193,7 +1197,6 @@ ANALYSIS_HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- CHART 1: STRIKE BAR CHART (PE LEFT GREEN | CE RIGHT RED) -->
     <div class="chart-box">
         <div class="chart-header">
             <div class="chart-title" id="chartHeaderTitle">Change in Open Interest (Chg in OI)</div>
@@ -1202,7 +1205,6 @@ ANALYSIS_HTML_TEMPLATE = """
         <canvas id="analysisChart" style="max-height: 480px;"></canvas>
     </div>
 
-    <!-- CHART 2: HISTORICAL SNAPSHOT TREND (GOOGLE SHEET MEMORY) -->
     <div class="chart-box">
         <div class="chart-header">
             <div style="display: flex; align-items: center; gap: 15px;">
@@ -1250,7 +1252,6 @@ ANALYSIS_HTML_TEMPLATE = """
         <canvas id="historyChart" style="max-height: 420px;"></canvas>
     </div>
 
-    <!-- CHART 3: MAIN SIGNAL CHART (COLUMNS AD TO AI) -->
     <div class="chart-box">
         <div class="chart-header">
             <div style="display: flex; align-items: center; gap: 15px;">
@@ -1389,18 +1390,8 @@ ANALYSIS_HTML_TEMPLATE = """
                     responsive: true,
                     maintainAspectRatio: false,
                     animation: false,
-                    animations: {
-                        colors: false,
-                        x: false,
-                        y: false
-                    },
-                    transitions: {
-                        active: {
-                            animation: {
-                                duration: 0
-                            }
-                        }
-                    },
+                    animations: { colors: false, x: false, y: false },
+                    transitions: { active: { animation: { duration: 0 } } },
                     scales: {
                         x: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } },
                         y: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } }
@@ -1451,41 +1442,10 @@ ANALYSIS_HTML_TEMPLATE = """
 
                     signalChartObj.data.labels = times;
                     signalChartObj.data.datasets = [
-                        {
-                            label: 'Min ROC (Buy)',
-                            data: minRocVals,
-                            borderColor: '#22c55e',
-                            backgroundColor: 'rgba(34, 197, 94, 0.1)',
-                            borderWidth: 2,
-                            tension: 0.2
-                        },
-                        {
-                            label: 'Max ROC (Sell)',
-                            data: maxRocVals,
-                            borderColor: '#ef4444',
-                            backgroundColor: 'rgba(239, 68, 68, 0.1)',
-                            borderWidth: 2,
-                            tension: 0.2
-                        },
-                        {
-                            label: 'Cross ROC Sig',
-                            data: crossRocVals,
-                            borderColor: '#facc15',
-                            backgroundColor: 'rgba(250, 204, 21, 0.1)',
-                            borderWidth: 2,
-                            tension: 0.2
-                        },
-                        {
-                            label: 'Main Volatility',
-                            data: mainVolVals,
-                            signalLabels: newSignals,
-                            borderColor: '#38bdf8',
-                            backgroundColor: 'rgba(56, 189, 248, 0.1)',
-                            borderWidth: 3,
-                            pointRadius: 4,
-                            pointHoverRadius: 6,
-                            tension: 0.2
-                        }
+                        { label: 'Min ROC (Buy)', data: minRocVals, borderColor: '#22c55e', backgroundColor: 'rgba(34, 197, 94, 0.1)', borderWidth: 2, tension: 0.2 },
+                        { label: 'Max ROC (Sell)', data: maxRocVals, borderColor: '#ef4444', backgroundColor: 'rgba(239, 68, 68, 0.1)', borderWidth: 2, tension: 0.2 },
+                        { label: 'Cross ROC Sig', data: crossRocVals, borderColor: '#facc15', backgroundColor: 'rgba(250, 204, 21, 0.1)', borderWidth: 2, tension: 0.2 },
+                        { label: 'Main Volatility', data: mainVolVals, signalLabels: newSignals, borderColor: '#38bdf8', backgroundColor: 'rgba(56, 189, 248, 0.1)', borderWidth: 3, pointRadius: 4, pointHoverRadius: 6, tension: 0.2 }
                     ];
 
                     signalChartObj.update('none');
@@ -1552,38 +1512,9 @@ ANALYSIS_HTML_TEMPLATE = """
                         const spotVals = snapshots.map(s => s.spot_price);
                         const pcrVals = snapshots.map(s => s.pcr);
 
-                        datasets.push({
-                            label: 'Relation 2: PCR',
-                            data: pcrVals,
-                            borderColor: '#06b6d4',
-                            backgroundColor: 'rgba(6, 182, 212, 0.1)',
-                            borderWidth: 2,
-                            tension: 0.2,
-                            yAxisID: 'y',
-                            fill: false
-                        });
-
-                        datasets.push({
-                            label: 'Relation 1: Price LTP',
-                            data: spotVals,
-                            borderColor: '#facc15',
-                            backgroundColor: 'rgba(250, 204, 21, 0.1)',
-                            borderWidth: 2,
-                            tension: 0.2,
-                            yAxisID: 'y1',
-                            fill: true
-                        });
-
-                        datasets.push({
-                            label: 'Price Trend',
-                            data: computeLinearTrend(spotVals),
-                            borderColor: '#ca8a04',
-                            borderDash: [6, 4],
-                            borderWidth: 2,
-                            pointRadius: 0,
-                            yAxisID: 'y1',
-                            fill: false
-                        });
+                        datasets.push({ label: 'Relation 2: PCR', data: pcrVals, borderColor: '#06b6d4', backgroundColor: 'rgba(6, 182, 212, 0.1)', borderWidth: 2, tension: 0.2, yAxisID: 'y', fill: false });
+                        datasets.push({ label: 'Relation 1: Price LTP', data: spotVals, borderColor: '#facc15', backgroundColor: 'rgba(250, 204, 21, 0.1)', borderWidth: 2, tension: 0.2, yAxisID: 'y1', fill: true });
+                        datasets.push({ label: 'Price Trend', data: computeLinearTrend(spotVals), borderColor: '#ca8a04', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, yAxisID: 'y1', fill: false });
                     }
                     else {
                         historyChartObj.options.scales.y1.display = false;
@@ -1607,63 +1538,11 @@ ANALYSIS_HTML_TEMPLATE = """
                         const peVals = snapshots.map(s => s[cfg.key2] || 0);
                         const avgVals = ceVals.map((v, i) => (v + (peVals[i] || 0)) / 2);
 
-                        // CE = RED
-                        datasets.push({
-                            label: `Relation 1: ${cfg.r1}`,
-                            data: ceVals,
-                            borderColor: '#ef4444',
-                            backgroundColor: 'rgba(239, 68, 68, 0.1)',
-                            borderWidth: 2,
-                            tension: 0.2,
-                            yAxisID: 'y'
-                        });
-
-                        // PE = GREEN
-                        datasets.push({
-                            label: `Relation 2: ${cfg.r2}`,
-                            data: peVals,
-                            borderColor: '#22c55e',
-                            backgroundColor: 'rgba(34, 197, 94, 0.1)',
-                            borderWidth: 2,
-                            tension: 0.2,
-                            yAxisID: 'y'
-                        });
-
-                        // Yellow Average Line (#facc15)
-                        datasets.push({
-                            label: `Average (${cfg.r1} & ${cfg.r2})`,
-                            data: avgVals,
-                            borderColor: '#facc15',
-                            backgroundColor: 'rgba(250, 204, 21, 0.1)',
-                            borderWidth: 2,
-                            tension: 0.2,
-                            yAxisID: 'y',
-                            fill: false
-                        });
-
-                        // CE Trend = Light RED
-                        datasets.push({
-                            label: `${cfg.r1} Trend`,
-                            data: computeLinearTrend(ceVals),
-                            borderColor: '#f87171',
-                            borderDash: [6, 4],
-                            borderWidth: 2,
-                            pointRadius: 0,
-                            yAxisID: 'y',
-                            fill: false
-                        });
-
-                        // PE Trend = Light GREEN
-                        datasets.push({
-                            label: `${cfg.r2} Trend`,
-                            data: computeLinearTrend(peVals),
-                            borderColor: '#4ade80',
-                            borderDash: [6, 4],
-                            borderWidth: 2,
-                            pointRadius: 0,
-                            yAxisID: 'y',
-                            fill: false
-                        });
+                        datasets.push({ label: `Relation 1: ${cfg.r1}`, data: ceVals, borderColor: '#ef4444', backgroundColor: 'rgba(239, 68, 68, 0.1)', borderWidth: 2, tension: 0.2, yAxisID: 'y' });
+                        datasets.push({ label: `Relation 2: ${cfg.r2}`, data: peVals, borderColor: '#22c55e', backgroundColor: 'rgba(34, 197, 94, 0.1)', borderWidth: 2, tension: 0.2, yAxisID: 'y' });
+                        datasets.push({ label: `Average (${cfg.r1} & ${cfg.r2})`, data: avgVals, borderColor: '#facc15', backgroundColor: 'rgba(250, 204, 21, 0.1)', borderWidth: 2, tension: 0.2, yAxisID: 'y', fill: false });
+                        datasets.push({ label: `${cfg.r1} Trend`, data: computeLinearTrend(ceVals), borderColor: '#f87171', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, yAxisID: 'y', fill: false });
+                        datasets.push({ label: `${cfg.r2} Trend`, data: computeLinearTrend(peVals), borderColor: '#4ade80', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, yAxisID: 'y', fill: false });
                     }
 
                     historyChartObj.data.labels = times;
@@ -1822,27 +1701,21 @@ ANALYSIS_HTML_TEMPLATE = """
             }
 
             titleEl.innerText = metricTitle;
-
             myChart.data.labels = strikes;
-            
             myChart.data.datasets[0].label = peLabel;
             myChart.data.datasets[0].data = peData;
             myChart.data.datasets[0].backgroundColor = peColor;
             myChart.data.datasets[0].borderColor = '#22c55e';
-
             myChart.data.datasets[1].label = ceLabel;
             myChart.data.datasets[1].data = ceData;
             myChart.data.datasets[1].backgroundColor = ceColor;
             myChart.data.datasets[1].borderColor = '#ef4444';
-
             myChart.data.datasets[2].label = `${peLabel} Trend`;
             myChart.data.datasets[2].data = computeLinearTrend(peData);
             myChart.data.datasets[2].borderColor = '#4ade80';
-
             myChart.data.datasets[3].label = `${ceLabel} Trend`;
             myChart.data.datasets[3].data = computeLinearTrend(ceData);
             myChart.data.datasets[3].borderColor = '#f87171';
-
             myChart.update('none');
 
             const count = rawRows.length || 1;
@@ -1850,7 +1723,6 @@ ANALYSIS_HTML_TEMPLATE = """
             const ceSum = ceData.reduce((a, b) => a + Math.abs(b), 0);
             const peAvg = (peSum / count).toFixed(2);
             const ceAvg = (ceSum / count).toFixed(2);
-            
             const totalSum = peSum + ceSum;
             const pePct = totalSum > 0 ? ((peSum / totalSum) * 100).toFixed(1) : 50;
             const cePct = totalSum > 0 ? ((ceSum / totalSum) * 100).toFixed(1) : 50;
@@ -1862,7 +1734,6 @@ ANALYSIS_HTML_TEMPLATE = """
             document.getElementById("gaugePeAvg").innerText = `Put Avg: ${Number(peAvg).toLocaleString()}`;
             document.getElementById("gaugeCeAvg").innerText = `Call Avg: ${Number(ceAvg).toLocaleString()}`;
             document.getElementById("gaugeRatioText").innerText = `Put/Call Ratio: ${ratio}`;
-
             document.getElementById("gaugePeBar").style.width = `${pePct}%`;
             document.getElementById("gaugeCeBar").style.width = `${cePct}%`;
         }
@@ -1893,9 +1764,7 @@ ANALYSIS_HTML_TEMPLATE = """
                     loadHistoricalChart(false);
                     loadSignalChart(false);
                 })
-                .catch(err => {
-                    console.error("Auto Sync Error:", err);
-                })
+                .catch(err => console.error("Auto Sync Error:", err))
                 .finally(() => {
                     isSyncing = false;
                     document.getElementById("syncBadge").innerHTML = 'Auto Sync: <span id="countdown">' + timerSeconds + '</span>s';
@@ -2073,6 +1942,7 @@ POSITIONS_HTML_TEMPLATE = """
             <span id="badgeManualCondition" class="badge-mode-manual">LOADING...</span>
             <span id="badgeWantToTrade" class="badge-want-no">Want to Trade (B17): -</span>
             <span id="badgeMaxInvest" style="color: #94a3b8; font-size: 13px; font-weight: 600;">Max Invest (B18): -</span>
+            <span id="badgeSheetSyncTime" style="color: #64748b; font-size: 12px;">Last Sheet Sync: -</span>
         </div>
         <div style="display: flex; align-items: center; gap: 10px;">
             <span id="engineStatusText" style="font-size: 13px; color: #38bdf8; font-weight: 600;">Checking DASHBOARD sheet...</span>
@@ -2227,6 +2097,7 @@ POSITIONS_HTML_TEMPLATE = """
             const modeBadge = document.getElementById("badgeManualCondition");
             const wantBadge = document.getElementById("badgeWantToTrade");
             const investBadge = document.getElementById("badgeMaxInvest");
+            const syncTimeBadge = document.getElementById("badgeSheetSyncTime");
             const statusText = document.getElementById("engineStatusText");
             const manualPanel = document.getElementById("manualOrderPanel");
             const resetBtn = document.getElementById("btnResetPreview");
@@ -2241,6 +2112,9 @@ POSITIONS_HTML_TEMPLATE = """
 
             const maxInv = orderState.amount_to_invest || 0;
             investBadge.innerText = `Max Invest (B18): ₹${Number(maxInv).toLocaleString('en-IN')}`;
+            if (orderState.sheet_synced_at) {
+                syncTimeBadge.innerText = `Last Sheet Sync: ${orderState.sheet_synced_at}`;
+            }
             statusText.innerText = orderState.status_message || "";
 
             if (orderState.auto_execution_notice) {
@@ -2346,7 +2220,7 @@ POSITIONS_HTML_TEMPLATE = """
             isSyncing = true;
             document.getElementById("syncBadge").innerText = "Syncing...";
 
-            fetch('/api/positions')
+            fetch('/api/positions?_t=' + Date.now(), { cache: 'no-store' })
                 .then(res => res.json())
                 .then(data => {
                     const errEl = document.getElementById("errorContainer");
@@ -2463,7 +2337,6 @@ def api_manual_order_action():
             return jsonify({"success": True, "message": "Cancelled state cleared."})
 
         if action == "PLACE":
-            # Re-evaluate fresh from DASHBOARD sheet (or use provided payload) to ensure fresh LTP
             cfg, cfg_err = fetch_dashboard_order_config()
             if cfg_err or not cfg:
                 return jsonify({"success": False, "message": cfg_err or "Could not read DASHBOARD sheet."})
@@ -2472,7 +2345,6 @@ def api_manual_order_action():
             if eval_err or not evaluated:
                 return jsonify({"success": False, "message": eval_err or "Order evaluation failed."})
 
-            # In Manual mode, user explicitly allows multiple/duplicate orders
             ok, msg = submit_upstox_evaluated_order(evaluated)
             return jsonify({"success": ok, "message": msg, "evaluated_order": evaluated})
 
@@ -2480,13 +2352,14 @@ def api_manual_order_action():
 
 @app.route("/api/positions")
 def api_positions():
-    """Background API route fetching live Upstox positions, order log, and DASHBOARD order engine."""
+    """Background API route fetching live Upstox positions, order log, and DASHBOARD order engine every 10s."""
     positions, orders, total_pnl, realised_pnl, unrealised_pnl, error = fetch_upstox_positions()
 
     order_engine_payload = {
         "manual_order": "Manual",
         "want_to_trade": "NO",
         "amount_to_invest": 0,
+        "sheet_synced_at": get_ist_now().strftime("%H:%M:%S IST"),
         "status_message": "Initializing...",
         "show_manual_panel": False,
         "evaluated_order": None,
@@ -2519,7 +2392,6 @@ def api_positions():
                     state = load_auto_order_state()
 
                     if cfg["manual_order"].lower() == "auto":
-                        # AUTO MODE: Strict single-order-per-day & no-duplicate guard
                         already_auto_traded = cfg["symbol"] in state.get("executed_symbols", {})
                         if dup_found or already_auto_traded:
                             reason = dup_reason if dup_found else f"Auto order already executed today for {cfg['symbol']}."
@@ -2536,7 +2408,6 @@ def api_positions():
                             order_engine_payload["auto_execution_notice"] = f"AUTO ORDER: {exec_msg}"
                             order_engine_payload["auto_execution_ok"] = ok
                     else:
-                        # MANUAL MODE: Show approval panel with Place Order & Cancel buttons
                         is_cancelled = evaluated["signature"] in state.get("cancelled_signatures", [])
                         order_engine_payload["is_cancelled"] = is_cancelled
                         if is_cancelled:
@@ -2546,7 +2417,7 @@ def api_positions():
                             order_engine_payload["show_manual_panel"] = True
                             order_engine_payload["status_message"] = f"Awaiting Manual Approval for {evaluated['symbol']} {evaluated['selected_strike']} {evaluated['option_type']} @ ₹{evaluated['entry_price']}"
 
-    return jsonify({
+    response = jsonify({
         "positions": positions,
         "orders": orders,
         "total_pnl": total_pnl,
@@ -2555,6 +2426,9 @@ def api_positions():
         "order_engine": order_engine_payload,
         "error": error
     })
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return response
 
 @app.route("/Live_Trade_Position", methods=["GET"])
 def live_trade_position():
