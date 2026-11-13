@@ -27,6 +27,7 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1fpXdodshvwHcduwffOhEK54K-a7a4TmOZ
 
 SESSION_FILE_PATH = "/tmp/upstox_session.json"
 AUTO_ORDER_STATE_PATH = "/tmp/upstox_auto_order_state.json"
+DYNAMIC_TSL_STATE_PATH = "/tmp/upstox_dynamic_tsl_state.json"
 AUTH_THREAD_LOCK = threading.Lock()
 ORDER_EXECUTION_LOCK = threading.Lock()
 
@@ -301,10 +302,349 @@ def save_auto_order_state(state):
     except Exception as e:
         print(f"[Order State Warning] Write failed: {e}")
 
+def load_dynamic_tsl_state():
+    today_str = get_ist_today_str()
+    try:
+        if os.path.exists(DYNAMIC_TSL_STATE_PATH):
+            with open(DYNAMIC_TSL_STATE_PATH, "r") as f:
+                data = json.load(f)
+                if data.get("date") == today_str:
+                    return data
+    except Exception as e:
+        print(f"[Dynamic TSL Warning] Read failed: {e}")
+    return {"date": today_str, "contracts": {}, "by_token": {}}
+
+def save_dynamic_tsl_state(state):
+    try:
+        with open(DYNAMIC_TSL_STATE_PATH, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f"[Dynamic TSL Warning] Write failed: {e}")
+
 def round_tick(price, tick=0.05):
     if price is None or price <= 0:
         return 0.05
     return round(round(price / tick) * tick, 2)
+
+def compute_dynamic_sl_target(side, entry_price, current_ltp, prev_best_price, sl_percent, target_percent, prev_sl=None, prev_target=None):
+    """
+    Dynamic SL & Target Trailing Engine:
+    - BUY / Long:
+      * Tracks highest favorable LTP: best_price = max(entry_price, prev_best_price, current_ltp)
+      * favorable_move = max(0, best_price - entry_price)
+      * Initial SL = entry * (1 - sl_percent / 100)
+      * Dynamic SL = Initial SL + favorable_move * (sl_percent / 100) [ratchets UP only]
+      * Initial Target = entry * (1 + target_percent / 100)
+      * Dynamic Target = Initial Target + favorable_move * (target_percent / 100) [ratchets UP only]
+    - SELL / Short:
+      * Tracks lowest favorable LTP: best_price = min(entry_price, prev_best_price, current_ltp)
+      * favorable_move = max(0, entry_price - best_price)
+      * Initial SL = entry * (1 + sl_percent / 100)
+      * Dynamic SL = Initial SL - favorable_move * (sl_percent / 100) [ratchets DOWN only]
+      * Initial Target = entry * (1 - target_percent / 100)
+      * Dynamic Target = Initial Target - favorable_move * (target_percent / 100) [ratchets DOWN only]
+    """
+    side = str(side).upper()
+    entry_price = float(entry_price)
+    current_ltp = float(current_ltp) if current_ltp and current_ltp > 0 else entry_price
+
+    if side == "BUY":
+        if prev_best_price is None or prev_best_price <= 0:
+            prev_best_price = entry_price
+        best_price = max(entry_price, prev_best_price, current_ltp)
+        favorable_move = max(0.0, best_price - entry_price)
+
+        new_sl = None
+        if sl_percent is not None and sl_percent > 0:
+            init_sl = entry_price * (1.0 - sl_percent / 100.0)
+            cand_sl = round_tick(init_sl + favorable_move * (sl_percent / 100.0))
+            new_sl = max(float(prev_sl), cand_sl) if prev_sl is not None else cand_sl
+
+        new_target = None
+        if target_percent is not None and target_percent > 0:
+            init_tgt = entry_price * (1.0 + target_percent / 100.0)
+            cand_tgt = round_tick(init_tgt + favorable_move * (target_percent / 100.0))
+            new_target = max(float(prev_target), cand_tgt) if prev_target is not None else cand_tgt
+
+    else:  # SELL / SHORT
+        if prev_best_price is None or prev_best_price <= 0:
+            prev_best_price = entry_price
+        best_price = min(entry_price, prev_best_price, current_ltp)
+        favorable_move = max(0.0, entry_price - best_price)
+
+        new_sl = None
+        if sl_percent is not None and sl_percent > 0:
+            init_sl = entry_price * (1.0 + sl_percent / 100.0)
+            cand_sl = round_tick(init_sl - favorable_move * (sl_percent / 100.0))
+            new_sl = min(float(prev_sl), cand_sl) if prev_sl is not None else cand_sl
+
+        new_target = None
+        if target_percent is not None and target_percent > 0:
+            init_tgt = entry_price * (1.0 - target_percent / 100.0)
+            cand_tgt = round_tick(init_tgt - favorable_move * (target_percent / 100.0))
+            new_target = min(float(prev_target), cand_tgt) if prev_target is not None else cand_tgt
+
+    return {
+        "best_price": round(best_price, 2),
+        "favorable_move": round(favorable_move, 2),
+        "new_sl": new_sl,
+        "new_target": new_target
+    }
+
+def modify_upstox_gtt_sl_target(gtt_order, new_sl, new_target):
+    """Calls PUT /v3/order/gtt/modify to dynamically update STOPLOSS & TARGET trigger prices."""
+    token = get_valid_token()
+    if not token:
+        return False, "Upstox token unavailable."
+
+    gtt_order_id = gtt_order.get("gtt_order_id")
+    if not gtt_order_id:
+        return False, "Missing gtt_order_id."
+
+    raw_rules = gtt_order.get("raw_rules") or []
+    entry_rule = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "ENTRY"), None)
+    if not entry_rule:
+        return False, "GTT ENTRY rule missing."
+
+    updated_rules = [
+        {
+            "strategy": "ENTRY",
+            "trigger_type": entry_rule.get("trigger_type", "IMMEDIATE"),
+            "trigger_price": float(entry_rule.get("trigger_price", 0.05))
+        }
+    ]
+
+    existing_target = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "TARGET"), None)
+    if new_target is not None:
+        updated_rules.append({
+            "strategy": "TARGET",
+            "trigger_type": "IMMEDIATE",
+            "trigger_price": float(new_target)
+        })
+    elif existing_target:
+        updated_rules.append({
+            "strategy": "TARGET",
+            "trigger_type": existing_target.get("trigger_type", "IMMEDIATE"),
+            "trigger_price": float(existing_target.get("trigger_price", 0.05))
+        })
+
+    existing_sl = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "STOPLOSS"), None)
+    if new_sl is not None:
+        updated_rules.append({
+            "strategy": "STOPLOSS",
+            "trigger_type": "IMMEDIATE",
+            "trigger_price": float(new_sl)
+        })
+    elif existing_sl:
+        updated_rules.append({
+            "strategy": "STOPLOSS",
+            "trigger_type": existing_sl.get("trigger_type", "IMMEDIATE"),
+            "trigger_price": float(existing_sl.get("trigger_price", 0.05))
+        })
+
+    payload = {
+        "type": gtt_order.get("type", "MULTIPLE"),
+        "quantity": int(gtt_order.get("quantity", 1)),
+        "gtt_order_id": gtt_order_id,
+        "rules": updated_rules
+    }
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+    try:
+        res = requests.put(
+            "https://api.upstox.com/v3/order/gtt/modify",
+            json=payload,
+            headers=headers,
+            proxies=get_upstox_proxies(),
+            timeout=10
+        )
+        resp_json = res.json() if res.content else {}
+        if res.status_code == 200 and resp_json.get("status") == "success":
+            return True, f"Updated {gtt_order_id} -> SL: {new_sl or 'N/A'} | Target: {new_target or 'N/A'}"
+        err_msg = resp_json.get("errors", [{}])[0].get("message") if isinstance(resp_json.get("errors"), list) and resp_json.get("errors") else res.text
+        return False, f"GTT Modify Rejected ({res.status_code}): {err_msg}"
+    except Exception as e:
+        return False, f"GTT Modify Exception: {e}"
+
+def process_dynamic_sl_and_target(positions, gtt_orders, default_sl_pct=None, default_target_pct=None):
+    """
+    Evaluates all live OPEN positions (quantity != 0), updates peak favorable LTP,
+    computes dynamic trailing SL & Target, modifies Upstox GTT orders if levels improved,
+    and attaches live dynamic SL/Target info onto each position dict.
+    """
+    tsl_state = load_dynamic_tsl_state()
+    contracts_map = tsl_state.setdefault("contracts", {})
+    by_token_map = tsl_state.setdefault("by_token", {})
+    state_dirty = False
+    updates_log = []
+
+    active_gtt_by_symbol = {}
+    for g in gtt_orders:
+        ts = str(g.get("trading_symbol", "")).strip().upper()
+        st = str(g.get("status", "")).strip().lower()
+        if ts and st in OPEN_ORDER_STATUSES:
+            active_gtt_by_symbol[ts] = g
+
+    for p in positions:
+        qty = p.get("quantity", 0) or 0
+        ts = str(p.get("trading_symbol", "")).strip().upper()
+        inst_token = str(p.get("instrument_token", "")).strip()
+        ltp = float(p.get("ltp", 0.0) or 0.0)
+
+        p["best_price"] = None
+        p["dynamic_sl"] = None
+        p["dynamic_target"] = None
+
+        if qty == 0 or not ts:
+            if ts in contracts_map:
+                del contracts_map[ts]
+                state_dirty = True
+            continue
+
+        side = "BUY" if qty > 0 else "SELL"
+        entry_price = float(p.get("buy_price", 0.0) if side == "BUY" else p.get("sell_price", 0.0)) or ltp
+
+        matching_gtt = active_gtt_by_symbol.get(ts)
+        rec = contracts_map.get(ts)
+        if not rec and inst_token and inst_token in by_token_map:
+            rec = dict(by_token_map[inst_token])
+            contracts_map[ts] = rec
+            state_dirty = True
+
+        # Recover or initialize tracker if missing
+        if not rec:
+            gtt_entry = entry_price
+            gtt_sl = None
+            gtt_tgt = None
+            inferred_sl_pct = default_sl_pct
+            inferred_tgt_pct = default_target_pct
+
+            if matching_gtt:
+                raw_rules = matching_gtt.get("raw_rules") or []
+                e_rule = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "ENTRY"), None)
+                s_rule = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "STOPLOSS"), None)
+                t_rule = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "TARGET"), None)
+                if e_rule and float(e_rule.get("trigger_price", 0)) > 0:
+                    gtt_entry = float(e_rule["trigger_price"])
+                if s_rule and float(s_rule.get("trigger_price", 0)) > 0:
+                    gtt_sl = float(s_rule["trigger_price"])
+                    if gtt_entry > 0:
+                        inferred_sl_pct = round(abs(gtt_entry - gtt_sl) / gtt_entry * 100.0, 4)
+                if t_rule and float(t_rule.get("trigger_price", 0)) > 0:
+                    gtt_tgt = float(t_rule["trigger_price"])
+                    if gtt_entry > 0:
+                        inferred_tgt_pct = round(abs(gtt_tgt - gtt_entry) / gtt_entry * 100.0, 4)
+
+            if (inferred_sl_pct is None or inferred_sl_pct <= 0) and (inferred_tgt_pct is None or inferred_tgt_pct <= 0):
+                continue
+
+            rec = {
+                "side": side,
+                "entry_price": entry_price if entry_price > 0 else gtt_entry,
+                "best_price": entry_price if entry_price > 0 else gtt_entry,
+                "sl_percent": inferred_sl_pct,
+                "target_percent": inferred_tgt_pct,
+                "current_sl": gtt_sl,
+                "current_target": gtt_tgt
+            }
+            contracts_map[ts] = rec
+            state_dirty = True
+
+        # Keep actual broker fill price if available
+        if entry_price > 0 and abs(rec.get("entry_price", 0) - entry_price) > 0.01:
+            rec["entry_price"] = entry_price
+            state_dirty = True
+
+        sl_pct = rec.get("sl_percent")
+        tgt_pct = rec.get("target_percent")
+        if (sl_pct is None or sl_pct <= 0) and (tgt_pct is None or tgt_pct <= 0):
+            continue
+
+        # Sync existing GTT triggers if present so we never move backwards
+        broker_sl = rec.get("current_sl")
+        broker_tgt = rec.get("current_target")
+        if matching_gtt:
+            raw_rules = matching_gtt.get("raw_rules") or []
+            s_rule = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "STOPLOSS"), None)
+            t_rule = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "TARGET"), None)
+            if s_rule and float(s_rule.get("trigger_price", 0)) > 0:
+                g_sl = float(s_rule["trigger_price"])
+                broker_sl = max(broker_sl, g_sl) if (side == "BUY" and broker_sl is not None) else (min(broker_sl, g_sl) if (side == "SELL" and broker_sl is not None) else g_sl)
+            if t_rule and float(t_rule.get("trigger_price", 0)) > 0:
+                g_tgt = float(t_rule["trigger_price"])
+                broker_tgt = max(broker_tgt, g_tgt) if (side == "BUY" and broker_tgt is not None) else (min(broker_tgt, g_tgt) if (side == "SELL" and broker_tgt is not None) else g_tgt)
+
+        dyn = compute_dynamic_sl_target(
+            side=side,
+            entry_price=rec["entry_price"],
+            current_ltp=ltp,
+            prev_best_price=rec.get("best_price"),
+            sl_percent=sl_pct,
+            target_percent=tgt_pct,
+            prev_sl=broker_sl,
+            prev_target=broker_tgt
+        )
+
+        if dyn["best_price"] != rec.get("best_price"):
+            rec["best_price"] = dyn["best_price"]
+            state_dirty = True
+
+        new_sl = dyn["new_sl"]
+        new_target = dyn["new_target"]
+
+        sl_improved = (
+            new_sl is not None and (
+                broker_sl is None
+                or (side == "BUY" and new_sl - broker_sl >= 0.05)
+                or (side == "SELL" and broker_sl - new_sl >= 0.05)
+            )
+        )
+        tgt_improved = (
+            new_target is not None and (
+                broker_tgt is None
+                or (side == "BUY" and new_target - broker_tgt >= 0.05)
+                or (side == "SELL" and broker_tgt - new_target >= 0.05)
+            )
+        )
+
+        # Safety check: ensure new SL has not already crossed live LTP
+        if sl_improved and ltp > 0:
+            if (side == "BUY" and new_sl >= ltp) or (side == "SELL" and new_sl <= ltp):
+                sl_improved = False
+
+        if (sl_improved or tgt_improved) and matching_gtt:
+            ok, mod_msg = modify_upstox_gtt_sl_target(
+                matching_gtt,
+                new_sl if sl_improved else broker_sl,
+                new_target if tgt_improved else broker_tgt
+            )
+            if ok:
+                rec["current_sl"] = new_sl if sl_improved else broker_sl
+                rec["current_target"] = new_target if tgt_improved else broker_tgt
+                state_dirty = True
+                updates_log.append(f"Dynamic Trail ({ts}): {mod_msg}")
+            else:
+                print(f"[Dynamic TSL Modify Warning] {ts}: {mod_msg}")
+        else:
+            if new_sl is not None and rec.get("current_sl") != new_sl:
+                rec["current_sl"] = new_sl
+                state_dirty = True
+            if new_target is not None and rec.get("current_target") != new_target:
+                rec["current_target"] = new_target
+                state_dirty = True
+
+        p["best_price"] = rec.get("best_price")
+        p["dynamic_sl"] = rec.get("current_sl")
+        p["dynamic_target"] = rec.get("current_target")
+
+    if state_dirty:
+        save_dynamic_tsl_state(tsl_state)
+
+    return updates_log
 
 def fetch_dashboard_order_config():
     """Fetches cells B16:B28 from Google Sheet tab 'DASHBOARD' with cache-busting and headers=0."""
@@ -655,7 +995,19 @@ def submit_upstox_evaluated_order(evaluated_order):
 
             if res.status_code == 200 and resp_json.get("status") == "success":
                 gtt_ids = resp_json.get("data", {}).get("gtt_order_ids", [])
-                return True, f"GTT Multi-Leg Order Placed! ID(s): {', '.join(gtt_ids) if gtt_ids else 'Confirmed'} | Entry: ₹{entry_price} | SL: {sl_price or 'Blank'} | Target: {target_price or 'Blank'}", False
+                # Seed dynamic TSL tracker for this contract
+                tsl_state = load_dynamic_tsl_state()
+                tsl_state.setdefault("by_token", {})[inst_token] = {
+                    "side": txn_type,
+                    "entry_price": entry_price,
+                    "best_price": entry_price,
+                    "sl_percent": evaluated_order.get("sl_percent"),
+                    "target_percent": evaluated_order.get("target_percent"),
+                    "current_sl": sl_price,
+                    "current_target": target_price
+                }
+                save_dynamic_tsl_state(tsl_state)
+                return True, f"GTT Multi-Leg Order Placed! ID(s): {', '.join(gtt_ids) if gtt_ids else 'Confirmed'} | Entry: ₹{entry_price} | Dynamic SL: {sl_price or 'Blank'} | Dynamic Target: {target_price or 'Blank'}", False
             else:
                 err_detail = resp_json.get("errors", [{}])[0].get("message") if isinstance(resp_json.get("errors"), list) and resp_json.get("errors") else res.text
                 if res.status_code == 403 and "static IP" in err_detail:
@@ -1014,10 +1366,13 @@ def fetch_upstox_positions():
                     entry_rule = next((r for r in rules if str(r.get("strategy", "")).upper() == "ENTRY"), rules[0] if rules else {})
                     gtt_orders.append({
                         "gtt_order_id": g.get("gtt_order_id", ""),
+                        "type": g.get("type", "MULTIPLE"),
+                        "instrument_token": g.get("instrument_token", ""),
                         "trading_symbol": g.get("trading_symbol", ""),
                         "transaction_type": g.get("transaction_type", ""),
                         "quantity": g.get("quantity", 0),
-                        "status": entry_rule.get("status") or g.get("status", "")
+                        "status": entry_rule.get("status") or g.get("status", ""),
+                        "raw_rules": rules
                     })
         except Exception:
             pass
@@ -1029,6 +1384,7 @@ def fetch_upstox_positions():
 
         for p in positions_raw:
             trading_symbol = p.get("trading_symbol", "")
+            instrument_token = p.get("instrument_token", "")
             quantity = p.get("quantity", 0)
             buy_price = p.get("buy_price", 0.0) or 0.0
             sell_price = p.get("sell_price", 0.0) or 0.0
@@ -1044,12 +1400,16 @@ def fetch_upstox_positions():
 
             positions.append({
                 "trading_symbol": trading_symbol,
+                "instrument_token": instrument_token,
                 "product": product,
                 "quantity": quantity,
                 "buy_price": round(buy_price, 2),
                 "sell_price": round(sell_price, 2),
                 "ltp": round(ltp, 2),
                 "pnl": round(pnl, 2),
+                "best_price": None,
+                "dynamic_sl": None,
+                "dynamic_target": None,
                 "status": "OPEN" if quantity != 0 else "CLOSED"
             })
 
@@ -2216,7 +2576,7 @@ POSITIONS_HTML_TEMPLATE = """
         .section-title { font-size: 18px; font-weight: bold; color: #f8fafc; margin-top: 25px; margin-bottom: 12px; border-left: 4px solid #38bdf8; padding-left: 10px; }
         
         .table-container { overflow-x: auto; background: #1e293b; border-radius: 10px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); margin-bottom: 25px; }
-        table { width: 100%; border-collapse: collapse; min-width: 900px; }
+        table { width: 100%; border-collapse: collapse; min-width: 1050px; }
         th, td { border: 1px solid #334155; padding: 10px 14px; text-align: center; font-size: 13px; }
         th { background-color: #0f172a; color: #38bdf8; text-transform: uppercase; font-size: 12px; }
         tr:nth-child(even){ background-color: #172554; }
@@ -2229,7 +2589,7 @@ POSITIONS_HTML_TEMPLATE = """
 <body>
     <h2>🔐 Private Live Trade & Positions Dashboard</h2>
     <div class="subtitle">
-        <span>Real-time Upstox Portfolio, Automated Google Sheet Order Engine & Executed Log</span>
+        <span>Real-time Upstox Portfolio, Automated Google Sheet Order Engine & Dynamic Trailing SL/Target</span>
         <span class="timer-badge" id="syncBadge">Auto Sync: <span id="countdown">10</span>s</span>
     </div>
 
@@ -2304,11 +2664,11 @@ POSITIONS_HTML_TEMPLATE = """
                     <div class="order-field-val" style="color: #facc15;" id="moTotalInvest">-</div>
                 </div>
                 <div class="order-field">
-                    <div class="order-field-label">Stop Loss (B26)</div>
+                    <div class="order-field-label">Initial Dynamic SL (B26)</div>
                     <div class="order-field-val" style="color: #f87171;" id="moStopLoss">-</div>
                 </div>
                 <div class="order-field">
-                    <div class="order-field-label">Profit Target (B27)</div>
+                    <div class="order-field-label">Initial Dynamic Target (B27)</div>
                     <div class="order-field-val" style="color: #4ade80;" id="moTarget">-</div>
                 </div>
             </div>
@@ -2338,7 +2698,7 @@ POSITIONS_HTML_TEMPLATE = """
         </div>
     </div>
 
-    <div class="section-title">📊 Live & Closed Positions</div>
+    <div class="section-title">📊 Live & Closed Positions (Dynamic Trailing SL & Target Active)</div>
     <div class="table-container">
         <table>
             <thead>
@@ -2350,11 +2710,14 @@ POSITIONS_HTML_TEMPLATE = """
                     <th>Avg Buy Price</th>
                     <th>Avg Sell Price</th>
                     <th>LTP</th>
+                    <th>Peak LTP</th>
+                    <th>Dynamic SL</th>
+                    <th>Dynamic Target</th>
                     <th>P&L (₹)</th>
                 </tr>
             </thead>
             <tbody id="positionsBody">
-                <tr><td colspan="8" style="color: #94a3b8;">Loading positions...</td></tr>
+                <tr><td colspan="11" style="color: #94a3b8;">Loading positions...</td></tr>
             </tbody>
         </table>
     </div>
@@ -2510,6 +2873,8 @@ POSITIONS_HTML_TEMPLATE = """
 
             if (orderState.auto_execution_notice) {
                 showToast(orderState.auto_execution_notice, orderState.auto_execution_ok ? "success" : "error");
+            } else if (orderState.tsl_updates && orderState.tsl_updates.length > 0) {
+                showToast("📈 " + orderState.tsl_updates.join(" | "), "success");
             }
 
             if (orderState.is_cancelled) {
@@ -2538,11 +2903,11 @@ POSITIONS_HTML_TEMPLATE = """
                 document.getElementById("moTotalInvest").innerText = `₹ ${Number(ev.total_investment).toLocaleString('en-IN')}`;
                 
                 document.getElementById("moStopLoss").innerText = (ev.sl_price !== null && ev.sl_price !== undefined)
-                    ? `₹ ${ev.sl_price} (${ev.sl_percent}%)`
+                    ? `₹ ${ev.sl_price} (${ev.sl_percent}% Dynamic)`
                     : "Blank (Self-Monitor)";
                 
                 document.getElementById("moTarget").innerText = (ev.target_price !== null && ev.target_price !== undefined)
-                    ? `₹ ${ev.target_price} (${ev.target_percent}%)`
+                    ? `₹ ${ev.target_price} (${ev.target_percent}% Dynamic)`
                     : "Blank (Self-Monitor)";
 
                 const warnBadge = document.getElementById("manualGuardWarningBadge");
@@ -2651,6 +3016,9 @@ POSITIONS_HTML_TEMPLATE = """
                             const pnlColor = pnlNum >= 0 ? '#22c55e' : '#ef4444';
                             const badge = p.status === 'OPEN' ? '<span class="status-open">OPEN</span>' : '<span class="status-closed">CLOSED</span>';
                             const formattedPnl = pnlNum.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                            const peakText = (p.best_price !== null && p.best_price !== undefined) ? `₹ ${p.best_price}` : '-';
+                            const dynSlText = (p.dynamic_sl !== null && p.dynamic_sl !== undefined) ? `<span style="color:#f87171; font-weight:bold;">₹ ${p.dynamic_sl}</span>` : '-';
+                            const dynTgtText = (p.dynamic_target !== null && p.dynamic_target !== undefined) ? `<span style="color:#4ade80; font-weight:bold;">₹ ${p.dynamic_target}</span>` : '-';
 
                             html += `<tr>
                                 <td>${badge}</td>
@@ -2660,12 +3028,15 @@ POSITIONS_HTML_TEMPLATE = """
                                 <td>₹ ${p.buy_price}</td>
                                 <td>₹ ${p.sell_price}</td>
                                 <td>₹ ${p.ltp}</td>
+                                <td style="color:#facc15;">${peakText}</td>
+                                <td>${dynSlText}</td>
+                                <td>${dynTgtText}</td>
                                 <td style="font-weight: bold; color: ${pnlColor};">₹ ${formattedPnl}</td>
                             </tr>`;
                         });
                         posBody.innerHTML = html;
                     } else {
-                        posBody.innerHTML = `<tr><td colspan="8" style="color: #94a3b8;">No open or closed positions found for today.</td></tr>`;
+                        posBody.innerHTML = `<tr><td colspan="11" style="color: #94a3b8;">No open or closed positions found for today.</td></tr>`;
                     }
 
                     const ordBody = document.getElementById("ordersBody");
@@ -2792,7 +3163,7 @@ def api_manual_order_action():
 
 @app.route("/api/positions")
 def api_positions():
-    """Background API route fetching live Upstox positions, order log, and DASHBOARD order engine every 10s."""
+    """Background API route fetching live Upstox positions, running Dynamic SL/Target trailing, and syncing DASHBOARD order engine every 10s."""
     positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, error = fetch_upstox_positions()
 
     order_engine_payload = {
@@ -2810,11 +3181,22 @@ def api_positions():
         "is_cancelled": False,
         "show_static_ip_bar": False,
         "auto_execution_notice": None,
-        "auto_execution_ok": False
+        "auto_execution_ok": False,
+        "tsl_updates": []
     }
 
     with ORDER_EXECUTION_LOCK:
         cfg, cfg_err = fetch_dashboard_order_config()
+
+        # Run Dynamic Trailing SL & Target on all open positions
+        tsl_updates = process_dynamic_sl_and_target(
+            positions=positions,
+            gtt_orders=gtt_orders,
+            default_sl_pct=cfg["sl_percent"] if cfg else None,
+            default_target_pct=cfg["target_percent"] if cfg else None
+        )
+        order_engine_payload["tsl_updates"] = tsl_updates
+
         if cfg_err or not cfg:
             order_engine_payload["status_message"] = cfg_err or "Unable to read DASHBOARD sheet."
         else:
