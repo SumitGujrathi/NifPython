@@ -35,6 +35,20 @@ INSTRUMENT_KEYS = {
     "BANKNIFTY": "NSE_INDEX|Nifty Bank"
 }
 
+OPEN_ORDER_STATUSES = {
+    "open",
+    "pending",
+    "trigger pending",
+    "open pending",
+    "validation pending",
+    "modify pending",
+    "modify validation pending",
+    "after market order req received",
+    "put order req received",
+    "scheduled",
+    "active"
+}
+
 AUTH_COOLDOWN = {
     "last_failure_time": 0,
     "cooldown_duration": 1500  # 25 minutes safety lockout
@@ -250,7 +264,6 @@ def update_upstox_static_ip(primary_ip, secondary_ip=None):
         )
         resp_json = res.json() if res.content else {}
         if res.status_code == 200 and resp_json.get("status") == "success":
-            # Upstox invalidates active tokens upon Static IP update; re-auth immediately via TOTP
             invalidate_session()
             new_token = perform_single_auth(force_refresh=True)
             reauth_note = "Session automatically refreshed via TOTP." if new_token else "Please update UPSTOX_ACCESS_TOKEN or re-authenticate."
@@ -279,7 +292,7 @@ def load_auto_order_state():
                     return data
     except Exception as e:
         print(f"[Order State Warning] Read failed: {e}")
-    return {"date": today_str, "executed_symbols": {}, "last_auto_result": None, "cancelled_signatures": []}
+    return {"date": today_str, "recent_submissions": {}, "cancelled_signatures": []}
 
 def save_auto_order_state(state):
     try:
@@ -294,7 +307,7 @@ def round_tick(price, tick=0.05):
     return round(round(price / tick) * tick, 2)
 
 def fetch_dashboard_order_config():
-    """Fetches cells B16:B27 from Google Sheet tab 'DASHBOARD' with cache-busting and headers=0."""
+    """Fetches cells B16:B28 from Google Sheet tab 'DASHBOARD' with cache-busting and headers=0."""
     sheet_id = SPREADSHEET_ID or "1fpXdodshvwHcduwffOhEK54K-a7a4TmOZF2Q-EgVRzM"
     cache_buster = int(time.time() * 1000)
     headers = {
@@ -303,7 +316,7 @@ def fetch_dashboard_order_config():
         "Pragma": "no-cache"
     }
     urls = [
-        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&headers=0&sheet=DASHBOARD&range=A16:Z27&_cb={cache_buster}",
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&headers=0&sheet=DASHBOARD&range=A16:Z28&_cb={cache_buster}",
         f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&headers=0&sheet=DASHBOARD&_cb={cache_buster}"
     ]
 
@@ -343,11 +356,11 @@ def fetch_dashboard_order_config():
                         label_values[norm_key] = val
 
         def get_b_cell(row_num_1based, rel_idx_16):
-            if len(grid) == 12 and rel_idx_16 < 12 and len(grid[rel_idx_16]) >= 2:
+            if len(grid) in (12, 13) and rel_idx_16 < len(grid) and len(grid[rel_idx_16]) >= 2:
                 val = str(grid[rel_idx_16][1]).strip()
                 if val != "":
                     return val
-            if len(grid) >= 27 and len(grid[row_num_1based - 1]) >= 2:
+            if len(grid) >= row_num_1based and len(grid[row_num_1based - 1]) >= 2:
                 val = str(grid[row_num_1based - 1][1]).strip()
                 if val != "":
                     return val
@@ -394,6 +407,9 @@ def fetch_dashboard_order_config():
         tgt_raw = resolve_field(["target_percent"], 27, 11).replace("%", "").strip()
         target_percent = float(tgt_raw) if tgt_raw != "" else None
 
+        active_raw = resolve_field(["active_trade", "active_trades", "max_active_trade", "max_active_trades"], 28, 12).replace(",", "").strip()
+        max_active_trades = int(float(active_raw)) if active_raw != "" else 1
+
         cfg = {
             "manual_order": manual_mode,
             "manual_order_raw": manual_raw or manual_mode,
@@ -407,12 +423,13 @@ def fetch_dashboard_order_config():
             "quantity": quantity,
             "product": product,
             "sl_percent": sl_percent,
-            "target_percent": target_percent
+            "target_percent": target_percent,
+            "max_active_trades": max_active_trades
         }
         return cfg, None
 
     except Exception as e:
-        return None, f"Error parsing DASHBOARD sheet B16:B27: {e}"
+        return None, f"Error parsing DASHBOARD sheet B16:B28: {e}"
 
 def resolve_monthly_expiry_date(symbol, expiry_month, headers):
     """Fetches option contracts and picks the last expiry date in the requested month."""
@@ -585,7 +602,7 @@ def submit_upstox_evaluated_order(evaluated_order):
     """Places either a GTT Multi-Leg order (when SL or Target exists) or a standard Limit order via static IP/proxy."""
     token = get_valid_token()
     if not token:
-        return False, "Authentication token missing or paused."
+        return False, "Authentication token missing or paused.", False
 
     headers = {
         "Accept": "application/json",
@@ -638,13 +655,13 @@ def submit_upstox_evaluated_order(evaluated_order):
 
             if res.status_code == 200 and resp_json.get("status") == "success":
                 gtt_ids = resp_json.get("data", {}).get("gtt_order_ids", [])
-                return True, f"GTT Multi-Leg Order Placed! ID(s): {', '.join(gtt_ids) if gtt_ids else 'Confirmed'} | Entry: ₹{entry_price} | SL: {sl_price or 'Blank'} | Target: {target_price or 'Blank'}"
+                return True, f"GTT Multi-Leg Order Placed! ID(s): {', '.join(gtt_ids) if gtt_ids else 'Confirmed'} | Entry: ₹{entry_price} | SL: {sl_price or 'Blank'} | Target: {target_price or 'Blank'}", False
             else:
                 err_detail = resp_json.get("errors", [{}])[0].get("message") if isinstance(resp_json.get("errors"), list) and resp_json.get("errors") else res.text
                 if res.status_code == 403 and "static IP" in err_detail:
                     cur_ip = get_current_outbound_ip()
-                    return False, f"Upstox Static IP Block (403): Outbound IP '{cur_ip}' is not registered. Click 'Register Server IP' above or configure STATIC_IP_PROXY_URL."
-                return False, f"Upstox GTT Order Rejected ({res.status_code}): {err_detail}"
+                    return False, f"Upstox Static IP Block (403): Outbound IP '{cur_ip}' is not registered. Click 'Register Server IP' above or configure STATIC_IP_PROXY_URL.", True
+                return False, f"Upstox GTT Order Rejected ({res.status_code}): {err_detail}", False
 
         else:
             payload = {
@@ -667,32 +684,123 @@ def submit_upstox_evaluated_order(evaluated_order):
             if res.status_code == 200 and resp_json.get("status") == "success":
                 order_ids = resp_json.get("data", {}).get("order_ids", [])
                 order_id = order_ids[0] if order_ids else resp_json.get("data", {}).get("order_id", "Confirmed")
-                return True, f"Limit Order Placed! Order ID: {order_id} | Entry: ₹{entry_price} | SL & Target: Blank (Self-Monitored)"
+                return True, f"Limit Order Placed! Order ID: {order_id} | Entry: ₹{entry_price} | SL & Target: Blank (Self-Monitored)", False
             else:
                 err_detail = resp_json.get("errors", [{}])[0].get("message") if isinstance(resp_json.get("errors"), list) and resp_json.get("errors") else res.text
                 if res.status_code == 403 and "static IP" in err_detail:
                     cur_ip = get_current_outbound_ip()
-                    return False, f"Upstox Static IP Block (403): Outbound IP '{cur_ip}' is not registered. Click 'Register Server IP' above or configure STATIC_IP_PROXY_URL."
-                return False, f"Upstox Limit Order Rejected ({res.status_code}): {err_detail}"
+                    return False, f"Upstox Static IP Block (403): Outbound IP '{cur_ip}' is not registered. Click 'Register Server IP' above or configure STATIC_IP_PROXY_URL.", True
+                return False, f"Upstox Limit Order Rejected ({res.status_code}): {err_detail}", False
 
     except Exception as e:
-        return False, f"Order API Exception: {e}"
+        return False, f"Order API Exception: {e}", False
 
-def check_existing_symbol_trade(symbol, positions, orders):
-    """Checks if an open/closed position or non-rejected order already exists today for symbol."""
-    sym_upper = symbol.upper()
+def extract_symbol_and_opt_type(trading_symbol):
+    """Extracts underlying ('NIFTY' / 'BANKNIFTY') and option type ('CE' / 'PE') from Upstox trading_symbol."""
+    ts = str(trading_symbol or "").strip().upper()
+    if not ts:
+        return None, None
+    underlying = None
+    if "BANKNIFTY" in ts:
+        underlying = "BANKNIFTY"
+    elif ts.startswith("NIFTY") or re.search(r'\bNIFTY\b', ts):
+        underlying = "NIFTY"
+
+    opt_match = re.search(r'(?:^|\s|\d)(CE|PE)(?:\s|$|\d)', ts)
+    opt_type = opt_match.group(1) if opt_match else None
+    return underlying, opt_type
+
+def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, positions, orders, gtt_orders=None):
+    """
+    Enforces:
+    1) Active Trade Max Limit from cell B28 (blocks if active_count >= max_active_trades).
+    2) Duplicate Script + Option Type Guard (blocks if same underlying + CE/PE is already active or in open order log across ANY strike, while allowing opposite CE/PE leg if B28 allows).
+    """
+    gtt_orders = gtt_orders or []
+    active_items = []
+    open_position_symbols = {}
+
+    # 1. Active Open Positions (quantity != 0)
     for p in positions:
-        ts = str(p.get("trading_symbol", "")).upper()
-        if ts.startswith(sym_upper):
-            return True, f"Existing position found ({p.get('trading_symbol')}, Status: {p.get('status')})"
+        qty = p.get("quantity", 0) or 0
+        ts = str(p.get("trading_symbol", "")).strip().upper()
+        if qty != 0 and ts:
+            open_position_symbols[ts] = qty
+            u, opt = extract_symbol_and_opt_type(ts)
+            active_items.append({
+                "source": "Active Position",
+                "trading_symbol": ts,
+                "underlying": u,
+                "option_type": opt,
+                "quantity": qty
+            })
 
+    # 2. Open / Pending Orders in Order Placement Log
     for o in orders:
-        ts = str(o.get("trading_symbol", "")).upper()
-        st = str(o.get("status", "")).lower()
-        if ts.startswith(sym_upper) and st not in ("rejected", "cancelled"):
-            return True, f"Existing order found today ({o.get('trading_symbol')}, Status: {o.get('status')})"
+        st = str(o.get("status", "")).strip().lower()
+        ts = str(o.get("trading_symbol", "")).strip().upper()
+        txn = str(o.get("transaction_type", "")).strip().upper()
+        if st in OPEN_ORDER_STATUSES and ts:
+            pos_qty = open_position_symbols.get(ts, 0)
+            is_exit_leg = (pos_qty > 0 and txn == "SELL") or (pos_qty < 0 and txn == "BUY")
+            if not is_exit_leg:
+                u, opt = extract_symbol_and_opt_type(ts)
+                active_items.append({
+                    "source": f"Open Order ({o.get('status', '')})",
+                    "trading_symbol": ts,
+                    "underlying": u,
+                    "option_type": opt,
+                    "status": o.get("status", "")
+                })
 
-    return False, None
+    # 3. Scheduled / Active GTT Entry Orders
+    for g in gtt_orders:
+        st = str(g.get("status", "")).strip().lower()
+        ts = str(g.get("trading_symbol", "")).strip().upper()
+        if st in OPEN_ORDER_STATUSES and ts and ts not in open_position_symbols:
+            u, opt = extract_symbol_and_opt_type(ts)
+            active_items.append({
+                "source": f"Active GTT ({g.get('status', '')})",
+                "trading_symbol": ts,
+                "underlying": u,
+                "option_type": opt,
+                "status": g.get("status", "")
+            })
+
+    active_count = len(active_items)
+
+    # Guard A: Duplicate Underlying + Option Type (CE/PE) check across any strike
+    duplicate_matches = [
+        item for item in active_items
+        if item["underlying"] == str(target_symbol).upper() and item["option_type"] == str(target_opt_type).upper()
+    ]
+    if duplicate_matches:
+        m = duplicate_matches[0]
+        return {
+            "allowed": False,
+            "active_count": active_count,
+            "max_active_trades": max_active_trades,
+            "block_type": "DUPLICATE",
+            "reason": f"Duplicate Blocked: {target_symbol} {target_opt_type} is already active/open ({m['trading_symbol']} - {m['source']})."
+        }
+
+    # Guard B: Active Trade Count Limit from Cell B28
+    if max_active_trades is not None and active_count >= max_active_trades:
+        return {
+            "allowed": False,
+            "active_count": active_count,
+            "max_active_trades": max_active_trades,
+            "block_type": "MAX_ACTIVE",
+            "reason": f"Active Trade Limit Reached ({active_count}/{max_active_trades} active). Close existing trade/open order before placing new order."
+        }
+
+    return {
+        "allowed": True,
+        "active_count": active_count,
+        "max_active_trades": max_active_trades,
+        "block_type": None,
+        "reason": f"Eligible ({active_count}/{max_active_trades} active trades)."
+    }
 
 # --- GOOGLE SHEET HISTORICAL & SIGNAL DATA LOADER ---
 def parse_timestamp(dt_str):
@@ -871,7 +979,7 @@ def fetch_history_from_gsheet(symbol="NIFTY", sheet_name=None):
 def fetch_upstox_positions():
     token = get_valid_token()
     if not token:
-        return [], [], 0.0, 0.0, 0.0, "Authentication paused or invalid."
+        return [], [], [], 0.0, 0.0, 0.0, "Authentication paused or invalid."
 
     headers = {
         "Accept": "application/json",
@@ -886,7 +994,7 @@ def fetch_upstox_positions():
             invalidate_session()
             token = perform_single_auth(force_refresh=True)
             if not token:
-                return [], [], 0.0, 0.0, 0.0, "Session expired."
+                return [], [], [], 0.0, 0.0, 0.0, "Session expired."
             headers["Authorization"] = f"Bearer {token}"
             pos_res = requests.get(pos_url, headers=headers, timeout=10)
 
@@ -895,6 +1003,24 @@ def fetch_upstox_positions():
         ord_url = "https://api.upstox.com/v2/order/retrieve-all"
         ord_res = requests.get(ord_url, headers=headers, timeout=10)
         orders_raw = ord_res.json().get("data", []) if ord_res.status_code == 200 else []
+
+        gtt_orders = []
+        try:
+            gtt_res = requests.get("https://api.upstox.com/v3/order/gtt", headers=headers, timeout=8)
+            if gtt_res.status_code == 200:
+                gtt_raw = gtt_res.json().get("data", []) or []
+                for g in gtt_raw:
+                    rules = g.get("rules", []) or []
+                    entry_rule = next((r for r in rules if str(r.get("strategy", "")).upper() == "ENTRY"), rules[0] if rules else {})
+                    gtt_orders.append({
+                        "gtt_order_id": g.get("gtt_order_id", ""),
+                        "trading_symbol": g.get("trading_symbol", ""),
+                        "transaction_type": g.get("transaction_type", ""),
+                        "quantity": g.get("quantity", 0),
+                        "status": entry_rule.get("status") or g.get("status", "")
+                    })
+        except Exception:
+            pass
 
         positions = []
         total_pnl = 0.0
@@ -940,11 +1066,11 @@ def fetch_upstox_positions():
                 "order_timestamp": o.get("order_timestamp", "")
             })
 
-        return positions, orders, round(total_pnl, 2), round(realised_pnl, 2), round(unrealised_pnl, 2), None
+        return positions, orders, gtt_orders, round(total_pnl, 2), round(realised_pnl, 2), round(unrealised_pnl, 2), None
 
     except Exception as e:
         print(f"[Positions Exception] Error fetching positions: {e}")
-        return [], [], 0.0, 0.0, 0.0, str(e)
+        return [], [], [], 0.0, 0.0, 0.0, str(e)
 
 # --- UPSTOX CONCURRENT DATA FETCHING ---
 def fetch_single_expiry_chain(instrument_key, expiry_date, headers):
@@ -1943,14 +2069,14 @@ POSITIONS_HTML_TEMPLATE = """
         .subtitle { color: #94a3b8; font-size: 13px; margin-bottom: 18px; display: flex; justify-content: space-between; align-items: center; }
         .timer-badge { background: #0284c7; color: #ffffff; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
         
-        /* STATIC IP WHITELIST BAR */
+        /* STATIC IP WHITELIST BAR (HIDDEN BY DEFAULT; SHOWN ONLY IF NEEDED) */
         .static-ip-bar {
             background: #131c31;
             border: 1px solid #334155;
             border-radius: 10px;
             padding: 12px 18px;
             margin-bottom: 14px;
-            display: flex;
+            display: none;
             justify-content: space-between;
             align-items: center;
             flex-wrap: wrap;
@@ -1989,6 +2115,8 @@ POSITIONS_HTML_TEMPLATE = """
         .badge-mode-manual { background: #78350f; color: #fbbf24; padding: 5px 12px; border-radius: 6px; font-weight: bold; font-size: 13px; border: 1px solid #f59e0b; }
         .badge-want-yes { background: #1e3a8a; color: #60a5fa; padding: 5px 10px; border-radius: 6px; font-weight: bold; font-size: 12px; }
         .badge-want-no { background: #334155; color: #94a3b8; padding: 5px 10px; border-radius: 6px; font-weight: bold; font-size: 12px; }
+        .badge-active-ok { background: #064e3b; color: #6ee7b7; padding: 5px 10px; border-radius: 6px; font-weight: bold; font-size: 12px; border: 1px solid #10b981; }
+        .badge-active-full { background: #7f1d1d; color: #fca5a5; padding: 5px 10px; border-radius: 6px; font-weight: bold; font-size: 12px; border: 1px solid #ef4444; }
 
         /* MANUAL ORDER APPROVAL PANEL */
         .order-approval-box {
@@ -2040,7 +2168,7 @@ POSITIONS_HTML_TEMPLATE = """
             transition: opacity 0.2s;
         }
         .btn-place-order:hover { opacity: 0.9; }
-        .btn-place-order:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-place-order:disabled { opacity: 0.45; cursor: not-allowed; background-color: #475569; color: #94a3b8; }
         .btn-cancel-order {
             background-color: #ef4444;
             color: #ffffff;
@@ -2105,8 +2233,8 @@ POSITIONS_HTML_TEMPLATE = """
         <span class="timer-badge" id="syncBadge">Auto Sync: <span id="countdown">10</span>s</span>
     </div>
 
-    <!-- UPSTOX STATIC IP STATUS & WHITELIST BAR -->
-    <div class="static-ip-bar">
+    <!-- UPSTOX STATIC IP STATUS & WHITELIST BAR (HIDDEN UNLESS ?show_ip=1 OR 403 ERROR) -->
+    <div id="staticIpBar" class="static-ip-bar">
         <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
             <span style="font-weight: bold; color: #e2e8f0; font-size: 13px;">🌐 Upstox Static IP Check:</span>
             <span style="font-size: 12px; color: #94a3b8;">Server Outbound IP:</span>
@@ -2126,6 +2254,7 @@ POSITIONS_HTML_TEMPLATE = """
             <span style="font-weight: bold; color: #e2e8f0; font-size: 14px;">Manual Order Condition (B16):</span>
             <span id="badgeManualCondition" class="badge-mode-manual">LOADING...</span>
             <span id="badgeWantToTrade" class="badge-want-no">Want to Trade (B17): -</span>
+            <span id="badgeActiveTrades" class="badge-active-ok">Active Trades (B28): -</span>
             <span id="badgeMaxInvest" style="color: #94a3b8; font-size: 13px; font-weight: 600;">Max Invest (B18): -</span>
             <span id="badgeSheetSyncTime" style="color: #64748b; font-size: 12px;">Last Sheet Sync: -</span>
         </div>
@@ -2142,8 +2271,8 @@ POSITIONS_HTML_TEMPLATE = """
     <div id="manualOrderPanel" class="order-approval-box" style="display: none;">
         <div style="flex: 1;">
             <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap;">
-                <span style="font-size: 16px; font-weight: 800; color: #fbbf24;">📋 Pending Manual Order Approval (DASHBOARD B16:B27)</span>
-                <span id="manualDuplicateBadge" style="display: none; background: #7f1d1d; color: #fca5a5; padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: bold;">⚠️ Duplicate / Existing Trade Active Today</span>
+                <span style="font-size: 16px; font-weight: 800; color: #fbbf24;">📋 Pending Manual Order Approval (DASHBOARD B16:B28)</span>
+                <span id="manualGuardWarningBadge" style="display: none; background: #7f1d1d; color: #fca5a5; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: bold;">⚠️ Blocked by Active/Duplicate Trade Guard</span>
             </div>
             <div class="order-details-grid">
                 <div class="order-field">
@@ -2256,6 +2385,14 @@ POSITIONS_HTML_TEMPLATE = """
         let latestEvaluatedOrder = null;
         let detectedOutboundIp = "";
 
+        function revealStaticIpBarIfNeeded(forceShow = false) {
+            const params = new URLSearchParams(window.location.search);
+            if (forceShow || params.get("show_ip") === "1") {
+                document.getElementById("staticIpBar").style.display = "flex";
+                checkStaticIpStatus();
+            }
+        }
+
         function showToast(msg, type = 'info') {
             const banner = document.getElementById("orderToastBanner");
             banner.className = "toast-banner toast-" + type;
@@ -2340,6 +2477,7 @@ POSITIONS_HTML_TEMPLATE = """
 
             const modeBadge = document.getElementById("badgeManualCondition");
             const wantBadge = document.getElementById("badgeWantToTrade");
+            const activeBadge = document.getElementById("badgeActiveTrades");
             const investBadge = document.getElementById("badgeMaxInvest");
             const syncTimeBadge = document.getElementById("badgeSheetSyncTime");
             const statusText = document.getElementById("engineStatusText");
@@ -2354,12 +2492,21 @@ POSITIONS_HTML_TEMPLATE = """
             wantBadge.innerText = `Want to Trade (B17): ${want}`;
             wantBadge.className = (want === "YES") ? "badge-want-yes" : "badge-want-no";
 
+            const curAct = orderState.active_trade_count ?? 0;
+            const maxAct = orderState.max_active_trades ?? 1;
+            activeBadge.innerText = `Active Trades (B28): ${curAct} / ${maxAct}`;
+            activeBadge.className = (curAct >= maxAct) ? "badge-active-full" : "badge-active-ok";
+
             const maxInv = orderState.amount_to_invest || 0;
             investBadge.innerText = `Max Invest (B18): ₹${Number(maxInv).toLocaleString('en-IN')}`;
             if (orderState.sheet_synced_at) {
                 syncTimeBadge.innerText = `Last Sheet Sync: ${orderState.sheet_synced_at}`;
             }
             statusText.innerText = orderState.status_message || "";
+
+            if (orderState.show_static_ip_bar) {
+                revealStaticIpBarIfNeeded(true);
+            }
 
             if (orderState.auto_execution_notice) {
                 showToast(orderState.auto_execution_notice, orderState.auto_execution_ok ? "success" : "error");
@@ -2398,8 +2545,18 @@ POSITIONS_HTML_TEMPLATE = """
                     ? `₹ ${ev.target_price} (${ev.target_percent}%)`
                     : "Blank (Self-Monitor)";
 
-                const dupBadge = document.getElementById("manualDuplicateBadge");
-                dupBadge.style.display = orderState.duplicate_exists ? "inline-block" : "none";
+                const warnBadge = document.getElementById("manualGuardWarningBadge");
+                const placeBtn = document.getElementById("btnPlaceOrder");
+                if (orderState.guard_blocked) {
+                    warnBadge.style.display = "inline-block";
+                    warnBadge.innerText = "⚠️ " + (orderState.guard_reason || "Blocked by Active/Duplicate Trade Guard");
+                    placeBtn.disabled = true;
+                    placeBtn.innerText = "🚫 Order Blocked";
+                } else {
+                    warnBadge.style.display = "none";
+                    placeBtn.disabled = false;
+                    placeBtn.innerText = "✅ Place Order";
+                }
             } else {
                 manualPanel.style.display = "none";
             }
@@ -2417,6 +2574,9 @@ POSITIONS_HTML_TEMPLATE = """
             })
             .then(res => res.json())
             .then(data => {
+                if (data.show_static_ip_bar) {
+                    revealStaticIpBarIfNeeded(true);
+                }
                 if (data.success) {
                     showToast("✅ " + data.message, "success");
                 } else {
@@ -2547,7 +2707,7 @@ POSITIONS_HTML_TEMPLATE = """
             }, 1000);
         }
 
-        checkStaticIpStatus();
+        revealStaticIpBarIfNeeded(false);
         fetchPositionsInBackground();
         startTimer();
     </script>
@@ -2601,30 +2761,54 @@ def api_manual_order_action():
             if cfg_err or not cfg:
                 return jsonify({"success": False, "message": cfg_err or "Could not read DASHBOARD sheet."})
 
+            positions, orders, gtt_orders, _, _, _, _ = fetch_upstox_positions()
+            guard = evaluate_trade_guards(
+                cfg["symbol"],
+                cfg["option_type"],
+                cfg["max_active_trades"],
+                positions,
+                orders,
+                gtt_orders
+            )
+            if not guard["allowed"]:
+                return jsonify({"success": False, "message": guard["reason"]})
+
             evaluated, eval_err = prepare_evaluated_order(cfg)
             if eval_err or not evaluated:
                 return jsonify({"success": False, "message": eval_err or "Order evaluation failed."})
 
-            ok, msg = submit_upstox_evaluated_order(evaluated)
-            return jsonify({"success": ok, "message": msg, "evaluated_order": evaluated})
+            ok, msg, is_ip_err = submit_upstox_evaluated_order(evaluated)
+            if ok:
+                state.setdefault("recent_submissions", {})[evaluated["signature"]] = time.time()
+                save_auto_order_state(state)
+            return jsonify({
+                "success": ok,
+                "message": msg,
+                "show_static_ip_bar": is_ip_err,
+                "evaluated_order": evaluated
+            })
 
     return jsonify({"success": False, "message": "Invalid action."})
 
 @app.route("/api/positions")
 def api_positions():
     """Background API route fetching live Upstox positions, order log, and DASHBOARD order engine every 10s."""
-    positions, orders, total_pnl, realised_pnl, unrealised_pnl, error = fetch_upstox_positions()
+    positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, error = fetch_upstox_positions()
 
     order_engine_payload = {
         "manual_order": "Manual",
         "want_to_trade": "NO",
         "amount_to_invest": 0,
+        "max_active_trades": 1,
+        "active_trade_count": 0,
         "sheet_synced_at": get_ist_now().strftime("%H:%M:%S IST"),
         "status_message": "Initializing...",
         "show_manual_panel": False,
         "evaluated_order": None,
-        "duplicate_exists": False,
+        "guard_blocked": False,
+        "guard_reason": None,
         "is_cancelled": False,
+        "show_static_ip_bar": False,
         "auto_execution_notice": None,
         "auto_execution_ok": False
     }
@@ -2637,6 +2821,19 @@ def api_positions():
             order_engine_payload["manual_order"] = cfg["manual_order"]
             order_engine_payload["want_to_trade"] = cfg["want_to_trade"]
             order_engine_payload["amount_to_invest"] = cfg["amount_to_invest"]
+            order_engine_payload["max_active_trades"] = cfg["max_active_trades"]
+
+            guard = evaluate_trade_guards(
+                cfg["symbol"],
+                cfg["option_type"],
+                cfg["max_active_trades"],
+                positions,
+                orders,
+                gtt_orders
+            )
+            order_engine_payload["active_trade_count"] = guard["active_count"]
+            order_engine_payload["guard_blocked"] = not guard["allowed"]
+            order_engine_payload["guard_reason"] = guard["reason"] if not guard["allowed"] else None
 
             if cfg["want_to_trade"] != "YES":
                 order_engine_payload["status_message"] = "Trade Avoided — Want to Trade (B17) is not YES."
@@ -2646,27 +2843,23 @@ def api_positions():
                     order_engine_payload["status_message"] = eval_err or "Order evaluation skipped."
                 else:
                     order_engine_payload["evaluated_order"] = evaluated
-                    dup_found, dup_reason = check_existing_symbol_trade(cfg["symbol"], positions, orders)
-                    order_engine_payload["duplicate_exists"] = dup_found
-
                     state = load_auto_order_state()
 
                     if cfg["manual_order"].lower() == "auto":
-                        already_auto_traded = cfg["symbol"] in state.get("executed_symbols", {})
-                        if dup_found or already_auto_traded:
-                            reason = dup_reason if dup_found else f"Auto order already executed today for {cfg['symbol']}."
-                            order_engine_payload["status_message"] = f"Skipped (Single Trade/Day Guard): {reason}"
+                        if not guard["allowed"]:
+                            order_engine_payload["status_message"] = f"Skipped: {guard['reason']}"
                         else:
-                            ok, exec_msg = submit_upstox_evaluated_order(evaluated)
-                            state.setdefault("executed_symbols", {})[cfg["symbol"]] = {
-                                "time": get_ist_today_str(),
-                                "success": ok,
-                                "message": exec_msg
-                            }
-                            save_auto_order_state(state)
-                            order_engine_payload["status_message"] = f"Auto Mode Executed: {exec_msg}"
-                            order_engine_payload["auto_execution_notice"] = f"AUTO ORDER: {exec_msg}"
-                            order_engine_payload["auto_execution_ok"] = ok
+                            last_sub_ts = state.get("recent_submissions", {}).get(evaluated["signature"], 0)
+                            if time.time() - last_sub_ts < 25:
+                                order_engine_payload["status_message"] = "Order submitted — waiting for Upstox order book sync..."
+                            else:
+                                ok, exec_msg, is_ip_err = submit_upstox_evaluated_order(evaluated)
+                                state.setdefault("recent_submissions", {})[evaluated["signature"]] = time.time()
+                                save_auto_order_state(state)
+                                order_engine_payload["show_static_ip_bar"] = is_ip_err
+                                order_engine_payload["status_message"] = f"Auto Mode: {exec_msg}"
+                                order_engine_payload["auto_execution_notice"] = f"AUTO ORDER: {exec_msg}"
+                                order_engine_payload["auto_execution_ok"] = ok
                     else:
                         is_cancelled = evaluated["signature"] in state.get("cancelled_signatures", [])
                         order_engine_payload["is_cancelled"] = is_cancelled
@@ -2675,7 +2868,10 @@ def api_positions():
                             order_engine_payload["status_message"] = "Manual Order Cancelled by User (Click Reload to restore)."
                         else:
                             order_engine_payload["show_manual_panel"] = True
-                            order_engine_payload["status_message"] = f"Awaiting Manual Approval for {evaluated['symbol']} {evaluated['selected_strike']} {evaluated['option_type']} @ ₹{evaluated['entry_price']}"
+                            if not guard["allowed"]:
+                                order_engine_payload["status_message"] = f"Manual Order Blocked: {guard['reason']}"
+                            else:
+                                order_engine_payload["status_message"] = f"Awaiting Manual Approval for {evaluated['symbol']} {evaluated['selected_strike']} {evaluated['option_type']} @ ₹{evaluated['entry_price']}"
 
     response = jsonify({
         "positions": positions,
