@@ -12,7 +12,6 @@ import requests
 import pyotp
 from flask import Flask, render_template_string, request, Response, jsonify
 
-# --- FLASK APP INITIALIZATION ---
 app = Flask(__name__)
 
 # --- ENVIRONMENT CONFIGURATION ---
@@ -37,26 +36,15 @@ INSTRUMENT_KEYS = {
 }
 
 OPEN_ORDER_STATUSES = {
-    "open",
-    "pending",
-    "trigger pending",
-    "open pending",
-    "validation pending",
-    "modify pending",
-    "modify validation pending",
-    "after market order req received",
-    "put order req received",
-    "scheduled",
-    "active"
+    "open", "pending", "trigger pending", "open pending",
+    "validation pending", "modify pending", "modify validation pending",
+    "after market order req received", "put order req received",
+    "scheduled", "active"
 }
 
-AUTH_COOLDOWN = {
-    "last_failure_time": 0,
-    "cooldown_duration": 1500  # 25 minutes safety lockout
-}
+AUTH_COOLDOWN = {"last_failure_time": 0, "cooldown_duration": 1500}
 
 def get_upstox_proxies():
-    """Returns proxy dict if STATIC_IP_PROXY_URL or QUOTAGUARDSHIELD_URL is set."""
     proxy_url = (
         os.getenv("STATIC_IP_PROXY_URL")
         or os.getenv("QUOTAGUARDSHIELD_URL")
@@ -64,11 +52,11 @@ def get_upstox_proxies():
         or os.getenv("HTTP_PROXY")
     )
     if proxy_url and proxy_url.strip():
-        clean_proxy = proxy_url.strip()
-        return {"http": clean_proxy, "https": clean_proxy}
+        clean = proxy_url.strip()
+        return {"http": clean, "https": clean}
     return None
 
-# --- PERSISTENT SESSION MANAGEMENT ---
+# --- SESSION MANAGEMENT ---
 def load_session_token():
     try:
         if os.path.exists(SESSION_FILE_PATH):
@@ -76,9 +64,8 @@ def load_session_token():
                 data = json.load(f)
                 if time.time() - data.get("generated_at", 0) < 43200:
                     return data.get("access_token")
-    except Exception as e:
-        print(f"[Session Warning] Failed to read session token: {e}")
-
+    except Exception:
+        pass
     if ENV_ACCESS_TOKEN and ENV_ACCESS_TOKEN.strip():
         return ENV_ACCESS_TOKEN.strip()
     return None
@@ -86,12 +73,9 @@ def load_session_token():
 def save_session_token(token):
     try:
         with open(SESSION_FILE_PATH, "w") as f:
-            json.dump({
-                "access_token": token,
-                "generated_at": time.time()
-            }, f)
-    except Exception as e:
-        print(f"[Session Warning] Failed to write session token: {e}")
+            json.dump({"access_token": token, "generated_at": time.time()}, f)
+    except Exception:
+        pass
 
 def invalidate_session():
     if os.path.exists(SESSION_FILE_PATH):
@@ -103,247 +87,155 @@ def invalidate_session():
 def perform_single_auth(force_refresh=False):
     with AUTH_THREAD_LOCK:
         if not force_refresh:
-            existing_token = load_session_token()
-            if existing_token:
-                return existing_token
-
-        current_time = time.time()
-        if current_time - AUTH_COOLDOWN["last_failure_time"] < AUTH_COOLDOWN["cooldown_duration"]:
-            remaining = int(AUTH_COOLDOWN["cooldown_duration"] - (current_time - AUTH_COOLDOWN["last_failure_time"]))
-            print(f"[Auth Security Lock] Cooldown active! Login blocked for {remaining}s.")
+            existing = load_session_token()
+            if existing:
+                return existing
+        now = time.time()
+        if now - AUTH_COOLDOWN["last_failure_time"] < AUTH_COOLDOWN["cooldown_duration"]:
             return None
-
         if not all([CLIENT_ID, USER_ID, PIN, TOTP_KEY]):
-            if ENV_ACCESS_TOKEN and ENV_ACCESS_TOKEN.strip():
-                return ENV_ACCESS_TOKEN.strip()
-            print("[Auth Error] Missing required Upstox Environment Variables!")
-            return None
-
+            return ENV_ACCESS_TOKEN.strip() if (ENV_ACCESS_TOKEN and ENV_ACCESS_TOKEN.strip()) else None
         try:
-            clean_totp_key = str(TOTP_KEY).strip().upper().replace(" ", "").replace("-", "")
-            totp_code = str(pyotp.TOTP(clean_totp_key).now()).zfill(6)
-            clean_pin = str(PIN).strip()
-            clean_client_id = str(CLIENT_ID).strip()
-
-            totp_url = "https://api.upstox.com/v2/totp-login/authorization/token"
-            headers = {
-                "accept": "application/json",
-                "Content-Type": "application/json",
-                "x-api-key": clean_client_id
-            }
-            payload = {
-                "totp": totp_code,
-                "pin": clean_pin
-            }
-
-            print("[Session Auth Attempt] Executing single TOTP login request...")
-            res = requests.post(totp_url, json=payload, headers=headers, proxies=get_upstox_proxies(), timeout=10)
-
+            clean_totp = str(TOTP_KEY).strip().upper().replace(" ", "").replace("-", "")
+            totp_code = str(pyotp.TOTP(clean_totp).now()).zfill(6)
+            res = requests.post(
+                "https://api.upstox.com/v2/totp-login/authorization/token",
+                json={"totp": totp_code, "pin": str(PIN).strip()},
+                headers={"accept": "application/json", "Content-Type": "application/json", "x-api-key": str(CLIENT_ID).strip()},
+                proxies=get_upstox_proxies(),
+                timeout=10
+            )
             if res.status_code == 200:
-                json_data = res.json()
-                token = json_data.get("access_token") or json_data.get("data", {}).get("access_token")
+                jd = res.json()
+                token = jd.get("access_token") or jd.get("data", {}).get("access_token")
                 if token:
                     save_session_token(token)
                     AUTH_COOLDOWN["last_failure_time"] = 0
-                    print("[Session Auth Success] Token cached.")
                     return token
-            
             AUTH_COOLDOWN["last_failure_time"] = time.time()
-        except Exception as e:
-            print(f"[Session Auth Exception] Error: {e}")
+        except Exception:
             AUTH_COOLDOWN["last_failure_time"] = time.time()
-
         return None
 
 def get_valid_token():
-    token = load_session_token()
-    if token:
-        return token
-    return perform_single_auth()
+    return load_session_token() or perform_single_auth()
 
-# --- STATIC IP DETECTION & UPSTOX WHITELIST MANAGEMENT ---
+# --- STATIC IP CHECK & REGISTRATION ---
 def get_current_outbound_ip():
-    """Fetches the exact outbound IPv4 address seen by external servers (respecting proxy if set)."""
     proxies = get_upstox_proxies()
     for url in ("https://api.ipify.org?format=json", "https://ifconfig.me/ip"):
         try:
             res = requests.get(url, proxies=proxies, timeout=6)
             if res.status_code == 200:
-                if "ipify" in url:
-                    return res.json().get("ip", "").strip()
-                return res.text.strip()
+                return res.json().get("ip", "").strip() if "ipify" in url else res.text.strip()
         except Exception:
             continue
     return ""
 
 def fetch_upstox_static_ip_status():
-    """Checks server outbound IP against Upstox registered Primary/Secondary Static IPs."""
     outbound_ip = get_current_outbound_ip()
-    proxy_active = bool(get_upstox_proxies())
-
     token = get_valid_token()
     if not token:
-        return {
-            "outbound_ip": outbound_ip,
-            "proxy_active": proxy_active,
-            "primary_ip": None,
-            "secondary_ip": None,
-            "is_matched": False,
-            "error": "Upstox access token unavailable."
-        }
-
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
+        return {"outbound_ip": outbound_ip, "primary_ip": None, "secondary_ip": None, "is_matched": False, "error": "Upstox access token unavailable."}
     try:
-        res = requests.get("https://api.upstox.com/v2/user/ip", headers=headers, proxies=get_upstox_proxies(), timeout=8)
+        res = requests.get(
+            "https://api.upstox.com/v2/user/ip",
+            headers={"Accept": "application/json", "Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+            proxies=get_upstox_proxies(),
+            timeout=8
+        )
         if res.status_code == 200:
             data = res.json().get("data", {}) or {}
-            p_ip = data.get("primary_ip") or ""
-            s_ip = data.get("secondary_ip") or ""
-            matched = bool(outbound_ip and outbound_ip in (p_ip, s_ip))
-            return {
-                "outbound_ip": outbound_ip,
-                "proxy_active": proxy_active,
-                "primary_ip": p_ip,
-                "secondary_ip": s_ip,
-                "primary_ip_updated_at": data.get("primary_ip_updated_at"),
-                "is_matched": matched,
-                "error": None
-            }
-        else:
-            resp_json = res.json() if res.content else {}
-            err_msg = resp_json.get("errors", [{}])[0].get("message") if isinstance(resp_json.get("errors"), list) and resp_json.get("errors") else res.text
-            return {
-                "outbound_ip": outbound_ip,
-                "proxy_active": proxy_active,
-                "primary_ip": None,
-                "secondary_ip": None,
-                "is_matched": False,
-                "error": f"HTTP {res.status_code}: {err_msg}"
-            }
+            p_ip, s_ip = data.get("primary_ip") or "", data.get("secondary_ip") or ""
+            return {"outbound_ip": outbound_ip, "primary_ip": p_ip, "secondary_ip": s_ip, "is_matched": bool(outbound_ip and outbound_ip in (p_ip, s_ip)), "error": None}
+        rj = res.json() if res.content else {}
+        err = rj.get("errors", [{}])[0].get("message") if isinstance(rj.get("errors"), list) and rj.get("errors") else res.text
+        return {"outbound_ip": outbound_ip, "primary_ip": None, "secondary_ip": None, "is_matched": False, "error": f"HTTP {res.status_code}: {err}"}
     except Exception as e:
-        return {
-            "outbound_ip": outbound_ip,
-            "proxy_active": proxy_active,
-            "primary_ip": None,
-            "secondary_ip": None,
-            "is_matched": False,
-            "error": str(e)
-        }
+        return {"outbound_ip": outbound_ip, "primary_ip": None, "secondary_ip": None, "is_matched": False, "error": str(e)}
 
 def update_upstox_static_ip(primary_ip, secondary_ip=None):
-    """Registers Primary (and optional Secondary) Static IP via Upstox PUT /v2/user/ip and refreshes session."""
     token = get_valid_token()
     if not token:
         return False, "Upstox access token unavailable."
-
-    clean_primary = str(primary_ip or "").strip()
-    clean_secondary = str(secondary_ip or "").strip()
-
-    if not clean_primary:
+    clean_p = str(primary_ip or "").strip()
+    if not clean_p:
         return False, "Primary IP is required."
-
-    payload = {"primary_ip": clean_primary}
-    if clean_secondary and clean_secondary != clean_primary:
-        payload["secondary_ip"] = clean_secondary
-
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
+    payload = {"primary_ip": clean_p}
+    clean_s = str(secondary_ip or "").strip()
+    if clean_s and clean_s != clean_p:
+        payload["secondary_ip"] = clean_s
     try:
         res = requests.put(
             "https://api.upstox.com/v2/user/ip",
             json=payload,
-            headers=headers,
+            headers={"Accept": "application/json", "Content-Type": "application/json", "Authorization": f"Bearer {token}"},
             proxies=get_upstox_proxies(),
             timeout=10
         )
-        resp_json = res.json() if res.content else {}
-        if res.status_code == 200 and resp_json.get("status") == "success":
+        rj = res.json() if res.content else {}
+        if res.status_code == 200 and rj.get("status") == "success":
             invalidate_session()
-            new_token = perform_single_auth(force_refresh=True)
-            reauth_note = "Session automatically refreshed via TOTP." if new_token else "Please update UPSTOX_ACCESS_TOKEN or re-authenticate."
-            return True, f"Static IP Registered ({clean_primary})! {reauth_note}"
-        else:
-            err_msg = resp_json.get("errors", [{}])[0].get("message") if isinstance(resp_json.get("errors"), list) and resp_json.get("errors") else res.text
-            return False, f"Upstox Rejected Static IP Update ({res.status_code}): {err_msg}"
+            new_tok = perform_single_auth(force_refresh=True)
+            note = "Session refreshed via TOTP." if new_tok else "Please re-authenticate."
+            return True, f"Static IP Registered ({clean_p})! {note}"
+        err = rj.get("errors", [{}])[0].get("message") if isinstance(rj.get("errors"), list) and rj.get("errors") else res.text
+        return False, f"Static IP Update Rejected ({res.status_code}): {err}"
     except Exception as e:
         return False, f"Static IP Update Exception: {e}"
 
-# --- DASHBOARD SHEET ORDER CONFIGURATION & EXECUTION ENGINE ---
+# --- TIME & PERSISTENT STATE HELPERS ---
 def get_ist_now():
-    ist_tz = timezone(timedelta(hours=5, minutes=30))
-    return datetime.now(ist_tz)
+    return datetime.now(timezone(timedelta(hours=5, minutes=30)))
 
 def get_ist_today_str():
     return get_ist_now().strftime("%Y-%m-%d")
 
 def load_auto_order_state():
-    today_str = get_ist_today_str()
+    today = get_ist_today_str()
     try:
         if os.path.exists(AUTO_ORDER_STATE_PATH):
             with open(AUTO_ORDER_STATE_PATH, "r") as f:
                 data = json.load(f)
-                if data.get("date") == today_str:
+                if data.get("date") == today:
                     return data
-    except Exception as e:
-        print(f"[Order State Warning] Read failed: {e}")
-    return {"date": today_str, "recent_submissions": {}, "cancelled_signatures": []}
+    except Exception:
+        pass
+    return {"date": today, "recent_submissions": {}, "cancelled_signatures": [], "exit_cooldowns": {}}
 
 def save_auto_order_state(state):
     try:
         with open(AUTO_ORDER_STATE_PATH, "w") as f:
             json.dump(state, f)
-    except Exception as e:
-        print(f"[Order State Warning] Write failed: {e}")
+    except Exception:
+        pass
 
 def load_dynamic_tsl_state():
-    today_str = get_ist_today_str()
+    today = get_ist_today_str()
     try:
         if os.path.exists(DYNAMIC_TSL_STATE_PATH):
             with open(DYNAMIC_TSL_STATE_PATH, "r") as f:
                 data = json.load(f)
-                if data.get("date") == today_str:
+                if data.get("date") == today:
                     return data
-    except Exception as e:
-        print(f"[Dynamic TSL Warning] Read failed: {e}")
-    return {"date": today_str, "contracts": {}, "by_token": {}}
+    except Exception:
+        pass
+    return {"date": today, "contracts": {}, "by_token": {}}
 
 def save_dynamic_tsl_state(state):
     try:
         with open(DYNAMIC_TSL_STATE_PATH, "w") as f:
             json.dump(state, f)
-    except Exception as e:
-        print(f"[Dynamic TSL Warning] Write failed: {e}")
+    except Exception:
+        pass
 
 def round_tick(price, tick=0.05):
     if price is None or price <= 0:
         return 0.05
     return round(round(price / tick) * tick, 2)
 
+# --- DYNAMIC TRAILING SL & TARGET ENGINE ---
 def compute_dynamic_sl_target(side, entry_price, current_ltp, prev_best_price, sl_percent, target_percent, prev_sl=None, prev_target=None):
-    """
-    Dynamic SL & Target Trailing Engine:
-    - BUY / Long:
-      * Tracks highest favorable LTP: best_price = max(entry_price, prev_best_price, current_ltp)
-      * favorable_move = max(0, best_price - entry_price)
-      * Initial SL = entry * (1 - sl_percent / 100)
-      * Dynamic SL = Initial SL + favorable_move * (sl_percent / 100) [ratchets UP only]
-      * Initial Target = entry * (1 + target_percent / 100)
-      * Dynamic Target = Initial Target + favorable_move * (target_percent / 100) [ratchets UP only]
-    - SELL / Short:
-      * Tracks lowest favorable LTP: best_price = min(entry_price, prev_best_price, current_ltp)
-      * favorable_move = max(0, entry_price - best_price)
-      * Initial SL = entry * (1 + sl_percent / 100)
-      * Dynamic SL = Initial SL - favorable_move * (sl_percent / 100) [ratchets DOWN only]
-      * Initial Target = entry * (1 - target_percent / 100)
-      * Dynamic Target = Initial Target - favorable_move * (target_percent / 100) [ratchets DOWN only]
-    """
     side = str(side).upper()
     entry_price = float(entry_price)
     current_ltp = float(current_ltp) if current_ltp and current_ltp > 0 else entry_price
@@ -352,130 +244,75 @@ def compute_dynamic_sl_target(side, entry_price, current_ltp, prev_best_price, s
         if prev_best_price is None or prev_best_price <= 0:
             prev_best_price = entry_price
         best_price = max(entry_price, prev_best_price, current_ltp)
-        favorable_move = max(0.0, best_price - entry_price)
+        fav = max(0.0, best_price - entry_price)
 
         new_sl = None
         if sl_percent is not None and sl_percent > 0:
-            init_sl = entry_price * (1.0 - sl_percent / 100.0)
-            cand_sl = round_tick(init_sl + favorable_move * (sl_percent / 100.0))
-            new_sl = max(float(prev_sl), cand_sl) if prev_sl is not None else cand_sl
+            cand = round_tick(entry_price * (1.0 - sl_percent / 100.0) + fav * (sl_percent / 100.0))
+            new_sl = max(float(prev_sl), cand) if prev_sl is not None else cand
 
         new_target = None
         if target_percent is not None and target_percent > 0:
-            init_tgt = entry_price * (1.0 + target_percent / 100.0)
-            cand_tgt = round_tick(init_tgt + favorable_move * (target_percent / 100.0))
-            new_target = max(float(prev_target), cand_tgt) if prev_target is not None else cand_tgt
-
-    else:  # SELL / SHORT
+            cand = round_tick(entry_price * (1.0 + target_percent / 100.0) + fav * (target_percent / 100.0))
+            new_target = max(float(prev_target), cand) if prev_target is not None else cand
+    else:
         if prev_best_price is None or prev_best_price <= 0:
             prev_best_price = entry_price
         best_price = min(entry_price, prev_best_price, current_ltp)
-        favorable_move = max(0.0, entry_price - best_price)
+        fav = max(0.0, entry_price - best_price)
 
         new_sl = None
         if sl_percent is not None and sl_percent > 0:
-            init_sl = entry_price * (1.0 + sl_percent / 100.0)
-            cand_sl = round_tick(init_sl - favorable_move * (sl_percent / 100.0))
-            new_sl = min(float(prev_sl), cand_sl) if prev_sl is not None else cand_sl
+            cand = round_tick(entry_price * (1.0 + sl_percent / 100.0) - fav * (sl_percent / 100.0))
+            new_sl = min(float(prev_sl), cand) if prev_sl is not None else cand
 
         new_target = None
         if target_percent is not None and target_percent > 0:
-            init_tgt = entry_price * (1.0 - target_percent / 100.0)
-            cand_tgt = round_tick(init_tgt - favorable_move * (target_percent / 100.0))
-            new_target = min(float(prev_target), cand_tgt) if prev_target is not None else cand_tgt
+            cand = round_tick(entry_price * (1.0 - target_percent / 100.0) - fav * (target_percent / 100.0))
+            new_target = min(float(prev_target), cand) if prev_target is not None else cand
 
-    return {
-        "best_price": round(best_price, 2),
-        "favorable_move": round(favorable_move, 2),
-        "new_sl": new_sl,
-        "new_target": new_target
-    }
+    return {"best_price": round(best_price, 2), "favorable_move": round(fav, 2), "new_sl": new_sl, "new_target": new_target}
 
 def modify_upstox_gtt_sl_target(gtt_order, new_sl, new_target):
-    """Calls PUT /v3/order/gtt/modify to dynamically update STOPLOSS & TARGET trigger prices."""
     token = get_valid_token()
     if not token:
         return False, "Upstox token unavailable."
-
     gtt_order_id = gtt_order.get("gtt_order_id")
-    if not gtt_order_id:
-        return False, "Missing gtt_order_id."
-
     raw_rules = gtt_order.get("raw_rules") or []
     entry_rule = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "ENTRY"), None)
-    if not entry_rule:
-        return False, "GTT ENTRY rule missing."
+    if not gtt_order_id or not entry_rule:
+        return False, "Missing GTT ID or ENTRY rule."
 
-    updated_rules = [
-        {
-            "strategy": "ENTRY",
-            "trigger_type": entry_rule.get("trigger_type", "IMMEDIATE"),
-            "trigger_price": float(entry_rule.get("trigger_price", 0.05))
-        }
-    ]
-
-    existing_target = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "TARGET"), None)
+    updated_rules = [{"strategy": "ENTRY", "trigger_type": entry_rule.get("trigger_type", "IMMEDIATE"), "trigger_price": float(entry_rule.get("trigger_price", 0.05))}]
+    existing_tgt = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "TARGET"), None)
     if new_target is not None:
-        updated_rules.append({
-            "strategy": "TARGET",
-            "trigger_type": "IMMEDIATE",
-            "trigger_price": float(new_target)
-        })
-    elif existing_target:
-        updated_rules.append({
-            "strategy": "TARGET",
-            "trigger_type": existing_target.get("trigger_type", "IMMEDIATE"),
-            "trigger_price": float(existing_target.get("trigger_price", 0.05))
-        })
+        updated_rules.append({"strategy": "TARGET", "trigger_type": "IMMEDIATE", "trigger_price": float(new_target)})
+    elif existing_tgt:
+        updated_rules.append({"strategy": "TARGET", "trigger_type": existing_tgt.get("trigger_type", "IMMEDIATE"), "trigger_price": float(existing_tgt.get("trigger_price", 0.05))})
 
     existing_sl = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "STOPLOSS"), None)
     if new_sl is not None:
-        updated_rules.append({
-            "strategy": "STOPLOSS",
-            "trigger_type": "IMMEDIATE",
-            "trigger_price": float(new_sl)
-        })
+        updated_rules.append({"strategy": "STOPLOSS", "trigger_type": "IMMEDIATE", "trigger_price": float(new_sl)})
     elif existing_sl:
-        updated_rules.append({
-            "strategy": "STOPLOSS",
-            "trigger_type": existing_sl.get("trigger_type", "IMMEDIATE"),
-            "trigger_price": float(existing_sl.get("trigger_price", 0.05))
-        })
+        updated_rules.append({"strategy": "STOPLOSS", "trigger_type": existing_sl.get("trigger_type", "IMMEDIATE"), "trigger_price": float(existing_sl.get("trigger_price", 0.05))})
 
-    payload = {
-        "type": gtt_order.get("type", "MULTIPLE"),
-        "quantity": int(gtt_order.get("quantity", 1)),
-        "gtt_order_id": gtt_order_id,
-        "rules": updated_rules
-    }
-
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
     try:
         res = requests.put(
             "https://api.upstox.com/v3/order/gtt/modify",
-            json=payload,
-            headers=headers,
+            json={"type": gtt_order.get("type", "MULTIPLE"), "quantity": int(gtt_order.get("quantity", 1)), "gtt_order_id": gtt_order_id, "rules": updated_rules},
+            headers={"Accept": "application/json", "Content-Type": "application/json", "Authorization": f"Bearer {token}"},
             proxies=get_upstox_proxies(),
             timeout=10
         )
-        resp_json = res.json() if res.content else {}
-        if res.status_code == 200 and resp_json.get("status") == "success":
+        rj = res.json() if res.content else {}
+        if res.status_code == 200 and rj.get("status") == "success":
             return True, f"Updated {gtt_order_id} -> SL: {new_sl or 'N/A'} | Target: {new_target or 'N/A'}"
-        err_msg = resp_json.get("errors", [{}])[0].get("message") if isinstance(resp_json.get("errors"), list) and resp_json.get("errors") else res.text
-        return False, f"GTT Modify Rejected ({res.status_code}): {err_msg}"
+        err = rj.get("errors", [{}])[0].get("message") if isinstance(rj.get("errors"), list) and rj.get("errors") else res.text
+        return False, f"GTT Modify Rejected ({res.status_code}): {err}"
     except Exception as e:
         return False, f"GTT Modify Exception: {e}"
 
 def process_dynamic_sl_and_target(positions, gtt_orders, default_sl_pct=None, default_target_pct=None):
-    """
-    Evaluates all live OPEN positions (quantity != 0), updates peak favorable LTP,
-    computes dynamic trailing SL & Target, modifies Upstox GTT orders if levels improved,
-    and attaches live dynamic SL/Target info onto each position dict.
-    """
     tsl_state = load_dynamic_tsl_state()
     contracts_map = tsl_state.setdefault("contracts", {})
     by_token_map = tsl_state.setdefault("by_token", {})
@@ -485,8 +322,7 @@ def process_dynamic_sl_and_target(positions, gtt_orders, default_sl_pct=None, de
     active_gtt_by_symbol = {}
     for g in gtt_orders:
         ts = str(g.get("trading_symbol", "")).strip().upper()
-        st = str(g.get("status", "")).strip().lower()
-        if ts and st in OPEN_ORDER_STATUSES:
+        if ts and str(g.get("status", "")).strip().lower() in OPEN_ORDER_STATUSES:
             active_gtt_by_symbol[ts] = g
 
     for p in positions:
@@ -494,7 +330,6 @@ def process_dynamic_sl_and_target(positions, gtt_orders, default_sl_pct=None, de
         ts = str(p.get("trading_symbol", "")).strip().upper()
         inst_token = str(p.get("instrument_token", "")).strip()
         ltp = float(p.get("ltp", 0.0) or 0.0)
-
         p["best_price"] = None
         p["dynamic_sl"] = None
         p["dynamic_target"] = None
@@ -507,7 +342,6 @@ def process_dynamic_sl_and_target(positions, gtt_orders, default_sl_pct=None, de
 
         side = "BUY" if qty > 0 else "SELL"
         entry_price = float(p.get("buy_price", 0.0) if side == "BUY" else p.get("sell_price", 0.0)) or ltp
-
         matching_gtt = active_gtt_by_symbol.get(ts)
         rec = contracts_map.get(ts)
         if not rec and inst_token and inst_token in by_token_map:
@@ -515,120 +349,77 @@ def process_dynamic_sl_and_target(positions, gtt_orders, default_sl_pct=None, de
             contracts_map[ts] = rec
             state_dirty = True
 
-        # Recover or initialize tracker if missing
         if not rec:
-            gtt_entry = entry_price
-            gtt_sl = None
-            gtt_tgt = None
-            inferred_sl_pct = default_sl_pct
-            inferred_tgt_pct = default_target_pct
-
+            gtt_entry, gtt_sl, gtt_tgt = entry_price, None, None
+            inf_sl, inf_tgt = default_sl_pct, default_target_pct
             if matching_gtt:
                 raw_rules = matching_gtt.get("raw_rules") or []
-                e_rule = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "ENTRY"), None)
-                s_rule = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "STOPLOSS"), None)
-                t_rule = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "TARGET"), None)
-                if e_rule and float(e_rule.get("trigger_price", 0)) > 0:
-                    gtt_entry = float(e_rule["trigger_price"])
-                if s_rule and float(s_rule.get("trigger_price", 0)) > 0:
-                    gtt_sl = float(s_rule["trigger_price"])
+                er = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "ENTRY"), None)
+                sr = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "STOPLOSS"), None)
+                tr = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "TARGET"), None)
+                if er and float(er.get("trigger_price", 0)) > 0:
+                    gtt_entry = float(er["trigger_price"])
+                if sr and float(sr.get("trigger_price", 0)) > 0:
+                    gtt_sl = float(sr["trigger_price"])
                     if gtt_entry > 0:
-                        inferred_sl_pct = round(abs(gtt_entry - gtt_sl) / gtt_entry * 100.0, 4)
-                if t_rule and float(t_rule.get("trigger_price", 0)) > 0:
-                    gtt_tgt = float(t_rule["trigger_price"])
+                        inf_sl = round(abs(gtt_entry - gtt_sl) / gtt_entry * 100.0, 4)
+                if tr and float(tr.get("trigger_price", 0)) > 0:
+                    gtt_tgt = float(tr["trigger_price"])
                     if gtt_entry > 0:
-                        inferred_tgt_pct = round(abs(gtt_tgt - gtt_entry) / gtt_entry * 100.0, 4)
-
-            if (inferred_sl_pct is None or inferred_sl_pct <= 0) and (inferred_tgt_pct is None or inferred_tgt_pct <= 0):
+                        inf_tgt = round(abs(gtt_tgt - gtt_entry) / gtt_entry * 100.0, 4)
+            if (inf_sl is None or inf_sl <= 0) and (inf_tgt is None or inf_tgt <= 0):
                 continue
-
             rec = {
                 "side": side,
                 "entry_price": entry_price if entry_price > 0 else gtt_entry,
                 "best_price": entry_price if entry_price > 0 else gtt_entry,
-                "sl_percent": inferred_sl_pct,
-                "target_percent": inferred_tgt_pct,
+                "sl_percent": inf_sl,
+                "target_percent": inf_tgt,
                 "current_sl": gtt_sl,
                 "current_target": gtt_tgt
             }
             contracts_map[ts] = rec
             state_dirty = True
 
-        # Keep actual broker fill price if available
         if entry_price > 0 and abs(rec.get("entry_price", 0) - entry_price) > 0.01:
             rec["entry_price"] = entry_price
             state_dirty = True
 
-        sl_pct = rec.get("sl_percent")
-        tgt_pct = rec.get("target_percent")
+        sl_pct, tgt_pct = rec.get("sl_percent"), rec.get("target_percent")
         if (sl_pct is None or sl_pct <= 0) and (tgt_pct is None or tgt_pct <= 0):
             continue
 
-        # Sync existing GTT triggers if present so we never move backwards
-        broker_sl = rec.get("current_sl")
-        broker_tgt = rec.get("current_target")
+        broker_sl, broker_tgt = rec.get("current_sl"), rec.get("current_target")
         if matching_gtt:
             raw_rules = matching_gtt.get("raw_rules") or []
-            s_rule = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "STOPLOSS"), None)
-            t_rule = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "TARGET"), None)
-            if s_rule and float(s_rule.get("trigger_price", 0)) > 0:
-                g_sl = float(s_rule["trigger_price"])
+            sr = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "STOPLOSS"), None)
+            tr = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "TARGET"), None)
+            if sr and float(sr.get("trigger_price", 0)) > 0:
+                g_sl = float(sr["trigger_price"])
                 broker_sl = max(broker_sl, g_sl) if (side == "BUY" and broker_sl is not None) else (min(broker_sl, g_sl) if (side == "SELL" and broker_sl is not None) else g_sl)
-            if t_rule and float(t_rule.get("trigger_price", 0)) > 0:
-                g_tgt = float(t_rule["trigger_price"])
+            if tr and float(tr.get("trigger_price", 0)) > 0:
+                g_tgt = float(tr["trigger_price"])
                 broker_tgt = max(broker_tgt, g_tgt) if (side == "BUY" and broker_tgt is not None) else (min(broker_tgt, g_tgt) if (side == "SELL" and broker_tgt is not None) else g_tgt)
 
-        dyn = compute_dynamic_sl_target(
-            side=side,
-            entry_price=rec["entry_price"],
-            current_ltp=ltp,
-            prev_best_price=rec.get("best_price"),
-            sl_percent=sl_pct,
-            target_percent=tgt_pct,
-            prev_sl=broker_sl,
-            prev_target=broker_tgt
-        )
-
+        dyn = compute_dynamic_sl_target(side, rec["entry_price"], ltp, rec.get("best_price"), sl_pct, tgt_pct, broker_sl, broker_tgt)
         if dyn["best_price"] != rec.get("best_price"):
             rec["best_price"] = dyn["best_price"]
             state_dirty = True
 
-        new_sl = dyn["new_sl"]
-        new_target = dyn["new_target"]
+        new_sl, new_target = dyn["new_sl"], dyn["new_target"]
+        sl_imp = new_sl is not None and (broker_sl is None or (side == "BUY" and new_sl - broker_sl >= 0.05) or (side == "SELL" and broker_sl - new_sl >= 0.05))
+        tgt_imp = new_target is not None and (broker_tgt is None or (side == "BUY" and new_target - broker_tgt >= 0.05) or (side == "SELL" and broker_tgt - new_target >= 0.05))
 
-        sl_improved = (
-            new_sl is not None and (
-                broker_sl is None
-                or (side == "BUY" and new_sl - broker_sl >= 0.05)
-                or (side == "SELL" and broker_sl - new_sl >= 0.05)
-            )
-        )
-        tgt_improved = (
-            new_target is not None and (
-                broker_tgt is None
-                or (side == "BUY" and new_target - broker_tgt >= 0.05)
-                or (side == "SELL" and broker_tgt - new_target >= 0.05)
-            )
-        )
+        if sl_imp and ltp > 0 and ((side == "BUY" and new_sl >= ltp) or (side == "SELL" and new_sl <= ltp)):
+            sl_imp = False
 
-        # Safety check: ensure new SL has not already crossed live LTP
-        if sl_improved and ltp > 0:
-            if (side == "BUY" and new_sl >= ltp) or (side == "SELL" and new_sl <= ltp):
-                sl_improved = False
-
-        if (sl_improved or tgt_improved) and matching_gtt:
-            ok, mod_msg = modify_upstox_gtt_sl_target(
-                matching_gtt,
-                new_sl if sl_improved else broker_sl,
-                new_target if tgt_improved else broker_tgt
-            )
+        if (sl_imp or tgt_imp) and matching_gtt:
+            ok, mod_msg = modify_upstox_gtt_sl_target(matching_gtt, new_sl if sl_imp else broker_sl, new_target if tgt_imp else broker_tgt)
             if ok:
-                rec["current_sl"] = new_sl if sl_improved else broker_sl
-                rec["current_target"] = new_target if tgt_improved else broker_tgt
+                rec["current_sl"] = new_sl if sl_imp else broker_sl
+                rec["current_target"] = new_target if tgt_imp else broker_tgt
                 state_dirty = True
                 updates_log.append(f"Dynamic Trail ({ts}): {mod_msg}")
-            else:
-                print(f"[Dynamic TSL Modify Warning] {ts}: {mod_msg}")
         else:
             if new_sl is not None and rec.get("current_sl") != new_sl:
                 rec["current_sl"] = new_sl
@@ -643,35 +434,182 @@ def process_dynamic_sl_and_target(positions, gtt_orders, default_sl_pct=None, de
 
     if state_dirty:
         save_dynamic_tsl_state(tsl_state)
-
     return updates_log
 
-def fetch_dashboard_order_config():
-    """Fetches cells B16:B28 from Google Sheet tab 'DASHBOARD' with cache-busting and headers=0."""
-    sheet_id = SPREADSHEET_ID or "1fpXdodshvwHcduwffOhEK54K-a7a4TmOZF2Q-EgVRzM"
-    cache_buster = int(time.time() * 1000)
+# --- EXIT CONDITION (B29 = BE / SE) & 3:20 PM AUTO EXIT (B7 = YES) ---
+def cancel_upstox_regular_order(order_id, headers, proxies):
+    try:
+        res = requests.delete(
+            f"https://api-hft.upstox.com/v3/order/cancel?order_id={urllib.parse.quote(str(order_id))}",
+            headers=headers,
+            proxies=proxies,
+            timeout=10
+        )
+        rj = res.json() if res.content else {}
+        if res.status_code == 200 and rj.get("status") == "success":
+            return True, f"Order {order_id} cancelled"
+        err = rj.get("errors", [{}])[0].get("message") if isinstance(rj.get("errors"), list) and rj.get("errors") else res.text
+        return False, f"Order {order_id} cancel failed: {err}"
+    except Exception as e:
+        return False, f"Order {order_id} cancel error: {e}"
+
+def cancel_upstox_gtt_order(gtt_order_id, headers, proxies):
+    try:
+        res = requests.delete(
+            "https://api.upstox.com/v3/order/gtt/cancel",
+            json={"gtt_order_id": str(gtt_order_id)},
+            headers=headers,
+            proxies=proxies,
+            timeout=10
+        )
+        rj = res.json() if res.content else {}
+        if res.status_code == 200 and rj.get("status") == "success":
+            return True, f"GTT {gtt_order_id} cancelled"
+        err = rj.get("errors", [{}])[0].get("message") if isinstance(rj.get("errors"), list) and rj.get("errors") else res.text
+        return False, f"GTT {gtt_order_id} cancel failed: {err}"
+    except Exception as e:
+        return False, f"GTT {gtt_order_id} cancel error: {e}"
+
+def exit_position_at_market(pos, headers, proxies):
+    qty = int(pos.get("quantity", 0) or 0)
+    if qty == 0:
+        return True, "Already flat"
+    inst_token = pos.get("instrument_token", "")
+    ts = pos.get("trading_symbol", "")
+    if not inst_token:
+        return False, f"Missing instrument_token for {ts}"
+
+    raw_prod = str(pos.get("product", "I")).strip().upper()
+    product = "I" if raw_prod in ("I", "MIS", "INTRADAY") else "D"
+    exit_txn = "SELL" if qty > 0 else "BUY"
+
+    payload = {
+        "quantity": abs(qty),
+        "product": product,
+        "validity": "DAY",
+        "price": 0,
+        "tag": "DASHBOARD_EXIT",
+        "instrument_token": inst_token,
+        "order_type": "MARKET",
+        "transaction_type": exit_txn,
+        "disclosed_quantity": 0,
+        "trigger_price": 0,
+        "is_amo": False
+    }
+    try:
+        res = requests.post(
+            "https://api-hft.upstox.com/v3/order/place",
+            json=payload,
+            headers=headers,
+            proxies=proxies,
+            timeout=12
+        )
+        rj = res.json() if res.content else {}
+        if res.status_code == 200 and rj.get("status") == "success":
+            oids = rj.get("data", {}).get("order_ids", [])
+            oid = oids[0] if oids else rj.get("data", {}).get("order_id", "OK")
+            return True, f"Exited {ts} ({exit_txn} {abs(qty)} @ MARKET, ID: {oid})"
+        err = rj.get("errors", [{}])[0].get("message") if isinstance(rj.get("errors"), list) and rj.get("errors") else res.text
+        return False, f"Market Exit Rejected for {ts} ({res.status_code}): {err}"
+    except Exception as e:
+        return False, f"Market Exit Exception for {ts}: {e}"
+
+def execute_targeted_or_full_exit(positions, orders, gtt_orders, target_underlying=None, only_options=False):
+    """
+    Cancels matching open regular orders & GTT orders, then exits matching active positions at MARKET rate.
+    - If target_underlying is None: exits ALL active positions & cancels ALL open orders (used for 3:20 PM IST B7=YES).
+    - If target_underlying is 'NIFTY' or 'BANKNIFTY' (with only_options=True): exits all active CE/PE positions and cancels
+      all open regular & GTT orders for that underlying (used for B29 = BE / SE).
+    """
+    token = get_valid_token()
+    if not token:
+        return False, "Upstox token unavailable for exit."
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+    proxies = get_upstox_proxies()
+
+    def matches_contract(trading_symbol):
+        if target_underlying is None:
+            return True
+        u, opt = extract_symbol_and_opt_type(trading_symbol)
+        if u != target_underlying.upper():
+            return False
+        if only_options and opt not in ("CE", "PE"):
+            return False
+        return True
+
+    matching_positions = [p for p in positions if (p.get("quantity", 0) or 0) != 0 and matches_contract(p.get("trading_symbol", ""))]
+    matching_open_orders = [
+        o for o in orders
+        if str(o.get("status", "")).strip().lower() in OPEN_ORDER_STATUSES
+        and o.get("order_id")
+        and matches_contract(o.get("trading_symbol", ""))
+    ]
+    matching_gtt_orders = [
+        g for g in gtt_orders
+        if str(g.get("status", "")).strip().lower() in OPEN_ORDER_STATUSES
+        and g.get("gtt_order_id")
+        and matches_contract(g.get("trading_symbol", ""))
+    ]
+
+    if not matching_positions and not matching_open_orders and not matching_gtt_orders:
+        return None, None  # Nothing active to cancel or exit
+
+    logs = []
+    all_ok = True
+
+    # 1. Cancel matching open regular orders first (releases margin / avoids duplicate fills)
+    for o in matching_open_orders:
+        ok, msg = cancel_upstox_regular_order(o["order_id"], headers, proxies)
+        logs.append(msg)
+        if not ok:
+            all_ok = False
+
+    # 2. Cancel matching active/scheduled GTT orders (SL / Target / Entry GTTs for that strike)
+    for g in matching_gtt_orders:
+        ok, msg = cancel_upstox_gtt_order(g["gtt_order_id"], headers, proxies)
+        logs.append(msg)
+        if not ok:
+            all_ok = False
+
+    # 3. Exit matching active positions at MARKET rate
+    for p in matching_positions:
+        ok, msg = exit_position_at_market(p, headers, proxies)
+        logs.append(msg)
+        if not ok:
+            all_ok = False
+
+    return all_ok, " | ".join(logs)
+
+# --- GOOGLE SHEET DASHBOARD CONFIG (B7, B16:B28, B29) ---
+def fetch_dashboard_order_config():
+    """Fetches cells A1:Z32 from Google Sheet tab 'DASHBOARD' preserving exact 1-based row numbers (B7, B16:B29)."""
+    sheet_id = SPREADSHEET_ID or "1fpXdodshvwHcduwffOhEK54K-a7a4TmOZF2Q-EgVRzM"
+    cb = int(time.time() * 1000)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Cache-Control": "no-cache, no-store, must-revalidate",
         "Pragma": "no-cache"
     }
     urls = [
-        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&headers=0&sheet=DASHBOARD&range=A16:Z28&_cb={cache_buster}",
-        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&headers=0&sheet=DASHBOARD&_cb={cache_buster}"
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&headers=0&sheet=DASHBOARD&range=A1:Z32&_cb={cb}",
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&headers=0&sheet=DASHBOARD&_cb={cb}"
     ]
 
-    raw_csv = None
-    last_err = None
-
+    raw_csv, last_err = None, None
     for url in urls:
         try:
             res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 200:
-                text = res.text.strip().lstrip('\ufeff')
-                if text.startswith("<!DOCTYPE") or "<html" in text.lower():
+                text = res.text.lstrip('\ufeff')
+                if text.strip().startswith("<!DOCTYPE") or "<html" in text.lower():
                     last_err = "Google Sheet is private. Set sharing to 'Anyone with the link can view'."
                     continue
-                if len(text) > 5:
+                if len(text.strip()) > 5:
                     raw_csv = text
                     break
             else:
@@ -683,11 +621,11 @@ def fetch_dashboard_order_config():
         return None, last_err or "Could not fetch DASHBOARD sheet."
 
     try:
-        lines = [line.lstrip('\ufeff') for line in raw_csv.splitlines() if line.strip()]
-        grid = list(csv.reader(io.StringIO("\n".join(lines))))
+        # Preserve empty lines so 1-based row indices (Row 7 = index 6, Row 16 = index 15, Row 29 = index 28) stay exact!
+        grid = list(csv.reader(io.StringIO(raw_csv.lstrip('\ufeff'))))
 
         label_values = {}
-        for r_idx, row in enumerate(grid):
+        for row in grid:
             for c_idx, cell in enumerate(row):
                 norm_key = re.sub(r'[^a-z0-9]+', '_', str(cell).strip().lower()).strip('_')
                 if norm_key and c_idx + 1 < len(row):
@@ -695,62 +633,69 @@ def fetch_dashboard_order_config():
                     if norm_key not in label_values or val != "":
                         label_values[norm_key] = val
 
-        def get_b_cell(row_num_1based, rel_idx_16):
-            if len(grid) in (12, 13) and rel_idx_16 < len(grid) and len(grid[rel_idx_16]) >= 2:
-                val = str(grid[rel_idx_16][1]).strip()
-                if val != "":
-                    return val
-            if len(grid) >= row_num_1based and len(grid[row_num_1based - 1]) >= 2:
-                val = str(grid[row_num_1based - 1][1]).strip()
-                if val != "":
-                    return val
+        def get_b_cell(row_num_1based):
+            idx = row_num_1based - 1
+            if 0 <= idx < len(grid) and len(grid[idx]) >= 2:
+                return str(grid[idx][1]).strip()
             return ""
 
-        def resolve_field(keys, row_num_1based, rel_idx_16):
+        def resolve_field(keys, row_num_1based, prefer_exact_row=False):
+            exact_val = get_b_cell(row_num_1based)
+            if prefer_exact_row and exact_val != "":
+                return exact_val
             for k in keys:
                 if k in label_values and label_values[k] != "":
                     return label_values[k]
-            return get_b_cell(row_num_1based, rel_idx_16)
+            return exact_val
 
-        manual_raw = resolve_field(["manual_order"], 16, 0)
+        # B7 -> 3:20 PM Auto Exit ("YES" / "NO")
+        b7_raw = resolve_field(["3_20_pm_exit", "auto_exit_3_20", "exit_at_3_20", "square_off_3_20", "auto_square_off"], 7, prefer_exact_row=True).strip().upper()
+        auto_exit_320 = "YES" if b7_raw in ("YES", "Y", "TRUE", "1") else "NO"
+
+        # B16:B28 -> Existing Order Configuration
+        manual_raw = resolve_field(["manual_order"], 16)
         manual_mode = "Auto" if manual_raw.strip().lower() == "auto" else "Manual"
 
-        want_raw = resolve_field(["want_to_trade"], 17, 1).strip().upper()
+        want_raw = resolve_field(["want_to_trade"], 17).strip().upper()
         want_to_trade = "YES" if want_raw in ("YES", "Y", "TRUE", "1") else "NO"
 
-        amt_raw = resolve_field(["amount_to_be_invest", "amount_to_invest"], 18, 2).replace(",", "").strip()
+        amt_raw = resolve_field(["amount_to_be_invest", "amount_to_invest"], 18).replace(",", "").strip()
         amount_to_invest = float(amt_raw) if amt_raw else 0.0
 
-        sym_raw = resolve_field(["symbol"], 19, 3).strip().upper()
+        sym_raw = resolve_field(["symbol"], 19).strip().upper()
         symbol = "BANKNIFTY" if "BANK" in sym_raw else "NIFTY"
 
-        expiry_month = resolve_field(["expiry_month"], 20, 4).strip().upper()
+        expiry_month = resolve_field(["expiry_month"], 20).strip().upper()
 
-        strike_raw = resolve_field(["strike_price"], 21, 5).replace(",", "").strip()
+        strike_raw = resolve_field(["strike_price"], 21).replace(",", "").strip()
         strike_price = int(float(strike_raw)) if strike_raw else 0
 
-        opt_raw = resolve_field(["option_type"], 22, 6).strip().upper()
+        opt_raw = resolve_field(["option_type"], 22).strip().upper()
         option_type = opt_raw if opt_raw in ("CE", "PE") else "CE"
 
-        txn_raw = resolve_field(["transaction_type"], 23, 7).strip().upper()
+        txn_raw = resolve_field(["transaction_type"], 23).strip().upper()
         transaction_type = txn_raw if txn_raw in ("BUY", "SELL") else "BUY"
 
-        qty_raw = resolve_field(["quantity"], 24, 8).replace(",", "").strip()
+        qty_raw = resolve_field(["quantity"], 24).replace(",", "").strip()
         quantity = int(float(qty_raw)) if qty_raw else 0
 
-        prod_raw = resolve_field(["product"], 25, 9).strip().upper()
+        prod_raw = resolve_field(["product"], 25).strip().upper()
         product = "I" if prod_raw in ("I", "INTRADAY", "MIS") else "D"
 
-        sl_raw = resolve_field(["sl_percent"], 26, 10).replace("%", "").strip()
+        sl_raw = resolve_field(["sl_percent"], 26).replace("%", "").strip()
         sl_percent = float(sl_raw) if sl_raw != "" else None
 
-        tgt_raw = resolve_field(["target_percent"], 27, 11).replace("%", "").strip()
+        tgt_raw = resolve_field(["target_percent"], 27).replace("%", "").strip()
         target_percent = float(tgt_raw) if tgt_raw != "" else None
 
-        active_raw = resolve_field(["active_trade", "active_trades", "max_active_trade", "max_active_trades"], 28, 12).replace(",", "").strip()
+        active_raw = resolve_field(["active_trade", "active_trades", "max_active_trade", "max_active_trades"], 28).replace(",", "").strip()
         max_active_trades = int(float(active_raw)) if active_raw != "" else 1
 
-        cfg = {
+        # B29 -> Exit Condition ("BE" / "SE" / blank)
+        exit_cond_raw = resolve_field(["exit_condition", "exit_signal"], 29, prefer_exact_row=True).strip().upper()
+
+        return {
+            "auto_exit_320": auto_exit_320,
             "manual_order": manual_mode,
             "manual_order_raw": manual_raw or manual_mode,
             "want_to_trade": want_to_trade,
@@ -764,18 +709,15 @@ def fetch_dashboard_order_config():
             "product": product,
             "sl_percent": sl_percent,
             "target_percent": target_percent,
-            "max_active_trades": max_active_trades
-        }
-        return cfg, None
-
+            "max_active_trades": max_active_trades,
+            "exit_condition": exit_cond_raw
+        }, None
     except Exception as e:
-        return None, f"Error parsing DASHBOARD sheet B16:B28: {e}"
+        return None, f"Error parsing DASHBOARD sheet: {e}"
 
 def resolve_monthly_expiry_date(symbol, expiry_month, headers):
-    """Fetches option contracts and picks the last expiry date in the requested month."""
     instrument_key = INSTRUMENT_KEYS.get(symbol, "NSE_INDEX|Nifty 50")
-    expiry_url = f"https://api.upstox.com/v2/option/contract?instrument_key={urllib.parse.quote(instrument_key)}"
-    res = requests.get(expiry_url, headers=headers, timeout=10)
+    res = requests.get(f"https://api.upstox.com/v2/option/contract?instrument_key={urllib.parse.quote(instrument_key)}", headers=headers, timeout=10)
     if res.status_code != 200:
         return None, f"Failed fetching option expiries: {res.text}"
 
@@ -784,52 +726,32 @@ def resolve_monthly_expiry_date(symbol, expiry_month, headers):
         return None, f"No option expiries found for {symbol}."
 
     month_lookup = {
-        "JAN": 1, "JANUARY": 1, "01": 1, "1": 1,
-        "FEB": 2, "FEBRUARY": 2, "02": 2, "2": 2,
-        "MAR": 3, "MARCH": 3, "03": 3, "3": 3,
-        "APR": 4, "APRIL": 4, "04": 4, "4": 4,
-        "MAY": 5, "05": 5, "5": 5,
-        "JUN": 6, "JUNE": 6, "06": 6, "6": 6,
-        "JUL": 7, "JULY": 7, "07": 7, "7": 7,
-        "AUG": 8, "AUGUST": 8, "08": 8, "8": 8,
-        "SEP": 9, "SEPT": 9, "SEPTEMBER": 9, "09": 9, "9": 9,
-        "OCT": 10, "OCTOBER": 10, "10": 10,
-        "NOV": 11, "NOVEMBER": 11, "11": 11,
-        "DEC": 12, "DECEMBER": 12, "12": 12
+        "JAN": 1, "JANUARY": 1, "01": 1, "1": 1, "FEB": 2, "FEBRUARY": 2, "02": 2, "2": 2,
+        "MAR": 3, "MARCH": 3, "03": 3, "3": 3, "APR": 4, "APRIL": 4, "04": 4, "4": 4,
+        "MAY": 5, "05": 5, "5": 5, "JUN": 6, "JUNE": 6, "06": 6, "6": 6,
+        "JUL": 7, "JULY": 7, "07": 7, "7": 7, "AUG": 8, "AUGUST": 8, "08": 8, "8": 8,
+        "SEP": 9, "SEPT": 9, "SEPTEMBER": 9, "09": 9, "9": 9, "OCT": 10, "OCTOBER": 10, "10": 10,
+        "NOV": 11, "NOVEMBER": 11, "11": 11, "DEC": 12, "DECEMBER": 12, "12": 12
     }
 
     today_str = get_ist_today_str()
     future_expiries = [e for e in expiries if e >= today_str] or expiries
-
     target_m = month_lookup.get(str(expiry_month).strip().upper())
     if not target_m:
-        if expiry_month in expiries:
-            return expiry_month, None
-        return future_expiries[0], None
+        return (expiry_month, None) if expiry_month in expiries else (future_expiries[0], None)
 
     matching = [e for e in future_expiries if int(e.split("-")[1]) == target_m]
     if matching:
         first_year = sorted(list(set(e.split("-")[0] for e in matching)))[0]
-        year_matches = [e for e in matching if e.startswith(first_year)]
-        return max(year_matches), None
-
+        return max([e for e in matching if e.startswith(first_year)]), None
     return None, f"No expiry dates found in month '{expiry_month}' for {symbol}."
 
 def prepare_evaluated_order(cfg):
-    """
-    Resolves monthly expiry, checks live LTP across strikes, enforces 'Amount to be Invest'
-    by stepping to next OTM strike if needed, and computes SL & Target prices.
-    """
     token = get_valid_token()
     if not token:
         return None, "Upstox token unavailable or authentication paused."
 
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
-
+    headers = {"Accept": "application/json", "Content-Type": "application/json", "Authorization": f"Bearer {token}"}
     symbol = cfg["symbol"]
     expiry_date, exp_err = resolve_monthly_expiry_date(symbol, cfg["expiry_month"], headers)
     if exp_err or not expiry_date:
@@ -851,17 +773,12 @@ def prepare_evaluated_order(cfg):
     candidates = []
     for item in chain_data:
         st = item.get("strike_price", 0)
-        leg = item.get("call_options", {}) if opt_type == "CE" else item.get("put_options", {})
-        leg = leg or {}
+        leg = (item.get("call_options", {}) if opt_type == "CE" else item.get("put_options", {})) or {}
         mkt = leg.get("market_data", {}) or {}
         ltp = float(mkt.get("ltp", 0) or 0)
         inst_token = leg.get("instrument_key", "")
         if inst_token and ltp > 0:
-            candidates.append({
-                "strike": st,
-                "ltp": ltp,
-                "instrument_token": inst_token
-            })
+            candidates.append({"strike": st, "ltp": ltp, "instrument_token": inst_token})
 
     if not candidates:
         return None, f"No active {opt_type} contracts with live LTP found for {symbol} ({expiry_date})."
@@ -870,23 +787,20 @@ def prepare_evaluated_order(cfg):
         ordered = sorted([c for c in candidates if c["strike"] >= req_strike], key=lambda x: x["strike"])
     else:
         ordered = sorted([c for c in candidates if c["strike"] <= req_strike], key=lambda x: x["strike"], reverse=True)
-
     if not ordered:
         ordered = sorted(candidates, key=lambda x: abs(x["strike"] - req_strike))
 
-    selected = None
-    stepped_strikes = []
+    selected, stepped = None, []
     for c in ordered:
         total_cost = round(c["ltp"] * qty, 2)
         if max_invest <= 0 or total_cost <= max_invest:
             selected = c
             selected["total_cost"] = total_cost
             break
-        else:
-            stepped_strikes.append(f"{int(c['strike'])} (₹{total_cost:,.0f})")
+        stepped.append(f"{int(c['strike'])} (₹{total_cost:,.0f})")
 
     if not selected:
-        return None, f"Budget Exceeded: Even furthest {opt_type} strike exceeds Amount to be Invest (₹{max_invest:,.0f}). Checked: {', '.join(stepped_strikes[:4])}"
+        return None, f"Budget Exceeded: Even furthest {opt_type} strike exceeds ₹{max_invest:,.0f}. Checked: {', '.join(stepped[:4])}"
 
     entry_price = round_tick(selected["ltp"])
     total_investment = round(entry_price * qty, 2)
@@ -895,23 +809,17 @@ def prepare_evaluated_order(cfg):
     sl_percent = cfg["sl_percent"]
     sl_price = None
     if sl_percent is not None and sl_percent > 0:
-        if txn_type == "BUY":
-            sl_price = round_tick(entry_price * (1.0 - sl_percent / 100.0))
-        else:
-            sl_price = round_tick(entry_price * (1.0 + sl_percent / 100.0))
+        sl_price = round_tick(entry_price * (1.0 - sl_percent / 100.0)) if txn_type == "BUY" else round_tick(entry_price * (1.0 + sl_percent / 100.0))
 
     target_percent = cfg["target_percent"]
     target_price = None
     if target_percent is not None and target_percent > 0:
-        if txn_type == "BUY":
-            target_price = round_tick(entry_price * (1.0 + target_percent / 100.0))
-        else:
-            target_price = round_tick(entry_price * (1.0 - target_percent / 100.0))
+        target_price = round_tick(entry_price * (1.0 + target_percent / 100.0)) if txn_type == "BUY" else round_tick(entry_price * (1.0 - target_percent / 100.0))
 
     strike_adjusted = (int(selected["strike"]) != int(req_strike))
     signature = f"{cfg['manual_order']}|{symbol}|{expiry_date}|{int(selected['strike'])}|{opt_type}|{txn_type}|{qty}|{cfg['product']}|{sl_percent}|{target_percent}"
 
-    evaluated = {
+    return {
         "signature": signature,
         "manual_order": cfg["manual_order"],
         "want_to_trade": cfg["want_to_trade"],
@@ -921,7 +829,6 @@ def prepare_evaluated_order(cfg):
         "requested_strike": int(req_strike),
         "selected_strike": int(selected["strike"]),
         "strike_adjusted": strike_adjusted,
-        "stepped_reason": f"Adjusted from {int(req_strike)} to fit ₹{max_invest:,.0f} budget" if strike_adjusted else "Exact requested strike within budget",
         "option_type": opt_type,
         "transaction_type": txn_type,
         "quantity": qty,
@@ -935,22 +842,15 @@ def prepare_evaluated_order(cfg):
         "sl_price": sl_price,
         "target_percent": target_percent,
         "target_price": target_price
-    }
-    return evaluated, None
+    }, None
 
 def submit_upstox_evaluated_order(evaluated_order):
-    """Places either a GTT Multi-Leg order (when SL or Target exists) or a standard Limit order via static IP/proxy."""
     token = get_valid_token()
     if not token:
         return False, "Authentication token missing or paused.", False
 
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
+    headers = {"Accept": "application/json", "Content-Type": "application/json", "Authorization": f"Bearer {token}"}
     proxies = get_upstox_proxies()
-
     sl_price = evaluated_order.get("sl_price")
     target_price = evaluated_order.get("target_price")
     entry_price = evaluated_order["entry_price"]
@@ -961,256 +861,146 @@ def submit_upstox_evaluated_order(evaluated_order):
 
     try:
         if sl_price is not None or target_price is not None:
-            rules = [
-                {
-                    "strategy": "ENTRY",
-                    "trigger_type": "IMMEDIATE",
-                    "trigger_price": entry_price
-                }
-            ]
+            rules = [{"strategy": "ENTRY", "trigger_type": "IMMEDIATE", "trigger_price": entry_price}]
             if target_price is not None:
-                rules.append({
-                    "strategy": "TARGET",
-                    "trigger_type": "IMMEDIATE",
-                    "trigger_price": target_price
-                })
+                rules.append({"strategy": "TARGET", "trigger_type": "IMMEDIATE", "trigger_price": target_price})
             if sl_price is not None:
-                rules.append({
-                    "strategy": "STOPLOSS",
-                    "trigger_type": "IMMEDIATE",
-                    "trigger_price": sl_price
-                })
+                rules.append({"strategy": "STOPLOSS", "trigger_type": "IMMEDIATE", "trigger_price": sl_price})
 
-            payload = {
-                "type": "MULTIPLE",
-                "quantity": qty,
-                "product": product,
-                "rules": rules,
-                "instrument_token": inst_token,
-                "transaction_type": txn_type
-            }
-            url = "https://api.upstox.com/v3/order/gtt/place"
-            res = requests.post(url, json=payload, headers=headers, proxies=proxies, timeout=12)
-            resp_json = res.json() if res.content else {}
-
-            if res.status_code == 200 and resp_json.get("status") == "success":
-                gtt_ids = resp_json.get("data", {}).get("gtt_order_ids", [])
-                # Seed dynamic TSL tracker for this contract
+            res = requests.post(
+                "https://api.upstox.com/v3/order/gtt/place",
+                json={"type": "MULTIPLE", "quantity": qty, "product": product, "rules": rules, "instrument_token": inst_token, "transaction_type": txn_type},
+                headers=headers,
+                proxies=proxies,
+                timeout=12
+            )
+            rj = res.json() if res.content else {}
+            if res.status_code == 200 and rj.get("status") == "success":
+                gtt_ids = rj.get("data", {}).get("gtt_order_ids", [])
                 tsl_state = load_dynamic_tsl_state()
                 tsl_state.setdefault("by_token", {})[inst_token] = {
-                    "side": txn_type,
-                    "entry_price": entry_price,
-                    "best_price": entry_price,
-                    "sl_percent": evaluated_order.get("sl_percent"),
-                    "target_percent": evaluated_order.get("target_percent"),
-                    "current_sl": sl_price,
-                    "current_target": target_price
+                    "side": txn_type, "entry_price": entry_price, "best_price": entry_price,
+                    "sl_percent": evaluated_order.get("sl_percent"), "target_percent": evaluated_order.get("target_percent"),
+                    "current_sl": sl_price, "current_target": target_price
                 }
                 save_dynamic_tsl_state(tsl_state)
                 return True, f"GTT Multi-Leg Order Placed! ID(s): {', '.join(gtt_ids) if gtt_ids else 'Confirmed'} | Entry: ₹{entry_price} | Dynamic SL: {sl_price or 'Blank'} | Dynamic Target: {target_price or 'Blank'}", False
-            else:
-                err_detail = resp_json.get("errors", [{}])[0].get("message") if isinstance(resp_json.get("errors"), list) and resp_json.get("errors") else res.text
-                if res.status_code == 403 and "static IP" in err_detail:
-                    cur_ip = get_current_outbound_ip()
-                    return False, f"Upstox Static IP Block (403): Outbound IP '{cur_ip}' is not registered. Click 'Register Server IP' above or configure STATIC_IP_PROXY_URL.", True
-                return False, f"Upstox GTT Order Rejected ({res.status_code}): {err_detail}", False
-
+            err = rj.get("errors", [{}])[0].get("message") if isinstance(rj.get("errors"), list) and rj.get("errors") else res.text
+            if res.status_code == 403 and "static IP" in err:
+                return False, f"Upstox Static IP Block (403): Outbound IP '{get_current_outbound_ip()}' is not registered.", True
+            return False, f"Upstox GTT Order Rejected ({res.status_code}): {err}", False
         else:
-            payload = {
-                "quantity": qty,
-                "product": product,
-                "validity": "DAY",
-                "price": entry_price,
-                "tag": "DASHBOARD_ORDER",
-                "instrument_token": inst_token,
-                "order_type": "LIMIT",
-                "transaction_type": txn_type,
-                "disclosed_quantity": 0,
-                "trigger_price": 0,
-                "is_amo": False
-            }
-            url = "https://api-hft.upstox.com/v3/order/place"
-            res = requests.post(url, json=payload, headers=headers, proxies=proxies, timeout=12)
-            resp_json = res.json() if res.content else {}
-
-            if res.status_code == 200 and resp_json.get("status") == "success":
-                order_ids = resp_json.get("data", {}).get("order_ids", [])
-                order_id = order_ids[0] if order_ids else resp_json.get("data", {}).get("order_id", "Confirmed")
-                return True, f"Limit Order Placed! Order ID: {order_id} | Entry: ₹{entry_price} | SL & Target: Blank (Self-Monitored)", False
-            else:
-                err_detail = resp_json.get("errors", [{}])[0].get("message") if isinstance(resp_json.get("errors"), list) and resp_json.get("errors") else res.text
-                if res.status_code == 403 and "static IP" in err_detail:
-                    cur_ip = get_current_outbound_ip()
-                    return False, f"Upstox Static IP Block (403): Outbound IP '{cur_ip}' is not registered. Click 'Register Server IP' above or configure STATIC_IP_PROXY_URL.", True
-                return False, f"Upstox Limit Order Rejected ({res.status_code}): {err_detail}", False
-
+            res = requests.post(
+                "https://api-hft.upstox.com/v3/order/place",
+                json={"quantity": qty, "product": product, "validity": "DAY", "price": entry_price, "tag": "DASHBOARD_ORDER", "instrument_token": inst_token, "order_type": "LIMIT", "transaction_type": txn_type, "disclosed_quantity": 0, "trigger_price": 0, "is_amo": False},
+                headers=headers,
+                proxies=proxies,
+                timeout=12
+            )
+            rj = res.json() if res.content else {}
+            if res.status_code == 200 and rj.get("status") == "success":
+                oids = rj.get("data", {}).get("order_ids", [])
+                oid = oids[0] if oids else rj.get("data", {}).get("order_id", "Confirmed")
+                return True, f"Limit Order Placed! Order ID: {oid} | Entry: ₹{entry_price}", False
+            err = rj.get("errors", [{}])[0].get("message") if isinstance(rj.get("errors"), list) and rj.get("errors") else res.text
+            if res.status_code == 403 and "static IP" in err:
+                return False, f"Upstox Static IP Block (403): Outbound IP '{get_current_outbound_ip()}' is not registered.", True
+            return False, f"Upstox Limit Order Rejected ({res.status_code}): {err}", False
     except Exception as e:
         return False, f"Order API Exception: {e}", False
 
 def extract_symbol_and_opt_type(trading_symbol):
-    """Extracts underlying ('NIFTY' / 'BANKNIFTY') and option type ('CE' / 'PE') from Upstox trading_symbol."""
     ts = str(trading_symbol or "").strip().upper()
     if not ts:
         return None, None
-    underlying = None
-    if "BANKNIFTY" in ts:
-        underlying = "BANKNIFTY"
-    elif ts.startswith("NIFTY") or re.search(r'\bNIFTY\b', ts):
-        underlying = "NIFTY"
-
+    underlying = "BANKNIFTY" if "BANKNIFTY" in ts else ("NIFTY" if (ts.startswith("NIFTY") or re.search(r'\bNIFTY\b', ts)) else None)
     opt_match = re.search(r'(?:^|\s|\d)(CE|PE)(?:\s|$|\d)', ts)
-    opt_type = opt_match.group(1) if opt_match else None
-    return underlying, opt_type
+    return underlying, (opt_match.group(1) if opt_match else None)
 
 def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, positions, orders, gtt_orders=None):
-    """
-    Enforces:
-    1) Active Trade Max Limit from cell B28 (blocks if active_count >= max_active_trades).
-    2) Duplicate Script + Option Type Guard (blocks if same underlying + CE/PE is already active or in open order log across ANY strike, while allowing opposite CE/PE leg if B28 allows).
-    """
     gtt_orders = gtt_orders or []
-    active_items = []
-    open_position_symbols = {}
+    active_items, open_pos_syms = [], {}
 
-    # 1. Active Open Positions (quantity != 0)
     for p in positions:
         qty = p.get("quantity", 0) or 0
         ts = str(p.get("trading_symbol", "")).strip().upper()
         if qty != 0 and ts:
-            open_position_symbols[ts] = qty
+            open_pos_syms[ts] = qty
             u, opt = extract_symbol_and_opt_type(ts)
-            active_items.append({
-                "source": "Active Position",
-                "trading_symbol": ts,
-                "underlying": u,
-                "option_type": opt,
-                "quantity": qty
-            })
+            active_items.append({"source": "Active Position", "trading_symbol": ts, "underlying": u, "option_type": opt})
 
-    # 2. Open / Pending Orders in Order Placement Log
     for o in orders:
         st = str(o.get("status", "")).strip().lower()
         ts = str(o.get("trading_symbol", "")).strip().upper()
         txn = str(o.get("transaction_type", "")).strip().upper()
         if st in OPEN_ORDER_STATUSES and ts:
-            pos_qty = open_position_symbols.get(ts, 0)
-            is_exit_leg = (pos_qty > 0 and txn == "SELL") or (pos_qty < 0 and txn == "BUY")
-            if not is_exit_leg:
+            pos_qty = open_pos_syms.get(ts, 0)
+            if not ((pos_qty > 0 and txn == "SELL") or (pos_qty < 0 and txn == "BUY")):
                 u, opt = extract_symbol_and_opt_type(ts)
-                active_items.append({
-                    "source": f"Open Order ({o.get('status', '')})",
-                    "trading_symbol": ts,
-                    "underlying": u,
-                    "option_type": opt,
-                    "status": o.get("status", "")
-                })
+                active_items.append({"source": f"Open Order ({o.get('status', '')})", "trading_symbol": ts, "underlying": u, "option_type": opt})
 
-    # 3. Scheduled / Active GTT Entry Orders
     for g in gtt_orders:
         st = str(g.get("status", "")).strip().lower()
         ts = str(g.get("trading_symbol", "")).strip().upper()
-        if st in OPEN_ORDER_STATUSES and ts and ts not in open_position_symbols:
+        if st in OPEN_ORDER_STATUSES and ts and ts not in open_pos_syms:
             u, opt = extract_symbol_and_opt_type(ts)
-            active_items.append({
-                "source": f"Active GTT ({g.get('status', '')})",
-                "trading_symbol": ts,
-                "underlying": u,
-                "option_type": opt,
-                "status": g.get("status", "")
-            })
+            active_items.append({"source": f"Active GTT ({g.get('status', '')})", "trading_symbol": ts, "underlying": u, "option_type": opt})
 
     active_count = len(active_items)
+    dups = [i for i in active_items if i["underlying"] == str(target_symbol).upper() and i["option_type"] == str(target_opt_type).upper()]
+    if dups:
+        m = dups[0]
+        return {"allowed": False, "active_count": active_count, "max_active_trades": max_active_trades, "reason": f"Duplicate Blocked: {target_symbol} {target_opt_type} already active/open ({m['trading_symbol']} - {m['source']})."}
 
-    # Guard A: Duplicate Underlying + Option Type (CE/PE) check across any strike
-    duplicate_matches = [
-        item for item in active_items
-        if item["underlying"] == str(target_symbol).upper() and item["option_type"] == str(target_opt_type).upper()
-    ]
-    if duplicate_matches:
-        m = duplicate_matches[0]
-        return {
-            "allowed": False,
-            "active_count": active_count,
-            "max_active_trades": max_active_trades,
-            "block_type": "DUPLICATE",
-            "reason": f"Duplicate Blocked: {target_symbol} {target_opt_type} is already active/open ({m['trading_symbol']} - {m['source']})."
-        }
-
-    # Guard B: Active Trade Count Limit from Cell B28
     if max_active_trades is not None and active_count >= max_active_trades:
-        return {
-            "allowed": False,
-            "active_count": active_count,
-            "max_active_trades": max_active_trades,
-            "block_type": "MAX_ACTIVE",
-            "reason": f"Active Trade Limit Reached ({active_count}/{max_active_trades} active). Close existing trade/open order before placing new order."
-        }
+        return {"allowed": False, "active_count": active_count, "max_active_trades": max_active_trades, "reason": f"Active Trade Limit Reached ({active_count}/{max_active_trades} active). Close existing trade/open order first."}
 
-    return {
-        "allowed": True,
-        "active_count": active_count,
-        "max_active_trades": max_active_trades,
-        "block_type": None,
-        "reason": f"Eligible ({active_count}/{max_active_trades} active trades)."
-    }
+    return {"allowed": True, "active_count": active_count, "max_active_trades": max_active_trades, "reason": f"Eligible ({active_count}/{max_active_trades} active trades)."}
 
 # --- GOOGLE SHEET HISTORICAL & SIGNAL DATA LOADER ---
 def parse_timestamp(dt_str):
     if not dt_str:
         return 0
     dt_str = str(dt_str).strip()
-    date_formats = (
-        "%m/%d/%Y %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", 
-        "%m/%d/%Y %H:%M", "%d/%m/%Y %H:%M",
-        "%m/%d/%y %H:%M:%S", "%d/%m/%y %H:%M:%S", "%m/%d/%y %H:%M", "%d/%m/%y %H:%M"
-    )
-    for fmt in date_formats:
+    for fmt in (
+        "%m/%d/%Y %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S",
+        "%m/%d/%Y %H:%M", "%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M",
+        "%m/%d/%y %H:%M:%S", "%d/%m/%y %H:%M:%S", "%m/%d/%y %H:%M", "%d/%m/%y %H:%M",
+        "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d"
+    ):
         try:
-            dt = datetime.strptime(dt_str, fmt)
-            return int(dt.timestamp())
+            return int(datetime.strptime(dt_str, fmt).timestamp())
         except ValueError:
             pass
     return 0
 
-def format_time_str(time_raw):
-    time_str = str(time_raw).strip()
-    if " " in time_str:
-        parts = time_str.split(" ")
-        time_part = parts[1] if len(parts) > 1 else parts[0]
-    else:
-        time_part = time_str
-    t_parts = time_part.split(":")
+def extract_date_and_time_parts(time_raw):
+    raw = str(time_raw).strip()
+    if " " in raw:
+        parts = raw.split()
+        date_part = parts[0]
+        t_parts = parts[1].split(":")
+        time_part = f"{t_parts[0]}:{t_parts[1]}" if len(t_parts) >= 2 else parts[1]
+        return date_part, time_part
+    t_parts = raw.split(":")
     if len(t_parts) >= 2:
-        return f"{t_parts[0]}:{t_parts[1]}"
-    return time_str
+        return "", f"{t_parts[0]}:{t_parts[1]}"
+    return raw, raw
 
 def fetch_history_from_gsheet(symbol="NIFTY", sheet_name=None):
     sheet_id = SPREADSHEET_ID or "1fpXdodshvwHcduwffOhEK54K-a7a4TmOZF2Q-EgVRzM"
-    
-    if sheet_name:
-        candidate_sheets = [sheet_name, sheet_name.upper(), symbol.upper(), "Sheet1", ""]
-    else:
-        candidate_sheets = ["NIFTY" if "BANK" not in symbol.upper() else "BANKNIFTY", symbol.upper(), "Sheet1", ""]
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-
-    raw_csv = None
-    last_err = None
+    candidate_sheets = [sheet_name, sheet_name.upper(), symbol.upper(), "Sheet1", ""] if sheet_name else ["NIFTY" if "BANK" not in symbol.upper() else "BANKNIFTY", symbol.upper(), "Sheet1", ""]
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    raw_csv, last_err = None, None
 
     for s_name in candidate_sheets:
-        if s_name:
-            url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={urllib.parse.quote(s_name)}"
-        else:
-            url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
-
+        url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={urllib.parse.quote(s_name)}" if s_name else f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
         try:
             res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 200:
                 text = res.text.strip().lstrip('\ufeff')
                 if text.startswith("<!DOCTYPE") or "<html" in text.lower():
-                    last_err = "Google Sheet is private. Set Sharing permissions to 'Anyone with the link can view'."
+                    last_err = "Google Sheet is private. Set sharing to 'Anyone with the link can view'."
                     continue
                 if len(text) > 30:
                     raw_csv = text
@@ -1221,149 +1011,120 @@ def fetch_history_from_gsheet(symbol="NIFTY", sheet_name=None):
             last_err = f"Network error connecting to Google Sheet: {e}"
 
     if not raw_csv:
-        err_msg = last_err or "Could not retrieve CSV from Google Sheet. Check Sheet ID and tab permissions."
-        print(f"[GSheet Error] {err_msg}")
-        return [], err_msg
+        return [], last_err or "Could not retrieve CSV from Google Sheet."
 
     try:
-        clean_csv = raw_csv.lstrip('\ufeff')
-        lines = [line.strip().lstrip('\ufeff') for line in clean_csv.splitlines() if line.strip()]
+        lines = [l.strip().lstrip('\ufeff') for l in raw_csv.lstrip('\ufeff').splitlines() if l.strip()]
         if not lines:
             return [], "Google Sheet CSV is empty."
 
         header_idx = 0
         for i, l in enumerate(lines[:10]):
-            l_lower = l.lower()
-            if "time" in l_lower or "symbol" in l_lower or "pcr" in l_lower or "ltp" in l_lower or "min roc" in l_lower:
+            ll = l.lower()
+            if any(k in ll for k in ("time", "symbol", "pcr", "ltp", "min roc")):
                 header_idx = i
                 break
 
-        csv_data_stream = "\n".join(lines[header_idx:])
-        reader = csv.DictReader(io.StringIO(csv_data_stream))
-
+        reader = csv.DictReader(io.StringIO("\n".join(lines[header_idx:])))
         snapshots = []
         for row in reader:
             if not row:
                 continue
             norm_r = {re.sub(r'^[^\w]+', '', str(k)).strip().lower(): str(v).strip() for k, v in row.items() if k is not None}
 
-            def safe_num(primary_name, alt_names=[], default=0.0):
-                names = [primary_name.lower()] + [a.lower() for a in alt_names]
-                for n in names:
+            def safe_num(primary, alts=[], default=0.0):
+                for n in [primary.lower()] + [a.lower() for a in alts]:
                     if n in norm_r:
-                        val_str = norm_r[n].replace(",", "").strip()
                         try:
-                            return float(val_str)
+                            return float(norm_r[n].replace(",", "").strip())
                         except (ValueError, TypeError):
                             pass
-                    n_nospace = n.replace(" ", "")
-                    for k_key, k_val in norm_r.items():
-                        if k_key.replace(" ", "") == n_nospace:
+                    ns = n.replace(" ", "")
+                    for kk, kv in norm_r.items():
+                        if kk.replace(" ", "") == ns:
                             try:
-                                return float(k_val.replace(",", "").strip())
+                                return float(kv.replace(",", "").strip())
                             except (ValueError, TypeError):
                                 pass
                 return default
 
-            def safe_str(primary_name, alt_names=[]):
-                names = [primary_name.lower()] + [a.lower() for a in alt_names]
-                for n in names:
+            def safe_str(primary, alts=[]):
+                for n in [primary.lower()] + [a.lower() for a in alts]:
                     if n in norm_r:
                         return norm_r[n]
-                    n_nospace = n.replace(" ", "")
-                    for k_key, k_val in norm_r.items():
-                        if k_key.replace(" ", "") == n_nospace:
-                            return k_val
+                    ns = n.replace(" ", "")
+                    for kk, kv in norm_r.items():
+                        if kk.replace(" ", "") == ns:
+                            return kv
                 return ""
 
             time_val = str(norm_r.get("time", norm_r.get("datetime", norm_r.get("timestamp", norm_r.get("date & time", norm_r.get("date and time", ""))))))
             if not time_val or time_val.lower() in ("nan", "none", "", "0.0"):
                 continue
 
-            snapshot = {
+            date_str, formatted_time = extract_date_and_time_parts(time_val)
+            snapshots.append({
                 "timestamp": parse_timestamp(time_val),
                 "datetime": time_val,
-                "formatted_time": format_time_str(time_val),
+                "date_str": date_str,
+                "formatted_time": formatted_time,
                 "symbol": str(norm_r.get("symbol", symbol.upper())),
                 "spot_price": safe_num("Price LTP", ["spot_price", "ltp"]),
                 "atm_strike": safe_num("ATM Strike", ["atm_strike"]),
                 "pcr": safe_num("PCR"),
-                "ce_oi": safe_num("CE OI"),
-                "pe_oi": safe_num("PE OI"),
+                "ce_oi": safe_num("CE OI"), "pe_oi": safe_num("PE OI"),
                 "ce_oi_chg": safe_num("CE Chg in OI", ["CE Chng OI", "CE Chg OI"]),
                 "pe_oi_chg": safe_num("PE Chg in OI", ["PE Chng OI", "PE Chg OI"]),
-                "ce_vol": safe_num("CE Vol"),
-                "pe_vol": safe_num("PE Vol"),
-                "ce_iv": safe_num("CE IV"),
-                "pe_iv": safe_num("PE IV"),
-                "ce_delta": safe_num("CE Delta"),
-                "pe_delta": safe_num("PE Delta"),
-                "ce_theta": safe_num("CE Theta"),
-                "pe_theta": safe_num("PE Theta"),
-                "ce_vega": safe_num("CE Vega"),
-                "pe_vega": safe_num("PE Vega"),
-                "ce_gamma": safe_num("CE Gamma"),
-                "pe_gamma": safe_num("PE Gamma"),
-                "ce_bid": safe_num("CE Bid"),
-                "pe_bid": safe_num("PE Bid"),
-                "ce_ask": safe_num("CE Ask"),
-                "pe_ask": safe_num("PE Ask"),
-                "ce_ltp": safe_num("CE LTP"),
-                "pe_ltp": safe_num("PE LTP"),
+                "ce_vol": safe_num("CE Vol"), "pe_vol": safe_num("PE Vol"),
+                "ce_iv": safe_num("CE IV"), "pe_iv": safe_num("PE IV"),
+                "ce_delta": safe_num("CE Delta"), "pe_delta": safe_num("PE Delta"),
+                "ce_theta": safe_num("CE Theta"), "pe_theta": safe_num("PE Theta"),
+                "ce_vega": safe_num("CE Vega"), "pe_vega": safe_num("PE Vega"),
+                "ce_gamma": safe_num("CE Gamma"), "pe_gamma": safe_num("PE Gamma"),
+                "ce_bid": safe_num("CE Bid"), "pe_bid": safe_num("PE Bid"),
+                "ce_ask": safe_num("CE Ask"), "pe_ask": safe_num("PE Ask"),
+                "ce_ltp": safe_num("CE LTP"), "pe_ltp": safe_num("PE LTP"),
                 "min_roc": safe_num("Min ROC (Buy)", ["min_roc", "min roc"]),
                 "max_roc": safe_num("Max ROC (Sell)", ["max_roc", "max roc"]),
                 "cross_roc": safe_num("Cross ROC Sig", ["cross_roc_sig", "cross roc"]),
                 "main_volatility": safe_num("Main Volatility", ["main_vol", "volatility"]),
                 "new_signal": safe_str("New Signal", ["signal", "sig"])
-            }
-            snapshots.append(snapshot)
+            })
 
         if not snapshots:
             return [], f"Google Sheet connected ({sheet_name or symbol}) but no valid data rows were found."
-
         return snapshots[::-1], None
-
     except Exception as e:
-        print(f"[GSheet Parsing Exception]: {e}")
         return [], f"Parsing error reading Google Sheet CSV: {e}"
 
-# --- UPSTOX LIVE TRADE & POSITION FETCHING ---
+# --- UPSTOX POSITIONS & OPTION CHAIN ---
 def fetch_upstox_positions():
     token = get_valid_token()
     if not token:
         return [], [], [], 0.0, 0.0, 0.0, "Authentication paused or invalid."
 
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
-
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
     try:
-        pos_url = "https://api.upstox.com/v2/portfolio/short-term-positions"
-        pos_res = requests.get(pos_url, headers=headers, timeout=10)
-
+        pos_res = requests.get("https://api.upstox.com/v2/portfolio/short-term-positions", headers=headers, timeout=10)
         if pos_res.status_code == 401:
             invalidate_session()
             token = perform_single_auth(force_refresh=True)
             if not token:
                 return [], [], [], 0.0, 0.0, 0.0, "Session expired."
             headers["Authorization"] = f"Bearer {token}"
-            pos_res = requests.get(pos_url, headers=headers, timeout=10)
+            pos_res = requests.get("https://api.upstox.com/v2/portfolio/short-term-positions", headers=headers, timeout=10)
 
         positions_raw = pos_res.json().get("data", []) if pos_res.status_code == 200 else []
-
-        ord_url = "https://api.upstox.com/v2/order/retrieve-all"
-        ord_res = requests.get(ord_url, headers=headers, timeout=10)
+        ord_res = requests.get("https://api.upstox.com/v2/order/retrieve-all", headers=headers, timeout=10)
         orders_raw = ord_res.json().get("data", []) if ord_res.status_code == 200 else []
 
         gtt_orders = []
         try:
             gtt_res = requests.get("https://api.upstox.com/v3/order/gtt", headers=headers, timeout=8)
             if gtt_res.status_code == 200:
-                gtt_raw = gtt_res.json().get("data", []) or []
-                for g in gtt_raw:
+                for g in (gtt_res.json().get("data", []) or []):
                     rules = g.get("rules", []) or []
-                    entry_rule = next((r for r in rules if str(r.get("strategy", "")).upper() == "ENTRY"), rules[0] if rules else {})
+                    er = next((r for r in rules if str(r.get("strategy", "")).upper() == "ENTRY"), rules[0] if rules else {})
                     gtt_orders.append({
                         "gtt_order_id": g.get("gtt_order_id", ""),
                         "type": g.get("type", "MULTIPLE"),
@@ -1371,101 +1132,73 @@ def fetch_upstox_positions():
                         "trading_symbol": g.get("trading_symbol", ""),
                         "transaction_type": g.get("transaction_type", ""),
                         "quantity": g.get("quantity", 0),
-                        "status": entry_rule.get("status") or g.get("status", ""),
+                        "status": er.get("status") or g.get("status", ""),
                         "raw_rules": rules
                     })
         except Exception:
             pass
 
-        positions = []
-        total_pnl = 0.0
-        realised_pnl = 0.0
-        unrealised_pnl = 0.0
-
+        positions, total_pnl, realised_pnl, unrealised_pnl = [], 0.0, 0.0, 0.0
         for p in positions_raw:
-            trading_symbol = p.get("trading_symbol", "")
-            instrument_token = p.get("instrument_token", "")
-            quantity = p.get("quantity", 0)
-            buy_price = p.get("buy_price", 0.0) or 0.0
-            sell_price = p.get("sell_price", 0.0) or 0.0
-            ltp = p.get("last_price", 0.0) or 0.0
+            qty = p.get("quantity", 0)
             pnl = p.get("pnl", 0.0) or 0.0
-            u_pnl = p.get("unrealised", 0.0) or 0.0
-            r_pnl = p.get("realised", 0.0) or 0.0
-            product = p.get("product", "")
-
             total_pnl += pnl
-            unrealised_pnl += u_pnl
-            realised_pnl += r_pnl
-
+            unrealised_pnl += (p.get("unrealised", 0.0) or 0.0)
+            realised_pnl += (p.get("realised", 0.0) or 0.0)
             positions.append({
-                "trading_symbol": trading_symbol,
-                "instrument_token": instrument_token,
-                "product": product,
-                "quantity": quantity,
-                "buy_price": round(buy_price, 2),
-                "sell_price": round(sell_price, 2),
-                "ltp": round(ltp, 2),
+                "trading_symbol": p.get("trading_symbol", ""),
+                "instrument_token": p.get("instrument_token", ""),
+                "product": p.get("product", ""),
+                "quantity": qty,
+                "buy_price": round(p.get("buy_price", 0.0) or 0.0, 2),
+                "sell_price": round(p.get("sell_price", 0.0) or 0.0, 2),
+                "ltp": round(p.get("last_price", 0.0) or 0.0, 2),
                 "pnl": round(pnl, 2),
                 "best_price": None,
                 "dynamic_sl": None,
                 "dynamic_target": None,
-                "status": "OPEN" if quantity != 0 else "CLOSED"
+                "status": "OPEN" if qty != 0 else "CLOSED"
             })
 
-        orders = []
-        for o in orders_raw:
-            orders.append({
-                "order_id": o.get("order_id", ""),
-                "trading_symbol": o.get("trading_symbol", ""),
-                "transaction_type": o.get("transaction_type", ""),
-                "quantity": o.get("quantity", 0),
-                "price": o.get("price", 0.0),
-                "average_price": o.get("average_price", 0.0),
-                "status": o.get("status", ""),
-                "order_timestamp": o.get("order_timestamp", "")
-            })
+        orders = [{
+            "order_id": o.get("order_id", ""),
+            "trading_symbol": o.get("trading_symbol", ""),
+            "transaction_type": o.get("transaction_type", ""),
+            "quantity": o.get("quantity", 0),
+            "price": o.get("price", 0.0),
+            "average_price": o.get("average_price", 0.0),
+            "status": o.get("status", ""),
+            "order_timestamp": o.get("order_timestamp", "")
+        } for o in orders_raw]
 
         return positions, orders, gtt_orders, round(total_pnl, 2), round(realised_pnl, 2), round(unrealised_pnl, 2), None
-
     except Exception as e:
-        print(f"[Positions Exception] Error fetching positions: {e}")
         return [], [], [], 0.0, 0.0, 0.0, str(e)
 
-# --- UPSTOX CONCURRENT DATA FETCHING ---
 def fetch_single_expiry_chain(instrument_key, expiry_date, headers):
     try:
-        chain_url = f"https://api.upstox.com/v2/option/chain?instrument_key={urllib.parse.quote(instrument_key)}&expiry_date={expiry_date}"
-        res = requests.get(chain_url, headers=headers, timeout=10)
+        res = requests.get(f"https://api.upstox.com/v2/option/chain?instrument_key={urllib.parse.quote(instrument_key)}&expiry_date={expiry_date}", headers=headers, timeout=10)
         if res.status_code == 200:
             return expiry_date, res.json().get("data", [])
-    except Exception as e:
-        print(f"[Fetch Error] Failed fetching expiry {expiry_date}: {e}")
+    except Exception:
+        pass
     return expiry_date, []
 
 def fetch_option_chain(symbol, selected_expiry="ALL"):
     token = get_valid_token()
     if not token:
-        return None, None, [], "Authentication paused to protect account from lockout. Wait 25 mins or check logs."
-
+        return None, None, [], "Authentication paused to protect account from lockout."
     instrument_key = INSTRUMENT_KEYS.get(symbol, "NSE_INDEX|Nifty 50")
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
-
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
     try:
-        expiry_url = f"https://api.upstox.com/v2/option/contract?instrument_key={urllib.parse.quote(instrument_key)}"
-        exp_res = requests.get(expiry_url, headers=headers, timeout=10)
-
+        exp_res = requests.get(f"https://api.upstox.com/v2/option/contract?instrument_key={urllib.parse.quote(instrument_key)}", headers=headers, timeout=10)
         if exp_res.status_code == 401:
             invalidate_session()
             token = perform_single_auth(force_refresh=True)
             if not token:
                 return None, None, [], "Session expired and re-authentication paused."
             headers["Authorization"] = f"Bearer {token}"
-            exp_res = requests.get(expiry_url, headers=headers, timeout=10)
-
+            exp_res = requests.get(f"https://api.upstox.com/v2/option/contract?instrument_key={urllib.parse.quote(instrument_key)}", headers=headers, timeout=10)
         if exp_res.status_code != 200:
             return None, None, [], f"Expiry lookup failed: {exp_res.text}"
 
@@ -1473,78 +1206,55 @@ def fetch_option_chain(symbol, selected_expiry="ALL"):
         if not expiries:
             return None, None, [], "No option contract expiries found."
 
-        clean_expiry = str(selected_expiry).strip().upper() if selected_expiry else "ALL"
-
-        if clean_expiry == "ALL" or clean_expiry == "ALL EXPIRIES (CONSOLIDATED)" or clean_expiry not in expiries:
-            target_expiries = expiries[:6]
+        clean_exp = str(selected_expiry).strip().upper() if selected_expiry else "ALL"
+        if clean_exp in ("ALL", "ALL EXPIRIES (CONSOLIDATED)") or clean_exp not in expiries:
             results_dict = {}
-
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                futures = {executor.submit(fetch_single_expiry_chain, instrument_key, exp, headers): exp for exp in target_expiries}
-                for future in as_completed(futures):
-                    exp_date, data = future.result()
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                futs = {ex.submit(fetch_single_expiry_chain, instrument_key, exp, headers): exp for exp in expiries[:6]}
+                for fut in as_completed(futs):
+                    ed, data = fut.result()
                     if data:
-                        results_dict[exp_date] = data
-
-            combined_chain = []
+                        results_dict[ed] = data
+            combined = []
             for exp in sorted(results_dict.keys()):
-                combined_chain.extend(results_dict[exp])
-            
-            return combined_chain, "ALL EXPIRIES (CONSOLIDATED)", expiries, None
+                combined.extend(results_dict[exp])
+            return combined, "ALL EXPIRIES (CONSOLIDATED)", expiries, None
 
-        _, chain_data = fetch_single_expiry_chain(instrument_key, clean_expiry, headers)
-        return chain_data, clean_expiry, expiries, None
-
+        _, chain_data = fetch_single_expiry_chain(instrument_key, clean_exp, headers)
+        return chain_data, clean_exp, expiries, None
     except Exception as e:
         return None, None, [], f"Exception during fetch: {e}"
 
 def process_option_data(symbol, selected_expiry="ALL"):
     chain_data, current_expiry, expiries, error = fetch_option_chain(symbol, selected_expiry)
-    
     updated_time = get_ist_now().strftime("%d/%m/%Y %H:%M:%S IST")
-
     if error or not chain_data:
         return [], 0, 0, current_expiry or "ALL EXPIRIES (CONSOLIDATED)", expiries, updated_time, 0, 0, 0, error or "No option chain data available."
 
     spot_price = chain_data[0].get("underlying_spot_price", 0) if chain_data else 0
-
     step = 100 if symbol == "BANKNIFTY" else 50
     atm_strike = round(spot_price / step) * step if step > 0 else spot_price
-
-    num_strikes_each_side = 12
-    min_strike = atm_strike - (num_strikes_each_side * step)
-    max_strike = atm_strike + (num_strikes_each_side * step)
-
+    min_s, max_s = atm_strike - (12 * step), atm_strike + (12 * step)
     strike_map = {}
 
     for item in chain_data:
         strike = item.get("strike_price", 0)
-        if not (min_strike <= strike <= max_strike):
+        if not (min_s <= strike <= max_s):
             continue
-
         if strike not in strike_map:
             strike_map[strike] = {
-                "strike": strike,
-                "is_atm": (strike == atm_strike),
+                "strike": strike, "is_atm": (strike == atm_strike),
                 "ce_oi": 0, "ce_oi_chg": 0, "ce_vol": 0, "ce_bid_qty": 0, "ce_ask_qty": 0,
                 "ce_iv": 0, "ce_ltp": 0, "ce_bid": 0, "ce_ask": 0, "ce_delta": 0, "ce_theta": 0, "ce_vega": 0, "ce_gamma": 0,
                 "pe_oi": 0, "pe_oi_chg": 0, "pe_vol": 0, "pe_bid_qty": 0, "pe_ask_qty": 0,
                 "pe_iv": 0, "pe_ltp": 0, "pe_bid": 0, "pe_ask": 0, "pe_delta": 0, "pe_theta": 0, "pe_vega": 0, "pe_gamma": 0,
                 "_has_pricing": False
             }
-
         rec = strike_map[strike]
-
-        ce = item.get("call_options", {}) or {}
-        pe = item.get("put_options", {}) or {}
-
-        ce_mkt = ce.get("market_data", {}) or {}
-        ce_gk = ce.get("option_greeks", {}) or {}
-        pe_mkt = pe.get("market_data", {}) or {}
-        pe_gk = pe.get("option_greeks", {}) or {}
-
-        c_oi = ce_mkt.get("oi", 0) or 0
-        p_oi = pe_mkt.get("oi", 0) or 0
+        ce, pe = item.get("call_options", {}) or {}, item.get("put_options", {}) or {}
+        ce_mkt, ce_gk = ce.get("market_data", {}) or {}, ce.get("option_greeks", {}) or {}
+        pe_mkt, pe_gk = pe.get("market_data", {}) or {}, pe.get("option_greeks", {}) or {}
+        c_oi, p_oi = ce_mkt.get("oi", 0) or 0, pe_mkt.get("oi", 0) or 0
 
         rec["ce_oi"] += c_oi
         rec["pe_oi"] += p_oi
@@ -1566,7 +1276,6 @@ def process_option_data(symbol, selected_expiry="ALL"):
             rec["ce_theta"] = round(ce_gk.get("theta", 0) or 0, 2)
             rec["ce_vega"] = round(ce_gk.get("vega", 0) or 0, 2)
             rec["ce_gamma"] = round(ce_gk.get("gamma", 0) or 0, 4)
-
             rec["pe_ltp"] = pe_mkt.get("ltp", 0) or 0
             rec["pe_bid"] = pe_mkt.get("bid_price", 0) or 0
             rec["pe_ask"] = pe_mkt.get("ask_price", 0) or 0
@@ -1578,16 +1287,12 @@ def process_option_data(symbol, selected_expiry="ALL"):
             rec["_has_pricing"] = True
 
     rows = [strike_map[k] for k in sorted(strike_map.keys())]
-
-    total_ce_oi = sum(r["ce_oi"] for r in rows)
-    total_pe_oi = sum(r["pe_oi"] for r in rows)
-    pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 0
-
-    return rows, spot_price, atm_strike, current_expiry, expiries, updated_time, pcr, total_ce_oi, total_pe_oi, None
+    t_ce, t_pe = sum(r["ce_oi"] for r in rows), sum(r["pe_oi"] for r in rows)
+    pcr = round(t_pe / t_ce, 2) if t_ce > 0 else 0
+    return rows, spot_price, atm_strike, current_expiry, expiries, updated_time, pcr, t_ce, t_pe, None
 
 # --- MAIN TABLE TEMPLATE ---
-MAIN_HTML_TEMPLATE = """
-<!DOCTYPE html>
+MAIN_HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
     <title>Upstox Pro Option Chain & Greeks Dashboard</title>
@@ -1603,21 +1308,17 @@ MAIN_HTML_TEMPLATE = """
         .btn { display: inline-block; padding: 8px 16px; color: #fff; background-color: #007bff; text-decoration: none; border-radius: 4px; margin-right: 10px; font-weight: 500; }
         .btn-success { background-color: #28a745; }
         .btn-purple { background-color: #6f42c1; }
-        .btn:hover { opacity: 0.9; }
         select { padding: 8px 12px; font-size: 14px; border-radius: 4px; border: 1px solid #ced4da; outline: none; font-weight: 600; }
         .table-container { overflow-x: auto; background: #fff; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.06); }
         table { width: 100%; border-collapse: collapse; min-width: 1300px; }
         th, td { border: 1px solid #e9ecef; padding: 7px 9px; text-align: center; font-size: 13px; }
         th { background-color: #343a40; color: white; position: sticky; top: 0; }
         tr:nth-child(even){ background-color: #f8f9fa; }
-        
         .ce-header { background-color: #28a745 !important; color: white; }
         .pe-header { background-color: #dc3545 !important; color: white; }
         .ce-cell { background-color: #f0fff4; }
         .pe-cell { background-color: #fff5f5; }
-        .greek-col { font-size: 12px; color: #495057; }
-        .order-col { font-size: 12px; color: #495057; }
-        
+        .greek-col, .order-col { font-size: 12px; color: #495057; }
         .strike-normal { background-color: #e2e8f0; font-weight: bold; }
         .atm-spot { background-color: #facc15 !important; color: #000 !important; font-weight: bold; font-size: 14px; border: 2px solid #ca8a04 !important; }
         .error-msg { color: #dc3545; font-weight: bold; padding: 12px; background: #f8d7da; border-radius: 4px; }
@@ -1640,70 +1341,35 @@ MAIN_HTML_TEMPLATE = """
         <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
             <a href="/?symbol=NIFTY&expiry={{ expiry }}" class="btn">View NIFTY</a>
             <a href="/?symbol=BANKNIFTY&expiry={{ expiry }}" class="btn">View BANKNIFTY</a>
-            
             <form method="GET" action="/" style="display: inline-flex; align-items: center; gap: 6px; margin: 0;">
                 <input type="hidden" name="symbol" value="{{ symbol }}">
                 <label style="font-weight: bold; color: #334155;">Select Expiry:</label>
                 <select name="expiry" onchange="this.form.submit()">
                     <option value="ALL" {% if expiry == 'ALL EXPIRIES (CONSOLIDATED)' or expiry == 'ALL' or not expiry %}selected{% endif %}>★ ALL EXPIRIES (CONSOLIDATED)</option>
-                    {% for exp in expiries %}
-                        <option value="{{ exp }}" {% if exp == expiry %}selected{% endif %}>{{ exp }}</option>
-                    {% endfor %}
+                    {% for exp in expiries %}<option value="{{ exp }}" {% if exp == expiry %}selected{% endif %}>{{ exp }}</option>{% endfor %}
                 </select>
             </form>
-
             <a href="/analysis?symbol={{ symbol }}&expiry={{ expiry }}" class="btn btn-purple">📊 Open Analysis Dashboard</a>
             <a href="/download?symbol={{ symbol }}&expiry={{ expiry }}" class="btn btn-success">Download Full CSV</a>
         </div>
     </div>
-
-    {% if error %}
-        <div class="error-msg">Error: {{ error }}</div>
-    {% else %}
+    {% if error %}<div class="error-msg">Error: {{ error }}</div>{% else %}
     <div class="table-container">
         <table>
             <thead>
-                <tr>
-                    <th colspan="11" class="ce-header">CALL OPTIONS (CE)</th>
-                    <th>STRIKE</th>
-                    <th colspan="11" class="pe-header">PUT OPTIONS (PE)</th>
-                </tr>
-                <tr>
-                    <th>OI</th><th>Chg in OI</th><th>Vol</th><th>IV</th><th>Delta</th><th>Theta</th><th>Vega</th><th>Gamma</th><th>Bid</th><th>Ask</th><th>LTP</th>
-                    <th>Price</th>
-                    <th>LTP</th><th>Bid</th><th>Ask</th><th>Delta</th><th>Theta</th><th>Vega</th><th>Gamma</th><th>IV</th><th>Vol</th><th>Chg in OI</th><th>OI</th>
-                </tr>
+                <tr><th colspan="11" class="ce-header">CALL OPTIONS (CE)</th><th>STRIKE</th><th colspan="11" class="pe-header">PUT OPTIONS (PE)</th></tr>
+                <tr><th>OI</th><th>Chg in OI</th><th>Vol</th><th>IV</th><th>Delta</th><th>Theta</th><th>Vega</th><th>Gamma</th><th>Bid</th><th>Ask</th><th>LTP</th><th>Price</th><th>LTP</th><th>Bid</th><th>Ask</th><th>Delta</th><th>Theta</th><th>Vega</th><th>Gamma</th><th>IV</th><th>Vol</th><th>Chg in OI</th><th>OI</th></tr>
             </thead>
             <tbody>
                 {% for row in rows %}
                 <tr>
-                    <td class="ce-cell">{{ "{:,}".format(row.ce_oi) }}</td>
-                    <td class="ce-cell">{{ "{:,}".format(row.ce_oi_chg) }}</td>
-                    <td class="ce-cell">{{ "{:,}".format(row.ce_vol) }}</td>
-                    <td class="ce-cell">{{ row.ce_iv }}</td>
-                    <td class="ce-cell greek-col">{{ row.ce_delta }}</td>
-                    <td class="ce-cell greek-col">{{ row.ce_theta }}</td>
-                    <td class="ce-cell greek-col">{{ row.ce_vega }}</td>
-                    <td class="ce-cell greek-col">{{ row.ce_gamma }}</td>
-                    <td class="ce-cell order-col">{{ row.ce_bid }}</td>
-                    <td class="ce-cell order-col">{{ row.ce_ask }}</td>
-                    <td class="ce-cell"><strong>{{ row.ce_ltp }}</strong></td>
-                    
-                    <td class="{% if row.is_atm %}atm-spot{% else %}strike-normal{% endif %}">
-                        {% if row.is_atm %}★ {{ row.strike }} (SPOT){% else %}{{ row.strike }}{% endif %}
-                    </td>
-                    
-                    <td class="pe-cell"><strong>{{ row.pe_ltp }}</strong></td>
-                    <td class="pe-cell order-col">{{ row.pe_bid }}</td>
-                    <td class="pe-cell order-col">{{ row.pe_ask }}</td>
-                    <td class="pe-cell greek-col">{{ row.pe_delta }}</td>
-                    <td class="pe-cell greek-col">{{ row.pe_theta }}</td>
-                    <td class="pe-cell greek-col">{{ row.pe_vega }}</td>
-                    <td class="pe-cell greek-col">{{ row.pe_gamma }}</td>
-                    <td class="pe-cell">{{ row.pe_iv }}</td>
-                    <td class="pe-cell">{{ "{:,}".format(row.pe_vol) }}</td>
-                    <td class="pe-cell">{{ "{:,}".format(row.pe_oi_chg) }}</td>
-                    <td class="pe-cell">{{ "{:,}".format(row.pe_oi) }}</td>
+                    <td class="ce-cell">{{ "{:,}".format(row.ce_oi) }}</td><td class="ce-cell">{{ "{:,}".format(row.ce_oi_chg) }}</td><td class="ce-cell">{{ "{:,}".format(row.ce_vol) }}</td><td class="ce-cell">{{ row.ce_iv }}</td>
+                    <td class="ce-cell greek-col">{{ row.ce_delta }}</td><td class="ce-cell greek-col">{{ row.ce_theta }}</td><td class="ce-cell greek-col">{{ row.ce_vega }}</td><td class="ce-cell greek-col">{{ row.ce_gamma }}</td>
+                    <td class="ce-cell order-col">{{ row.ce_bid }}</td><td class="ce-cell order-col">{{ row.ce_ask }}</td><td class="ce-cell"><strong>{{ row.ce_ltp }}</strong></td>
+                    <td class="{% if row.is_atm %}atm-spot{% else %}strike-normal{% endif %}">{% if row.is_atm %}★ {{ row.strike }} (SPOT){% else %}{{ row.strike }}{% endif %}</td>
+                    <td class="pe-cell"><strong>{{ row.pe_ltp }}</strong></td><td class="pe-cell order-col">{{ row.pe_bid }}</td><td class="pe-cell order-col">{{ row.pe_ask }}</td>
+                    <td class="pe-cell greek-col">{{ row.pe_delta }}</td><td class="pe-cell greek-col">{{ row.pe_theta }}</td><td class="pe-cell greek-col">{{ row.pe_vega }}</td><td class="pe-cell greek-col">{{ row.pe_gamma }}</td>
+                    <td class="pe-cell">{{ row.pe_iv }}</td><td class="pe-cell">{{ "{:,}".format(row.pe_vol) }}</td><td class="pe-cell">{{ "{:,}".format(row.pe_oi_chg) }}</td><td class="pe-cell">{{ "{:,}".format(row.pe_oi) }}</td>
                 </tr>
                 {% endfor %}
             </tbody>
@@ -1711,12 +1377,10 @@ MAIN_HTML_TEMPLATE = """
     </div>
     {% endif %}
 </body>
-</html>
-"""
+</html>"""
 
 # --- ANALYSIS DASHBOARD TEMPLATE ---
-ANALYSIS_HTML_TEMPLATE = """
-<!DOCTYPE html>
+ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
     <title>{{ symbol }} Option Chain & Technical Chart Analysis</title>
@@ -1729,8 +1393,6 @@ ANALYSIS_HTML_TEMPLATE = """
         .btn { padding: 9px 18px; color: #fff; background-color: #3b82f6; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 14px; border: none; cursor: pointer; }
         .btn-table { background-color: #64748b; }
         .btn-dl { background-color: #10b981; font-size: 12px; padding: 6px 12px; text-decoration: none; color: #fff; border-radius: 6px; font-weight: bold; }
-        .btn-dl:hover { background-color: #059669; }
-        .btn:hover { opacity: 0.9; }
         select { padding: 9px 14px; background: #0f172a; color: #38bdf8; border: 1px solid #334155; border-radius: 6px; font-weight: 600; font-size: 14px; outline: none; }
         .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; }
         .card { background: #1e293b; padding: 16px; border-radius: 10px; border-left: 5px solid #3b82f6; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
@@ -1761,9 +1423,7 @@ ANALYSIS_HTML_TEMPLATE = """
         <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Expiry:</label>
         <select id="expirySelector" onchange="switchExpiry(this.value)">
             <option value="ALL" {% if expiry == 'ALL EXPIRIES (CONSOLIDATED)' or expiry == 'ALL' or not expiry %}selected{% endif %}>★ ALL EXPIRIES (CONSOLIDATED)</option>
-            {% for exp in expiries %}
-                <option value="{{ exp }}" {% if exp == expiry %}selected{% endif %}>{{ exp }}</option>
-            {% endfor %}
+            {% for exp in expiries %}<option value="{{ exp }}" {% if exp == expiry %}selected{% endif %}>{{ exp }}</option>{% endfor %}
         </select>
 
         <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Bar Chart Metric:</label>
@@ -1785,26 +1445,11 @@ ANALYSIS_HTML_TEMPLATE = """
     <div id="errorContainer" class="error-msg" style="display: none;"></div>
 
     <div class="metrics-grid">
-        <div class="card" style="border-left-color: #facc15;">
-            <div class="card-title">Spot Price / ATM</div>
-            <div class="card-value" id="cardSpot" style="color: #facc15;">{{ spot_price }} (ATM: {{ atm_strike }})</div>
-        </div>
-        <div class="card" id="cardPcrBox">
-            <div class="card-title">Put-Call Ratio (PCR)</div>
-            <div class="card-value" id="cardPcr">{{ pcr }}</div>
-        </div>
-        <div class="card" style="border-left-color: #ef4444;">
-            <div class="card-title">Major Resistance (Max Call OI)</div>
-            <div class="card-value" id="maxCallStrike" style="color: #ef4444;">-</div>
-        </div>
-        <div class="card" style="border-left-color: #22c55e;">
-            <div class="card-title">Major Support (Max Put OI)</div>
-            <div class="card-value" id="maxPutStrike" style="color: #22c55e;">-</div>
-        </div>
-        <div class="card" style="border-left-color: #a855f7;">
-            <div class="card-title">Last Updated (IST)</div>
-            <div class="card-value" id="cardUpdated" style="font-size: 15px;">{{ updated }}</div>
-        </div>
+        <div class="card" style="border-left-color: #facc15;"><div class="card-title">Spot Price / ATM</div><div class="card-value" id="cardSpot" style="color: #facc15;">{{ spot_price }} (ATM: {{ atm_strike }})</div></div>
+        <div class="card" id="cardPcrBox"><div class="card-title">Put-Call Ratio (PCR)</div><div class="card-value" id="cardPcr">{{ pcr }}</div></div>
+        <div class="card" style="border-left-color: #ef4444;"><div class="card-title">Major Resistance (Max Call OI)</div><div class="card-value" id="maxCallStrike" style="color: #ef4444;">-</div></div>
+        <div class="card" style="border-left-color: #22c55e;"><div class="card-title">Major Support (Max Put OI)</div><div class="card-value" id="maxPutStrike" style="color: #22c55e;">-</div></div>
+        <div class="card" style="border-left-color: #a855f7;"><div class="card-title">Last Updated (IST)</div><div class="card-value" id="cardUpdated" style="font-size: 15px;">{{ updated }}</div></div>
     </div>
 
     <div class="sentiment-bar-container">
@@ -1813,14 +1458,9 @@ ANALYSIS_HTML_TEMPLATE = """
             <span style="color: #38bdf8;" id="gaugeMetricName">SELECTED METRIC COMPARISON</span>
             <span style="color: #ef4444;" id="gaugeCeLabel">CALL (CE) TOTAL: -</span>
         </div>
-        <div class="gauge-flex">
-            <div id="gaugePeBar" class="gauge-pe" style="width: 50%;"></div>
-            <div id="gaugeCeBar" class="gauge-ce" style="width: 50%;"></div>
-        </div>
+        <div class="gauge-flex"><div id="gaugePeBar" class="gauge-pe" style="width: 50%;"></div><div id="gaugeCeBar" class="gauge-ce" style="width: 50%;"></div></div>
         <div style="display: flex; justify-content: space-between; color: #94a3b8; font-size: 12px; margin-top: 6px;">
-            <span id="gaugePeAvg">Put Avg: -</span>
-            <span id="gaugeRatioText">Ratio: 1.00</span>
-            <span id="gaugeCeAvg">Call Avg: -</span>
+            <span id="gaugePeAvg">Put Avg: -</span><span id="gaugeRatioText">Ratio: 1.00</span><span id="gaugeCeAvg">Call Avg: -</span>
         </div>
     </div>
 
@@ -1834,9 +1474,7 @@ ANALYSIS_HTML_TEMPLATE = """
 
     <div class="chart-box">
         <div class="chart-header">
-            <div style="display: flex; align-items: center; gap: 15px;">
-                <span class="chart-title">2 - 📈 Historical Snapshot Trend (Google Sheet Memory)</span>
-            </div>
+            <span class="chart-title">2 - 📈 Historical Snapshot Trend (Google Sheet Memory)</span>
             <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
                 <label style="color: #94a3b8; font-weight: bold;">Head of Dropdown:</label>
                 <select id="historyMetricSelector" onchange="loadHistoricalChart(true)">
@@ -1853,26 +1491,15 @@ ANALYSIS_HTML_TEMPLATE = """
                     <option value="ask">ASK (CE Ask vs PE Ask)</option>
                     <option value="ltp">LTP AVG (CE LTP vs PE LTP)</option>
                 </select>
-
-                <label style="color: #94a3b8; font-weight: bold; margin-left: 6px;">Data Day Range:</label>
+                <label style="color: #94a3b8; font-weight: bold;">Data Day Range:</label>
                 <select id="historyDayRangeSelector" onchange="loadHistoricalChart(true)">
-                    <option value="1day" selected>1 Day</option>
-                    <option value="3day">3 Day</option>
-                    <option value="1week">1 Week</option>
-                    <option value="2week">2 Week</option>
-                    <option value="1month">1 Month</option>
-                    <option value="3month">3 Month</option>
+                    <option value="1day" selected>1 Day</option><option value="3day">3 Day</option><option value="1week">1 Week</option>
+                    <option value="2week">2 Week</option><option value="1month">1 Month</option><option value="3month">3 Month</option>
                 </select>
-
-                <label style="color: #94a3b8; font-weight: bold; margin-left: 6px;">Interval:</label>
+                <label style="color: #94a3b8; font-weight: bold;">Interval:</label>
                 <select id="historyTimeframeSelector" onchange="loadHistoricalChart(true)">
-                    <option value="5minute" selected>5 Min</option>
-                    <option value="15minute">15 Min</option>
-                    <option value="30minute">30 Min</option>
-                    <option value="60minute">1 Hour</option>
-                    <option value="day">1 Day</option>
+                    <option value="5minute" selected>5 Min</option><option value="15minute">15 Min</option><option value="30minute">30 Min</option><option value="60minute">1 Hour</option><option value="day">1 Day</option>
                 </select>
-
                 <a id="downloadHistoryBtn" href="/download_history?symbol={{ symbol }}" class="btn-dl">📥 Download Google Sheet Memory CSV</a>
             </div>
         </div>
@@ -1881,26 +1508,16 @@ ANALYSIS_HTML_TEMPLATE = """
 
     <div class="chart-box">
         <div class="chart-header">
-            <div style="display: flex; align-items: center; gap: 15px;">
-                <span class="chart-title">3 - 🚀 Main Signal</span>
-            </div>
+            <span class="chart-title">3 - 🚀 Main Signal (B / BE / S / SE)</span>
             <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
                 <label style="color: #94a3b8; font-weight: bold;">Data Day Range:</label>
                 <select id="signalDayRangeSelector" onchange="loadSignalChart(true)">
-                    <option value="1day" selected>1 Day</option>
-                    <option value="3day">3 Day</option>
-                    <option value="1week">1 Week</option>
-                    <option value="2week">2 Week</option>
-                    <option value="1month">1 Month</option>
-                    <option value="3month">3 Month</option>
+                    <option value="1day" selected>1 Day</option><option value="3day">3 Day</option><option value="1week">1 Week</option>
+                    <option value="2week">2 Week</option><option value="1month">1 Month</option><option value="3month">3 Month</option>
                 </select>
-
-                <label style="color: #94a3b8; font-weight: bold; margin-left: 6px;">Interval:</label>
+                <label style="color: #94a3b8; font-weight: bold;">Interval:</label>
                 <select id="signalTimeframeSelector" onchange="loadSignalChart(true)">
-                    <option value="5minute" selected>5 Min</option>
-                    <option value="15minute">15 Min</option>
-                    <option value="30minute">30 Min</option>
-                    <option value="60minute">1 Hour</option>
+                    <option value="5minute" selected>5 Min</option><option value="15minute">15 Min</option><option value="30minute">30 Min</option><option value="60minute">1 Hour</option>
                 </select>
             </div>
         </div>
@@ -1912,11 +1529,145 @@ ANALYSIS_HTML_TEMPLATE = """
         let currentExpiry = "{{ expiry }}";
         let rawRows = {{ rows | tojson }};
         let currentAtmStrike = {{ atm_strike }};
-        let myChart = null;
-        let historyChartObj = null;
-        let signalChartObj = null;
-        let hasHistoryData = false;
-        let hasSignalData = false;
+        let myChart = null, historyChartObj = null, signalChartObj = null;
+        let hasHistoryData = false, hasSignalData = false;
+
+        const DATE_PALETTE = ['#38bdf8', '#facc15', '#4ade80', '#f472b6', '#a78bfa', '#fb923c', '#2dd4bf'];
+
+        function buildDateMeta(snapshots) {
+            const dates = [], colors = [], groups = [];
+            const dateColorMap = {};
+            let paletteIdx = 0;
+
+            snapshots.forEach((s, i) => {
+                let dStr = (s.date_str || "").trim();
+                if (!dStr && s.datetime && String(s.datetime).includes(" ")) {
+                    dStr = String(s.datetime).split(" ")[0].trim();
+                }
+                if (!dStr) dStr = "Session";
+                if (!(dStr in dateColorMap)) {
+                    dateColorMap[dStr] = DATE_PALETTE[paletteIdx % DATE_PALETTE.length];
+                    paletteIdx++;
+                }
+                const col = dateColorMap[dStr];
+                dates.push(dStr);
+                colors.push(col);
+                if (groups.length === 0 || groups[groups.length - 1].date !== dStr) {
+                    groups.push({ date: dStr, start: i, end: i, color: col, bandIdx: groups.length });
+                } else {
+                    groups[groups.length - 1].end = i;
+                }
+            });
+            return { dates, colors, groups };
+        }
+
+        const dateBandPlugin = {
+            id: 'dateBandPlugin',
+            beforeDraw: (chart) => {
+                const { ctx, chartArea, scales } = chart;
+                const groups = chart._dateGroups || [];
+                if (!scales || !scales.x || !chartArea || groups.length === 0) return;
+                const { top, bottom, left, right } = chartArea;
+                const xScale = scales.x;
+
+                ctx.save();
+                groups.forEach((g, idx) => {
+                    const xStart = idx === 0 ? left : (xScale.getPixelForValue(g.start - 1) + xScale.getPixelForValue(g.start)) / 2;
+                    const xEnd = idx === groups.length - 1 ? right : (xScale.getPixelForValue(g.end) + xScale.getPixelForValue(g.end + 1)) / 2;
+                    ctx.fillStyle = idx % 2 === 0 ? 'rgba(56, 189, 248, 0.04)' : 'rgba(250, 204, 21, 0.05)';
+                    ctx.fillRect(xStart, top, xEnd - xStart, bottom - top);
+
+                    if (idx > 0) {
+                        ctx.beginPath();
+                        ctx.moveTo(xStart, top);
+                        ctx.lineTo(xStart, bottom);
+                        ctx.lineWidth = 1.5;
+                        ctx.strokeStyle = 'rgba(148, 163, 184, 0.45)';
+                        ctx.setLineDash([4, 4]);
+                        ctx.stroke();
+                        ctx.setLineDash([]);
+                    }
+
+                    if (g.date && g.date !== "Session" && (xEnd - xStart) > 48) {
+                        ctx.fillStyle = g.color;
+                        ctx.font = 'bold 11px Segoe UI';
+                        ctx.textAlign = 'left';
+                        ctx.textBaseline = 'top';
+                        ctx.fillText(g.date, xStart + 6, top + 6);
+                    }
+                });
+                ctx.restore();
+            }
+        };
+
+        const signalLabelPlugin = {
+            id: 'signalLabelPlugin',
+            afterDatasetsDraw: (chart) => {
+                const { ctx } = chart;
+                chart.data.datasets.forEach((dataset, datasetIndex) => {
+                    if (dataset.label === 'Main Volatility') {
+                        const meta = chart.getDatasetMeta(datasetIndex);
+                        const signals = dataset.signalLabels || [];
+                        meta.data.forEach((element, index) => {
+                            const rawSig = (signals[index] || "").trim().toUpperCase();
+                            if (rawSig === 'B' || rawSig === 'BE' || rawSig === 'S' || rawSig === 'SE') {
+                                const { x, y } = element.tooltipPosition();
+                                const badgeColor = rawSig === 'B' ? '#22c55e' : (rawSig === 'BE' ? '#f59e0b' : (rawSig === 'S' ? '#ef4444' : '#38bdf8'));
+                                ctx.save();
+                                ctx.font = 'bold 11px Segoe UI';
+                                const textW = ctx.measureText(rawSig).width;
+                                const padX = 5, boxH = 16, boxW = textW + padX * 2;
+                                const boxX = x - boxW / 2, boxY = y - boxH - 6;
+
+                                ctx.fillStyle = '#0f172a';
+                                ctx.strokeStyle = badgeColor;
+                                ctx.lineWidth = 1.5;
+                                ctx.beginPath();
+                                ctx.roundRect(boxX, boxY, boxW, boxH, 4);
+                                ctx.fill();
+                                ctx.stroke();
+
+                                ctx.fillStyle = badgeColor;
+                                ctx.textAlign = 'center';
+                                ctx.textBaseline = 'middle';
+                                ctx.fillText(rawSig, x, boxY + boxH / 2 + 0.5);
+                                ctx.restore();
+                            }
+                        });
+                    }
+                });
+            }
+        };
+
+        const zeroLinePlugin = {
+            id: 'zeroLinePlugin',
+            beforeDraw: (chart) => {
+                const { ctx, chartArea, scales } = chart;
+                if (!scales || !scales.y || !chartArea) return;
+                const { top, bottom, left, right } = chartArea;
+                const zeroY = scales.y.getPixelForValue(0);
+                ctx.save();
+                if (zeroY >= top && zeroY <= bottom) {
+                    ctx.fillStyle = 'rgba(34, 197, 94, 0.08)';
+                    ctx.fillRect(left, top, right - left, zeroY - top);
+                    ctx.fillStyle = 'rgba(239, 68, 68, 0.08)';
+                    ctx.fillRect(left, zeroY, right - left, bottom - zeroY);
+                    ctx.beginPath();
+                    ctx.moveTo(left, zeroY);
+                    ctx.lineTo(right, zeroY);
+                    ctx.lineWidth = 3;
+                    ctx.strokeStyle = '#facc15';
+                    ctx.stroke();
+                } else if (zeroY > bottom) {
+                    ctx.fillStyle = 'rgba(34, 197, 94, 0.08)';
+                    ctx.fillRect(left, top, right - left, bottom - top);
+                } else {
+                    ctx.fillStyle = 'rgba(239, 68, 68, 0.08)';
+                    ctx.fillRect(left, top, right - left, bottom - top);
+                }
+                ctx.restore();
+            }
+        };
 
         function switchSymbol(newSym) {
             currentSymbol = newSym;
@@ -1935,78 +1686,13 @@ ANALYSIS_HTML_TEMPLATE = """
             let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
             for (let i = 0; i < n; i++) {
                 const val = data[i] || 0;
-                sumX += i;
-                sumY += val;
-                sumXY += i * val;
-                sumXX += i * i;
+                sumX += i; sumY += val; sumXY += i * val; sumXX += i * i;
             }
             const denom = (n * sumXX - sumX * sumX);
             const slope = denom !== 0 ? (n * sumXY - sumX * sumY) / denom : 0;
             const intercept = (sumY - slope * sumX) / n;
-
             return data.map((_, i) => Number((slope * i + intercept).toFixed(2)));
         }
-
-        const signalLabelPlugin = {
-            id: 'signalLabelPlugin',
-            afterDatasetsDraw: (chart) => {
-                const { ctx } = chart;
-                chart.data.datasets.forEach((dataset, datasetIndex) => {
-                    if (dataset.label === 'Main Volatility') {
-                        const meta = chart.getDatasetMeta(datasetIndex);
-                        const signals = dataset.signalLabels || [];
-                        meta.data.forEach((element, index) => {
-                            const sig = signals[index];
-                            if (sig && (sig.toUpperCase() === 'B' || sig.toUpperCase() === 'S')) {
-                                const { x, y } = element.tooltipPosition();
-                                ctx.save();
-                                ctx.fillStyle = '#ffffff';
-                                ctx.font = 'bold 13px Segoe UI';
-                                ctx.textAlign = 'center';
-                                ctx.textBaseline = 'bottom';
-                                ctx.fillText(sig.toUpperCase(), x, y - 6);
-                                ctx.restore();
-                            }
-                        });
-                    }
-                });
-            }
-        };
-
-        const zeroLinePlugin = {
-            id: 'zeroLinePlugin',
-            beforeDraw: (chart) => {
-                const { ctx, chartArea, scales } = chart;
-                if (!scales || !scales.y || !chartArea) return;
-                const { top, bottom, left, right } = chartArea;
-                const y = scales.y;
-                const zeroY = y.getPixelForValue(0);
-
-                ctx.save();
-                if (zeroY >= top && zeroY <= bottom) {
-                    ctx.fillStyle = 'rgba(34, 197, 94, 0.08)';
-                    ctx.fillRect(left, top, right - left, zeroY - top);
-
-                    ctx.fillStyle = 'rgba(239, 68, 68, 0.08)';
-                    ctx.fillRect(left, zeroY, right - left, bottom - zeroY);
-
-                    ctx.beginPath();
-                    ctx.moveTo(left, zeroY);
-                    ctx.lineTo(right, zeroY);
-                    ctx.lineWidth = 3;
-                    ctx.strokeStyle = '#facc15';
-                    ctx.setLineDash([]);
-                    ctx.stroke();
-                } else if (zeroY > bottom) {
-                    ctx.fillStyle = 'rgba(34, 197, 94, 0.08)';
-                    ctx.fillRect(left, top, right - left, bottom - top);
-                } else if (zeroY < top) {
-                    ctx.fillStyle = 'rgba(239, 68, 68, 0.08)';
-                    ctx.fillRect(left, top, right - left, bottom - top);
-                }
-                ctx.restore();
-            }
-        };
 
         function initSignalChart() {
             const ctx = document.getElementById('signalChart').getContext('2d');
@@ -2017,18 +1703,25 @@ ANALYSIS_HTML_TEMPLATE = """
                     responsive: true,
                     maintainAspectRatio: false,
                     animation: false,
-                    animations: { colors: false, x: false, y: false },
-                    transitions: { active: { animation: { duration: 0 } } },
+                    interaction: { mode: null },
+                    hover: { mode: null },
+                    events: ['click'],
                     scales: {
-                        x: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } },
+                        x: {
+                            ticks: {
+                                color: (c) => (c.chart._dateColors && c.chart._dateColors[c.index]) || '#94a3b8',
+                                font: { weight: 'bold', size: 11 }
+                            },
+                            grid: { color: '#334155' }
+                        },
                         y: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } }
                     },
                     plugins: {
                         legend: { labels: { color: '#f8fafc', font: { size: 13 } } },
-                        tooltip: { mode: 'index', intersect: false }
+                        tooltip: { enabled: false }
                     }
                 },
-                plugins: [zeroLinePlugin, signalLabelPlugin]
+                plugins: [dateBandPlugin, zeroLinePlugin, signalLabelPlugin]
             });
             loadSignalChart(true);
         }
@@ -2036,45 +1729,33 @@ ANALYSIS_HTML_TEMPLATE = """
         function loadSignalChart(isManualChange = false) {
             const dayRange = document.getElementById('signalDayRangeSelector').value;
             const timeframe = document.getElementById('signalTimeframeSelector').value;
-
             fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&day_range=${dayRange}&chart_type=signal`)
                 .then(res => res.json())
                 .then(data => {
-                    if (data.error) {
+                    if (data.error || !(data.history && data.history.length)) {
                         if (isManualChange || !hasSignalData) {
-                            signalChartObj.data.labels = [data.error];
-                            signalChartObj.data.datasets = [{ label: 'Status / Error', data: [0], borderColor: '#ef4444' }];
+                            signalChartObj._dateColors = [];
+                            signalChartObj._dateGroups = [];
+                            signalChartObj.data.labels = [data.error || "No data found for Main Signal."];
+                            signalChartObj.data.datasets = [{ label: 'Status', data: [0], borderColor: '#ef4444' }];
                             signalChartObj.update('none');
                         }
                         return;
                     }
-
-                    const snapshots = data.history || [];
-                    if (snapshots.length === 0) {
-                        if (isManualChange || !hasSignalData) {
-                            signalChartObj.data.labels = ["No data found for Main Signal."];
-                            signalChartObj.data.datasets = [{ label: 'Status', data: [0], borderColor: '#94a3b8' }];
-                            signalChartObj.update('none');
-                        }
-                        return;
-                    }
-
                     hasSignalData = true;
-                    const times = snapshots.map(s => s.formatted_time || s.datetime);
-                    const minRocVals = snapshots.map(s => s.min_roc || 0);
-                    const maxRocVals = snapshots.map(s => s.max_roc || 0);
-                    const crossRocVals = snapshots.map(s => s.cross_roc || 0);
-                    const mainVolVals = snapshots.map(s => s.main_volatility || 0);
-                    const newSignals = snapshots.map(s => s.new_signal || "");
+                    const snapshots = data.history;
+                    const meta = buildDateMeta(snapshots);
+                    signalChartObj._dateColors = meta.colors;
+                    signalChartObj._dateGroups = meta.groups;
 
+                    const times = snapshots.map(s => s.formatted_time || s.datetime);
                     signalChartObj.data.labels = times;
                     signalChartObj.data.datasets = [
-                        { label: 'Min ROC (Buy)', data: minRocVals, borderColor: '#22c55e', backgroundColor: 'rgba(34, 197, 94, 0.1)', borderWidth: 2, tension: 0.2 },
-                        { label: 'Max ROC (Sell)', data: maxRocVals, borderColor: '#ef4444', backgroundColor: 'rgba(239, 68, 68, 0.1)', borderWidth: 2, tension: 0.2 },
-                        { label: 'Cross ROC Sig', data: crossRocVals, borderColor: '#facc15', backgroundColor: 'rgba(250, 204, 21, 0.1)', borderWidth: 2, tension: 0.2 },
-                        { label: 'Main Volatility', data: mainVolVals, signalLabels: newSignals, borderColor: '#38bdf8', backgroundColor: 'rgba(56, 189, 248, 0.1)', borderWidth: 3, pointRadius: 4, pointHoverRadius: 6, tension: 0.2 }
+                        { label: 'Min ROC (Buy)', data: snapshots.map(s => s.min_roc || 0), borderColor: '#22c55e', borderWidth: 2, pointRadius: 0, pointHoverRadius: 0, tension: 0.2 },
+                        { label: 'Max ROC (Sell)', data: snapshots.map(s => s.max_roc || 0), borderColor: '#ef4444', borderWidth: 2, pointRadius: 0, pointHoverRadius: 0, tension: 0.2 },
+                        { label: 'Cross ROC Sig', data: snapshots.map(s => s.cross_roc || 0), borderColor: '#facc15', borderWidth: 2, pointRadius: 0, pointHoverRadius: 0, tension: 0.2 },
+                        { label: 'Main Volatility', data: snapshots.map(s => s.main_volatility || 0), signalLabels: snapshots.map(s => s.new_signal || ""), borderColor: '#38bdf8', borderWidth: 3, pointRadius: 3, pointHoverRadius: 0, tension: 0.2 }
                     ];
-
                     signalChartObj.update('none');
                 })
                 .catch(err => console.error("Signal chart error:", err));
@@ -2090,7 +1771,13 @@ ANALYSIS_HTML_TEMPLATE = """
                     maintainAspectRatio: false,
                     animation: false,
                     scales: {
-                        x: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } },
+                        x: {
+                            ticks: {
+                                color: (c) => (c.chart._dateColors && c.chart._dateColors[c.index]) || '#94a3b8',
+                                font: { weight: 'bold', size: 11 }
+                            },
+                            grid: { color: '#334155' }
+                        },
                         y: { position: 'left', ticks: { color: '#94a3b8' }, grid: { color: '#334155' } },
                         y1: { position: 'right', display: false, ticks: { color: '#38bdf8' }, grid: { drawOnChartArea: false } }
                     },
@@ -2098,7 +1785,8 @@ ANALYSIS_HTML_TEMPLATE = """
                         legend: { labels: { color: '#f8fafc', font: { size: 13 } } },
                         tooltip: { mode: 'index', intersect: false }
                     }
-                }
+                },
+                plugins: [dateBandPlugin]
             });
             loadHistoricalChart(true);
         }
@@ -2111,26 +1799,22 @@ ANALYSIS_HTML_TEMPLATE = """
             fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&metric=${metric}&day_range=${dayRange}&chart_type=history`)
                 .then(res => res.json())
                 .then(data => {
-                    if (data.error) {
+                    if (data.error || !(data.history && data.history.length)) {
                         if (isManualChange || !hasHistoryData) {
-                            historyChartObj.data.labels = [data.error];
-                            historyChartObj.data.datasets = [{ label: 'Status / Error', data: [0], borderColor: '#ef4444' }];
+                            historyChartObj._dateColors = [];
+                            historyChartObj._dateGroups = [];
+                            historyChartObj.data.labels = [data.error || "No data found in Google Sheet."];
+                            historyChartObj.data.datasets = [{ label: 'Status', data: [0], borderColor: '#ef4444' }];
                             historyChartObj.update('none');
                         }
                         return;
                     }
-
-                    const snapshots = data.history || [];
-                    if (snapshots.length === 0) {
-                        if (isManualChange || !hasHistoryData) {
-                            historyChartObj.data.labels = ["No data found in Google Sheet."];
-                            historyChartObj.data.datasets = [{ label: 'Status', data: [0], borderColor: '#94a3b8' }];
-                            historyChartObj.update('none');
-                        }
-                        return;
-                    }
-
                     hasHistoryData = true;
+                    const snapshots = data.history;
+                    const meta = buildDateMeta(snapshots);
+                    historyChartObj._dateColors = meta.colors;
+                    historyChartObj._dateGroups = meta.groups;
+
                     const times = snapshots.map(s => s.formatted_time || s.datetime);
                     let datasets = [];
 
@@ -2138,14 +1822,11 @@ ANALYSIS_HTML_TEMPLATE = """
                         historyChartObj.options.scales.y1.display = true;
                         const spotVals = snapshots.map(s => s.spot_price);
                         const pcrVals = snapshots.map(s => s.pcr);
-
-                        datasets.push({ label: 'Relation 2: PCR', data: pcrVals, borderColor: '#06b6d4', backgroundColor: 'rgba(6, 182, 212, 0.1)', borderWidth: 2, tension: 0.2, yAxisID: 'y', fill: false });
+                        datasets.push({ label: 'Relation 2: PCR', data: pcrVals, borderColor: '#06b6d4', borderWidth: 2, tension: 0.2, yAxisID: 'y' });
                         datasets.push({ label: 'Relation 1: Price LTP', data: spotVals, borderColor: '#facc15', backgroundColor: 'rgba(250, 204, 21, 0.1)', borderWidth: 2, tension: 0.2, yAxisID: 'y1', fill: true });
-                        datasets.push({ label: 'Price Trend', data: computeLinearTrend(spotVals), borderColor: '#ca8a04', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, yAxisID: 'y1', fill: false });
-                    }
-                    else {
+                        datasets.push({ label: 'Price Trend', data: computeLinearTrend(spotVals), borderColor: '#ca8a04', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, yAxisID: 'y1' });
+                    } else {
                         historyChartObj.options.scales.y1.display = false;
-
                         const metricMap = {
                             "oi": { key1: "ce_oi", key2: "pe_oi", r1: "CE OI", r2: "PE OI" },
                             "oi_chg": { key1: "ce_oi_chg", key2: "pe_oi_chg", r1: "CE Chng OI", r2: "PE Chng OI" },
@@ -2159,19 +1840,17 @@ ANALYSIS_HTML_TEMPLATE = """
                             "ask": { key1: "ce_ask", key2: "pe_ask", r1: "CE Ask", r2: "PE Ask" },
                             "ltp": { key1: "ce_ltp", key2: "pe_ltp", r1: "CE LTP", r2: "PE LTP" }
                         };
-
                         const cfg = metricMap[metric] || metricMap["oi"];
                         const ceVals = snapshots.map(s => s[cfg.key1] || 0);
                         const peVals = snapshots.map(s => s[cfg.key2] || 0);
                         const avgVals = ceVals.map((v, i) => (v + (peVals[i] || 0)) / 2);
 
-                        datasets.push({ label: `Relation 1: ${cfg.r1}`, data: ceVals, borderColor: '#ef4444', backgroundColor: 'rgba(239, 68, 68, 0.1)', borderWidth: 2, tension: 0.2, yAxisID: 'y' });
-                        datasets.push({ label: `Relation 2: ${cfg.r2}`, data: peVals, borderColor: '#22c55e', backgroundColor: 'rgba(34, 197, 94, 0.1)', borderWidth: 2, tension: 0.2, yAxisID: 'y' });
-                        datasets.push({ label: `Average (${cfg.r1} & ${cfg.r2})`, data: avgVals, borderColor: '#facc15', backgroundColor: 'rgba(250, 204, 21, 0.1)', borderWidth: 2, tension: 0.2, yAxisID: 'y', fill: false });
-                        datasets.push({ label: `${cfg.r1} Trend`, data: computeLinearTrend(ceVals), borderColor: '#f87171', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, yAxisID: 'y', fill: false });
-                        datasets.push({ label: `${cfg.r2} Trend`, data: computeLinearTrend(peVals), borderColor: '#4ade80', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, yAxisID: 'y', fill: false });
+                        datasets.push({ label: `Relation 1: ${cfg.r1}`, data: ceVals, borderColor: '#ef4444', borderWidth: 2, tension: 0.2, yAxisID: 'y' });
+                        datasets.push({ label: `Relation 2: ${cfg.r2}`, data: peVals, borderColor: '#22c55e', borderWidth: 2, tension: 0.2, yAxisID: 'y' });
+                        datasets.push({ label: `Average (${cfg.r1} & ${cfg.r2})`, data: avgVals, borderColor: '#facc15', borderWidth: 2, tension: 0.2, yAxisID: 'y' });
+                        datasets.push({ label: `${cfg.r1} Trend`, data: computeLinearTrend(ceVals), borderColor: '#f87171', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, yAxisID: 'y' });
+                        datasets.push({ label: `${cfg.r2} Trend`, data: computeLinearTrend(peVals), borderColor: '#4ade80', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, yAxisID: 'y' });
                     }
-
                     historyChartObj.data.labels = times;
                     historyChartObj.data.datasets = datasets;
                     historyChartObj.update('none');
@@ -2187,21 +1866,19 @@ ANALYSIS_HTML_TEMPLATE = """
                     const meta = chart.getDatasetMeta(0);
                     if (meta && meta.data[index]) {
                         const x = meta.data[index].x;
-                        const topY = chart.scales.y.top;
-                        const bottomY = chart.scales.y.bottom;
+                        const { top, bottom } = chart.scales.y;
                         const ctx = chart.ctx;
                         ctx.save();
                         ctx.beginPath();
-                        ctx.moveTo(x, topY);
-                        ctx.lineTo(x, bottomY);
+                        ctx.moveTo(x, top);
+                        ctx.lineTo(x, bottom);
                         ctx.lineWidth = 3;
                         ctx.strokeStyle = '#facc15';
                         ctx.setLineDash([6, 4]);
                         ctx.stroke();
-
                         ctx.fillStyle = '#facc15';
                         ctx.font = 'bold 12px Segoe UI';
-                        ctx.fillText('★ ATM (' + currentAtmStrike + ')', x + 5, topY + 15);
+                        ctx.fillText('★ ATM (' + currentAtmStrike + ')', x + 5, top + 15);
                         ctx.restore();
                     }
                 }
@@ -2209,38 +1886,27 @@ ANALYSIS_HTML_TEMPLATE = """
         };
 
         function renderPageData(data) {
-            if (data.error) {
-                document.getElementById("errorContainer").style.display = "block";
-                document.getElementById("errorContainer").innerText = "Error: " + data.error;
-                return;
-            }
-            document.getElementById("errorContainer").style.display = "none";
+            const errEl = document.getElementById("errorContainer");
+            if (data.error) { errEl.style.display = "block"; errEl.innerText = "Error: " + data.error; return; }
+            errEl.style.display = "none";
 
             rawRows = data.rows || [];
             currentAtmStrike = data.atm_strike || 0;
-            
             document.getElementById("cardSpot").innerText = `${data.spot_price || 0} (ATM: ${currentAtmStrike})`;
             document.getElementById("cardUpdated").innerText = data.updated || "";
-            
+
             const pcrVal = data.pcr || 0;
             const pcrBox = document.getElementById("cardPcrBox");
-            if (pcrVal >= 1.0) {
-                pcrBox.style.borderLeftColor = "#22c55e";
-                document.getElementById("cardPcr").innerHTML = `${pcrVal} <span style="color:#22c55e; font-size:14px;">(Bullish)</span>`;
-            } else {
-                pcrBox.style.borderLeftColor = "#ef4444";
-                document.getElementById("cardPcr").innerHTML = `${pcrVal} <span style="color:#ef4444; font-size:14px;">(Bearish)</span>`;
-            }
+            pcrBox.style.borderLeftColor = pcrVal >= 1.0 ? "#22c55e" : "#ef4444";
+            document.getElementById("cardPcr").innerHTML = pcrVal >= 1.0 ? `${pcrVal} <span style="color:#22c55e; font-size:14px;">(Bullish)</span>` : `${pcrVal} <span style="color:#ef4444; font-size:14px;">(Bearish)</span>`;
 
-            let maxCE = -1, resStrike = 0;
-            let maxPE = -1, supStrike = 0;
+            let maxCE = -1, resStrike = 0, maxPE = -1, supStrike = 0;
             rawRows.forEach(r => {
                 if (r.ce_oi > maxCE) { maxCE = r.ce_oi; resStrike = r.strike; }
                 if (r.pe_oi > maxPE) { maxPE = r.pe_oi; supStrike = r.strike; }
             });
             document.getElementById("maxCallStrike").innerText = resStrike;
             document.getElementById("maxPutStrike").innerText = supStrike;
-
             updateChartMetric();
         }
 
@@ -2253,8 +1919,8 @@ ANALYSIS_HTML_TEMPLATE = """
                     datasets: [
                         { type: 'bar', label: 'Puts (PE)', data: [], backgroundColor: 'rgba(34, 197, 94, 0.85)', borderColor: '#22c55e', borderWidth: 1 },
                         { type: 'bar', label: 'Calls (CE)', data: [], backgroundColor: 'rgba(239, 68, 68, 0.85)', borderColor: '#ef4444', borderWidth: 1 },
-                        { type: 'line', label: 'PE Trend', data: [], borderColor: '#4ade80', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, fill: false },
-                        { type: 'line', label: 'CE Trend', data: [], borderColor: '#f87171', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, fill: false }
+                        { type: 'line', label: 'PE Trend', data: [], borderColor: '#4ade80', borderDash: [6, 4], borderWidth: 2, pointRadius: 0 },
+                        { type: 'line', label: 'CE Trend', data: [], borderColor: '#f87171', borderDash: [6, 4], borderWidth: 2, pointRadius: 0 }
                     ]
                 },
                 options: {
@@ -2265,10 +1931,7 @@ ANALYSIS_HTML_TEMPLATE = """
                         x: { ticks: { color: '#94a3b8', font: { weight: 'bold' } }, grid: { color: '#334155' } },
                         y: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } }
                     },
-                    plugins: {
-                        legend: { labels: { color: '#f8fafc', font: { size: 13 } } },
-                        tooltip: { mode: 'index', intersect: false }
-                    }
+                    plugins: { legend: { labels: { color: '#f8fafc', font: { size: 13 } } }, tooltip: { mode: 'index', intersect: false } }
                 },
                 plugins: [spotLinePlugin]
             });
@@ -2276,150 +1939,70 @@ ANALYSIS_HTML_TEMPLATE = """
 
         function updateChartMetric() {
             const selected = document.getElementById("metricSelector").value;
-            const titleEl = document.getElementById("chartHeaderTitle");
             const strikes = rawRows.map(r => r.strike);
+            const map = {
+                depth_qty: ["1 - Order Book Depth Quantity (Put Bid Qty vs Call Ask Qty)", "Put Bid Qty (Buy Vol)", "Call Ask Qty (Sell Vol)", r => r.pe_bid_qty, r => r.ce_ask_qty],
+                oi_chg: ["Change in Open Interest (Chg in OI)", "Put Chg in OI", "Call Chg in OI", r => r.pe_oi_chg, r => r.ce_oi_chg],
+                oi: ["Open Interest (PE vs CE)", "Put OI", "Call OI", r => r.pe_oi, r => r.ce_oi],
+                vol: ["Trading Volume", "Put Volume", "Call Volume", r => r.pe_vol, r => r.ce_vol],
+                delta: ["Option Delta Exposure", "Put Delta", "Call Delta", r => r.pe_delta, r => r.ce_delta],
+                theta: ["Theta Time Decay Rate", "Put Theta", "Call Theta", r => r.pe_theta, r => r.ce_theta]
+            };
+            const [metricTitle, peLabel, ceLabel, peFn, ceFn] = map[selected] || map.oi_chg;
+            const peData = rawRows.map(peFn), ceData = rawRows.map(ceFn);
 
-            let peData = [], ceData = [];
-            let peLabel = "", ceLabel = "";
-            let peColor = "", ceColor = "";
-            let metricTitle = "";
-
-            if (selected === "depth_qty") {
-                metricTitle = "1 - Order Book Depth Quantity (Put Bid Qty vs Call Ask Qty)";
-                peLabel = "Put Bid Qty (Buy Vol)"; ceLabel = "Call Ask Qty (Sell Vol)";
-                peColor = 'rgba(34, 197, 94, 0.85)'; ceColor = 'rgba(239, 68, 68, 0.85)';
-                peData = rawRows.map(r => r.pe_bid_qty);
-                ceData = rawRows.map(r => r.ce_ask_qty);
-            }
-            else if (selected === "oi_chg") {
-                metricTitle = "Change in Open Interest (Chg in OI)";
-                peLabel = "Put Chg in OI"; ceLabel = "Call Chg in OI";
-                peColor = 'rgba(34, 197, 94, 0.85)'; ceColor = 'rgba(239, 68, 68, 0.85)';
-                peData = rawRows.map(r => r.pe_oi_chg);
-                ceData = rawRows.map(r => r.ce_oi_chg);
-            }
-            else if (selected === "oi") {
-                metricTitle = "Open Interest (PE vs CE)";
-                peLabel = "Put OI"; ceLabel = "Call OI";
-                peColor = 'rgba(34, 197, 94, 0.85)'; ceColor = 'rgba(239, 68, 68, 0.85)';
-                peData = rawRows.map(r => r.pe_oi);
-                ceData = rawRows.map(r => r.ce_oi);
-            }
-            else if (selected === "vol") {
-                metricTitle = "Trading Volume";
-                peLabel = "Put Volume"; ceLabel = "Call Volume";
-                peColor = 'rgba(34, 197, 94, 0.85)'; ceColor = 'rgba(239, 68, 68, 0.85)';
-                peData = rawRows.map(r => r.pe_vol);
-                ceData = rawRows.map(r => r.ce_vol);
-            }
-            else if (selected === "delta") {
-                metricTitle = "Option Delta Exposure";
-                peLabel = "Put Delta"; ceLabel = "Call Delta";
-                peColor = 'rgba(34, 197, 94, 0.85)'; ceColor = 'rgba(239, 68, 68, 0.85)';
-                peData = rawRows.map(r => r.pe_delta);
-                ceData = rawRows.map(r => r.ce_delta);
-            }
-            else if (selected === "theta") {
-                metricTitle = "Theta Time Decay Rate";
-                peLabel = "Put Theta"; ceLabel = "Call Theta";
-                peColor = 'rgba(34, 197, 94, 0.85)'; ceColor = 'rgba(239, 68, 68, 0.85)';
-                peData = rawRows.map(r => r.pe_theta);
-                ceData = rawRows.map(r => r.ce_theta);
-            }
-
-            titleEl.innerText = metricTitle;
+            document.getElementById("chartHeaderTitle").innerText = metricTitle;
             myChart.data.labels = strikes;
-            myChart.data.datasets[0].label = peLabel;
-            myChart.data.datasets[0].data = peData;
-            myChart.data.datasets[0].backgroundColor = peColor;
-            myChart.data.datasets[0].borderColor = '#22c55e';
-            myChart.data.datasets[1].label = ceLabel;
-            myChart.data.datasets[1].data = ceData;
-            myChart.data.datasets[1].backgroundColor = ceColor;
-            myChart.data.datasets[1].borderColor = '#ef4444';
-            myChart.data.datasets[2].label = `${peLabel} Trend`;
-            myChart.data.datasets[2].data = computeLinearTrend(peData);
-            myChart.data.datasets[2].borderColor = '#4ade80';
-            myChart.data.datasets[3].label = `${ceLabel} Trend`;
-            myChart.data.datasets[3].data = computeLinearTrend(ceData);
-            myChart.data.datasets[3].borderColor = '#f87171';
+            myChart.data.datasets[0].label = peLabel; myChart.data.datasets[0].data = peData;
+            myChart.data.datasets[1].label = ceLabel; myChart.data.datasets[1].data = ceData;
+            myChart.data.datasets[2].label = `${peLabel} Trend`; myChart.data.datasets[2].data = computeLinearTrend(peData);
+            myChart.data.datasets[3].label = `${ceLabel} Trend`; myChart.data.datasets[3].data = computeLinearTrend(ceData);
             myChart.update('none');
 
             const count = rawRows.length || 1;
             const peSum = peData.reduce((a, b) => a + Math.abs(b), 0);
             const ceSum = ceData.reduce((a, b) => a + Math.abs(b), 0);
-            const peAvg = (peSum / count).toFixed(2);
-            const ceAvg = (ceSum / count).toFixed(2);
             const totalSum = peSum + ceSum;
             const pePct = totalSum > 0 ? ((peSum / totalSum) * 100).toFixed(1) : 50;
             const cePct = totalSum > 0 ? ((ceSum / totalSum) * 100).toFixed(1) : 50;
-            const ratio = ceSum > 0 ? (peSum / ceSum).toFixed(2) : "0.00";
 
             document.getElementById("gaugeMetricName").innerText = metricTitle.toUpperCase();
             document.getElementById("gaugePeLabel").innerText = `PUT (PE) TOTAL: ${peSum.toLocaleString()} (${pePct}%)`;
             document.getElementById("gaugeCeLabel").innerText = `CALL (CE) TOTAL: ${ceSum.toLocaleString()} (${cePct}%)`;
-            document.getElementById("gaugePeAvg").innerText = `Put Avg: ${Number(peAvg).toLocaleString()}`;
-            document.getElementById("gaugeCeAvg").innerText = `Call Avg: ${Number(ceAvg).toLocaleString()}`;
-            document.getElementById("gaugeRatioText").innerText = `Put/Call Ratio: ${ratio}`;
+            document.getElementById("gaugePeAvg").innerText = `Put Avg: ${(peSum / count).toFixed(2)}`;
+            document.getElementById("gaugeCeAvg").innerText = `Call Avg: ${(ceSum / count).toFixed(2)}`;
+            document.getElementById("gaugeRatioText").innerText = `Put/Call Ratio: ${ceSum > 0 ? (peSum / ceSum).toFixed(2) : "0.00"}`;
             document.getElementById("gaugePeBar").style.width = `${pePct}%`;
             document.getElementById("gaugeCeBar").style.width = `${cePct}%`;
         }
 
-        let timerSeconds = 10;
-        let isSyncing = false;
-
-        function startAutoSync() {
-            setInterval(() => {
-                if (isSyncing) return;
-                timerSeconds--;
-                if (timerSeconds <= 0) {
-                    timerSeconds = 10;
-                    fetchDataInBackground();
-                }
-                document.getElementById("countdown").innerText = timerSeconds;
-            }, 1000);
-        }
-
+        let timerSeconds = 10, isSyncing = false;
         function fetchDataInBackground() {
             isSyncing = true;
             document.getElementById("syncBadge").innerText = "Syncing...";
-
             fetch(`/api/data?symbol=${currentSymbol}&expiry=${currentExpiry}`)
-                .then(res => res.json())
-                .then(data => {
-                    renderPageData(data);
-                    loadHistoricalChart(false);
-                    loadSignalChart(false);
-                })
-                .catch(err => console.error("Auto Sync Error:", err))
-                .finally(() => {
-                    isSyncing = false;
-                    document.getElementById("syncBadge").innerHTML = 'Auto Sync: <span id="countdown">' + timerSeconds + '</span>s';
-                });
+                .then(r => r.json())
+                .then(data => { renderPageData(data); loadHistoricalChart(false); loadSignalChart(false); })
+                .catch(e => console.error(e))
+                .finally(() => { isSyncing = false; document.getElementById("syncBadge").innerHTML = 'Auto Sync: <span id="countdown">' + timerSeconds + '</span>s'; });
         }
 
-        try { initChart(); } catch(e) { console.error("Bar Chart Init Error:", e); }
-        try { initHistoryChart(); } catch(e) { console.error("History Chart Init Error:", e); }
-        try { initSignalChart(); } catch(e) { console.error("Signal Chart Init Error:", e); }
+        try { initChart(); } catch(e) {}
+        try { initHistoryChart(); } catch(e) {}
+        try { initSignalChart(); } catch(e) {}
+        renderPageData({ rows: rawRows, spot_price: {{ spot_price }}, atm_strike: {{ atm_strike }}, expiry: "{{ expiry }}", updated: "{{ updated }}", pcr: {{ pcr }} });
 
-        renderPageData({
-            rows: rawRows,
-            spot_price: {{ spot_price }},
-            atm_strike: {{ atm_strike }},
-            expiry: "{{ expiry }}",
-            updated: "{{ updated }}",
-            pcr: {{ pcr }}
-        });
-
-        startAutoSync();
+        setInterval(() => {
+            if (isSyncing) return;
+            if (--timerSeconds <= 0) { timerSeconds = 10; fetchDataInBackground(); }
+            document.getElementById("countdown").innerText = timerSeconds;
+        }, 1000);
     </script>
 </body>
-</html>
-"""
+</html>"""
 
 # --- LIVE TRADE & POSITION DASHBOARD TEMPLATE ---
-POSITIONS_HTML_TEMPLATE = """
-<!DOCTYPE html>
+POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
     <title>Upstox Private Live Trade & Positions Dashboard</title>
@@ -2428,159 +2011,43 @@ POSITIONS_HTML_TEMPLATE = """
         h2 { color: #38bdf8; margin-bottom: 5px; }
         .subtitle { color: #94a3b8; font-size: 13px; margin-bottom: 18px; display: flex; justify-content: space-between; align-items: center; }
         .timer-badge { background: #0284c7; color: #ffffff; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
-        
-        /* STATIC IP WHITELIST BAR (HIDDEN BY DEFAULT; SHOWN ONLY IF NEEDED) */
-        .static-ip-bar {
-            background: #131c31;
-            border: 1px solid #334155;
-            border-radius: 10px;
-            padding: 12px 18px;
-            margin-bottom: 14px;
-            display: none;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 12px;
-        }
+        .static-ip-bar { background: #131c31; border: 1px solid #334155; border-radius: 10px; padding: 12px 18px; margin-bottom: 14px; display: none; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
         .ip-chip { background: #0f172a; border: 1px solid #334155; padding: 4px 10px; border-radius: 6px; font-family: monospace; font-size: 13px; color: #38bdf8; }
         .ip-ok { color: #34d399; font-weight: bold; font-size: 12px; }
         .ip-warn { color: #fbbf24; font-weight: bold; font-size: 12px; }
-        .btn-register-ip {
-            background-color: #2563eb;
-            color: #ffffff;
-            border: none;
-            padding: 7px 14px;
-            border-radius: 6px;
-            font-weight: 700;
-            font-size: 12px;
-            cursor: pointer;
-        }
-        .btn-register-ip:hover { opacity: 0.9; }
-        .btn-register-ip:disabled { opacity: 0.5; cursor: not-allowed; }
-
-        /* TOP MANUAL/AUTO CONDITION BAR */
-        .condition-bar {
-            background: #1e293b;
-            border: 1px solid #334155;
-            border-radius: 10px;
-            padding: 14px 18px;
-            margin-bottom: 20px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 12px;
-        }
+        .btn-register-ip { background-color: #2563eb; color: #ffffff; border: none; padding: 7px 14px; border-radius: 6px; font-weight: 700; font-size: 12px; cursor: pointer; }
+        .condition-bar { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 14px 18px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
         .badge-mode-auto { background: #065f46; color: #34d399; padding: 5px 12px; border-radius: 6px; font-weight: bold; font-size: 13px; border: 1px solid #10b981; }
         .badge-mode-manual { background: #78350f; color: #fbbf24; padding: 5px 12px; border-radius: 6px; font-weight: bold; font-size: 13px; border: 1px solid #f59e0b; }
-        .badge-want-yes { background: #1e3a8a; color: #60a5fa; padding: 5px 10px; border-radius: 6px; font-weight: bold; font-size: 12px; }
-        .badge-want-no { background: #334155; color: #94a3b8; padding: 5px 10px; border-radius: 6px; font-weight: bold; font-size: 12px; }
-        .badge-active-ok { background: #064e3b; color: #6ee7b7; padding: 5px 10px; border-radius: 6px; font-weight: bold; font-size: 12px; border: 1px solid #10b981; }
-        .badge-active-full { background: #7f1d1d; color: #fca5a5; padding: 5px 10px; border-radius: 6px; font-weight: bold; font-size: 12px; border: 1px solid #ef4444; }
-
-        /* MANUAL ORDER APPROVAL PANEL */
-        .order-approval-box {
-            background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
-            border: 2px solid #f59e0b;
-            border-radius: 12px;
-            padding: 18px 22px;
-            margin-bottom: 24px;
-            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.4);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 20px;
-            flex-wrap: wrap;
-        }
-        .order-details-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
-            gap: 12px;
-            flex: 1;
-            min-width: 300px;
-        }
-        .order-field {
-            background: #0f172a;
-            padding: 8px 12px;
-            border-radius: 6px;
-            border: 1px solid #334155;
-        }
+        .badge-pill { background: #0f172a; color: #94a3b8; padding: 5px 10px; border-radius: 6px; font-weight: bold; font-size: 12px; border: 1px solid #334155; }
+        .badge-active-ok { background: #064e3b; color: #6ee7b7; border-color: #10b981; }
+        .badge-active-full { background: #7f1d1d; color: #fca5a5; border-color: #ef4444; }
+        .order-approval-box { background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); border: 2px solid #f59e0b; border-radius: 12px; padding: 18px 22px; margin-bottom: 24px; display: flex; justify-content: space-between; align-items: center; gap: 20px; flex-wrap: wrap; }
+        .order-details-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 12px; flex: 1; min-width: 300px; }
+        .order-field { background: #0f172a; padding: 8px 12px; border-radius: 6px; border: 1px solid #334155; }
         .order-field-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; font-weight: 600; }
         .order-field-val { font-size: 14px; font-weight: bold; color: #f8fafc; margin-top: 2px; }
-        
-        .order-actions-corner {
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-            min-width: 150px;
-            align-items: stretch;
-        }
-        .btn-place-order {
-            background-color: #22c55e;
-            color: #052e16;
-            border: none;
-            padding: 12px 20px;
-            border-radius: 8px;
-            font-weight: 800;
-            font-size: 14px;
-            cursor: pointer;
-            text-align: center;
-            transition: opacity 0.2s;
-        }
-        .btn-place-order:hover { opacity: 0.9; }
+        .order-actions-corner { display: flex; flex-direction: column; gap: 10px; min-width: 150px; }
+        .btn-place-order { background-color: #22c55e; color: #052e16; border: none; padding: 12px 20px; border-radius: 8px; font-weight: 800; font-size: 14px; cursor: pointer; }
         .btn-place-order:disabled { opacity: 0.45; cursor: not-allowed; background-color: #475569; color: #94a3b8; }
-        .btn-cancel-order {
-            background-color: #ef4444;
-            color: #ffffff;
-            border: none;
-            padding: 10px 20px;
-            border-radius: 8px;
-            font-weight: 700;
-            font-size: 13px;
-            cursor: pointer;
-            text-align: center;
-            transition: opacity 0.2s;
-        }
-        .btn-cancel-order:hover { opacity: 0.9; }
-        .btn-reset-preview {
-            background-color: #334155;
-            color: #e2e8f0;
-            border: 1px solid #475569;
-            padding: 5px 12px;
-            border-radius: 6px;
-            font-size: 12px;
-            font-weight: 600;
-            cursor: pointer;
-        }
-
-        .toast-banner {
-            padding: 12px 16px;
-            border-radius: 8px;
-            margin-bottom: 18px;
-            font-weight: 600;
-            font-size: 13px;
-            display: none;
-        }
+        .btn-cancel-order { background-color: #ef4444; color: #ffffff; border: none; padding: 10px 20px; border-radius: 8px; font-weight: 700; font-size: 13px; cursor: pointer; }
+        .btn-reset-preview { background-color: #334155; color: #e2e8f0; border: 1px solid #475569; padding: 5px 12px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; }
+        .toast-banner { padding: 12px 16px; border-radius: 8px; margin-bottom: 18px; font-weight: 600; font-size: 13px; display: none; }
         .toast-success { background: #064e3b; color: #6ee7b7; border: 1px solid #10b981; }
         .toast-error { background: #450a0a; color: #fca5a5; border: 1px solid #ef4444; }
         .toast-info { background: #1e3a8a; color: #93c5fd; border: 1px solid #3b82f6; }
-
         .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 18px; margin-bottom: 25px; }
-        .card { background: #1e293b; padding: 18px; border-radius: 10px; border-left: 5px solid #3b82f6; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
+        .card { background: #1e293b; padding: 18px; border-radius: 10px; border-left: 5px solid #3b82f6; }
         .card-title { font-size: 12px; color: #94a3b8; text-transform: uppercase; font-weight: bold; margin-bottom: 6px; }
         .card-value { font-size: 24px; font-weight: bold; }
-        
         .pnl-green { color: #22c55e !important; border-left-color: #22c55e !important; }
         .pnl-red { color: #ef4444 !important; border-left-color: #ef4444 !important; }
-        
         .section-title { font-size: 18px; font-weight: bold; color: #f8fafc; margin-top: 25px; margin-bottom: 12px; border-left: 4px solid #38bdf8; padding-left: 10px; }
-        
-        .table-container { overflow-x: auto; background: #1e293b; border-radius: 10px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); margin-bottom: 25px; }
+        .table-container { overflow-x: auto; background: #1e293b; border-radius: 10px; margin-bottom: 25px; }
         table { width: 100%; border-collapse: collapse; min-width: 1050px; }
         th, td { border: 1px solid #334155; padding: 10px 14px; text-align: center; font-size: 13px; }
         th { background-color: #0f172a; color: #38bdf8; text-transform: uppercase; font-size: 12px; }
         tr:nth-child(even){ background-color: #172554; }
-        
         .status-open { background-color: #065f46; color: #34d399; padding: 3px 8px; border-radius: 12px; font-weight: bold; font-size: 11px; }
         .status-closed { background-color: #334155; color: #94a3b8; padding: 3px 8px; border-radius: 12px; font-weight: bold; font-size: 11px; }
         .error-msg { color: #f87171; font-weight: bold; padding: 15px; background: #450a0a; border-radius: 8px; margin-bottom: 20px; }
@@ -2589,34 +2056,29 @@ POSITIONS_HTML_TEMPLATE = """
 <body>
     <h2>🔐 Private Live Trade & Positions Dashboard</h2>
     <div class="subtitle">
-        <span>Real-time Upstox Portfolio, Automated Google Sheet Order Engine & Dynamic Trailing SL/Target</span>
+        <span>Real-time Upstox Portfolio, Automated Google Sheet Order Engine, Exit Triggers (B29 / 3:20 PM B7) & Dynamic SL/Target</span>
         <span class="timer-badge" id="syncBadge">Auto Sync: <span id="countdown">10</span>s</span>
     </div>
 
-    <!-- UPSTOX STATIC IP STATUS & WHITELIST BAR (HIDDEN UNLESS ?show_ip=1 OR 403 ERROR) -->
     <div id="staticIpBar" class="static-ip-bar">
         <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
             <span style="font-weight: bold; color: #e2e8f0; font-size: 13px;">🌐 Upstox Static IP Check:</span>
-            <span style="font-size: 12px; color: #94a3b8;">Server Outbound IP:</span>
-            <span id="txtOutboundIp" class="ip-chip">Checking...</span>
-            <span style="font-size: 12px; color: #94a3b8;">Upstox Registered IP:</span>
-            <span id="txtRegisteredIp" class="ip-chip">Checking...</span>
+            <span style="font-size: 12px; color: #94a3b8;">Server Outbound IP:</span><span id="txtOutboundIp" class="ip-chip">Checking...</span>
+            <span style="font-size: 12px; color: #94a3b8;">Registered IP:</span><span id="txtRegisteredIp" class="ip-chip">Checking...</span>
             <span id="txtIpMatchStatus" class="ip-warn">Verifying...</span>
         </div>
-        <div style="display: flex; align-items: center; gap: 8px;">
-            <button id="btnRegisterServerIp" class="btn-register-ip" onclick="registerCurrentServerIp()">⚡ Register Server IP with Upstox</button>
-        </div>
+        <button id="btnRegisterServerIp" class="btn-register-ip" onclick="registerCurrentServerIp()">⚡ Register Server IP with Upstox</button>
     </div>
 
-    <!-- TOP MANUAL ORDER CONDITION BAR (B16) -->
     <div class="condition-bar">
-        <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
-            <span style="font-weight: bold; color: #e2e8f0; font-size: 14px;">Manual Order Condition (B16):</span>
+        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+            <span style="font-weight: bold; color: #e2e8f0; font-size: 14px;">Mode (B16):</span>
             <span id="badgeManualCondition" class="badge-mode-manual">LOADING...</span>
-            <span id="badgeWantToTrade" class="badge-want-no">Want to Trade (B17): -</span>
-            <span id="badgeActiveTrades" class="badge-active-ok">Active Trades (B28): -</span>
-            <span id="badgeMaxInvest" style="color: #94a3b8; font-size: 13px; font-weight: 600;">Max Invest (B18): -</span>
-            <span id="badgeSheetSyncTime" style="color: #64748b; font-size: 12px;">Last Sheet Sync: -</span>
+            <span id="badgeWantToTrade" class="badge-pill">Want to Trade (B17): -</span>
+            <span id="badgeActiveTrades" class="badge-pill badge-active-ok">Active Trades (B28): -</span>
+            <span id="badgeExitCond" class="badge-pill">Exit Cond (B29): -</span>
+            <span id="badgeAutoExit320" class="badge-pill">3:20 PM Exit (B7): -</span>
+            <span id="badgeSheetSyncTime" style="color: #64748b; font-size: 12px;">Sync: -</span>
         </div>
         <div style="display: flex; align-items: center; gap: 10px;">
             <span id="engineStatusText" style="font-size: 13px; color: #38bdf8; font-weight: 600;">Checking DASHBOARD sheet...</span>
@@ -2624,57 +2086,26 @@ POSITIONS_HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- EXECUTION RESULT / NOTIFICATION BANNER -->
     <div id="orderToastBanner" class="toast-banner"></div>
 
-    <!-- MANUAL ORDER APPROVAL PANEL (SHOWN WHEN B16 = MANUAL AND B17 = YES) -->
     <div id="manualOrderPanel" class="order-approval-box" style="display: none;">
         <div style="flex: 1;">
             <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap;">
-                <span style="font-size: 16px; font-weight: 800; color: #fbbf24;">📋 Pending Manual Order Approval (DASHBOARD B16:B28)</span>
-                <span id="manualGuardWarningBadge" style="display: none; background: #7f1d1d; color: #fca5a5; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: bold;">⚠️ Blocked by Active/Duplicate Trade Guard</span>
+                <span style="font-size: 16px; font-weight: 800; color: #fbbf24;">📋 Pending Manual Order Approval (DASHBOARD B16:B29)</span>
+                <span id="manualGuardWarningBadge" style="display: none; background: #7f1d1d; color: #fca5a5; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: bold;">⚠️ Blocked</span>
             </div>
             <div class="order-details-grid">
-                <div class="order-field">
-                    <div class="order-field-label">Symbol & Type</div>
-                    <div class="order-field-val" id="moSymbolType">-</div>
-                </div>
-                <div class="order-field">
-                    <div class="order-field-label">Expiry (Month → Date)</div>
-                    <div class="order-field-val" id="moExpiry">-</div>
-                </div>
-                <div class="order-field">
-                    <div class="order-field-label">Strike Price</div>
-                    <div class="order-field-val" id="moStrike">-</div>
-                </div>
-                <div class="order-field">
-                    <div class="order-field-label">Action & Qty</div>
-                    <div class="order-field-val" id="moActionQty">-</div>
-                </div>
-                <div class="order-field">
-                    <div class="order-field-label">Product Mode</div>
-                    <div class="order-field-val" id="moProduct">-</div>
-                </div>
-                <div class="order-field">
-                    <div class="order-field-label">Live Limit Price (LTP)</div>
-                    <div class="order-field-val" style="color: #38bdf8;" id="moEntryPrice">-</div>
-                </div>
-                <div class="order-field">
-                    <div class="order-field-label">Total Investment</div>
-                    <div class="order-field-val" style="color: #facc15;" id="moTotalInvest">-</div>
-                </div>
-                <div class="order-field">
-                    <div class="order-field-label">Initial Dynamic SL (B26)</div>
-                    <div class="order-field-val" style="color: #f87171;" id="moStopLoss">-</div>
-                </div>
-                <div class="order-field">
-                    <div class="order-field-label">Initial Dynamic Target (B27)</div>
-                    <div class="order-field-val" style="color: #4ade80;" id="moTarget">-</div>
-                </div>
+                <div class="order-field"><div class="order-field-label">Symbol & Type</div><div class="order-field-val" id="moSymbolType">-</div></div>
+                <div class="order-field"><div class="order-field-label">Expiry (Month → Date)</div><div class="order-field-val" id="moExpiry">-</div></div>
+                <div class="order-field"><div class="order-field-label">Strike Price</div><div class="order-field-val" id="moStrike">-</div></div>
+                <div class="order-field"><div class="order-field-label">Action & Qty</div><div class="order-field-val" id="moActionQty">-</div></div>
+                <div class="order-field"><div class="order-field-label">Product Mode</div><div class="order-field-val" id="moProduct">-</div></div>
+                <div class="order-field"><div class="order-field-label">Live Limit Price (LTP)</div><div class="order-field-val" style="color: #38bdf8;" id="moEntryPrice">-</div></div>
+                <div class="order-field"><div class="order-field-label">Total Investment</div><div class="order-field-val" style="color: #facc15;" id="moTotalInvest">-</div></div>
+                <div class="order-field"><div class="order-field-label">Initial Dynamic SL (B26)</div><div class="order-field-val" style="color: #f87171;" id="moStopLoss">-</div></div>
+                <div class="order-field"><div class="order-field-label">Initial Dynamic Target (B27)</div><div class="order-field-val" style="color: #4ade80;" id="moTarget">-</div></div>
             </div>
         </div>
-
-        <!-- FAR RIGHT CORNER ACTION BUTTONS -->
         <div class="order-actions-corner">
             <button id="btnPlaceOrder" class="btn-place-order" onclick="executeManualOrder()">✅ Place Order</button>
             <button id="btnCancelOrder" class="btn-cancel-order" onclick="cancelManualOrder()">❌ Cancel</button>
@@ -2684,41 +2115,18 @@ POSITIONS_HTML_TEMPLATE = """
     <div id="errorContainer" class="error-msg" style="display: none;"></div>
 
     <div class="metrics-grid">
-        <div class="card" id="cardTotalPnlBox">
-            <div class="card-title">Total Overall P&L</div>
-            <div class="card-value" id="valTotalPnl">₹ 0.00</div>
-        </div>
-        <div class="card" id="cardUnrealisedPnlBox">
-            <div class="card-title">Unrealised P&L (Live Positions)</div>
-            <div class="card-value" id="valUnrealisedPnl">₹ 0.00</div>
-        </div>
-        <div class="card" id="cardRealisedPnlBox">
-            <div class="card-title">Realised P&L (Booked Today)</div>
-            <div class="card-value" id="valRealisedPnl">₹ 0.00</div>
-        </div>
+        <div class="card" id="cardTotalPnlBox"><div class="card-title">Total Overall P&L</div><div class="card-value" id="valTotalPnl">₹ 0.00</div></div>
+        <div class="card" id="cardUnrealisedPnlBox"><div class="card-title">Unrealised P&L (Live Positions)</div><div class="card-value" id="valUnrealisedPnl">₹ 0.00</div></div>
+        <div class="card" id="cardRealisedPnlBox"><div class="card-title">Realised P&L (Booked Today)</div><div class="card-value" id="valRealisedPnl">₹ 0.00</div></div>
     </div>
 
     <div class="section-title">📊 Live & Closed Positions (Dynamic Trailing SL & Target Active)</div>
     <div class="table-container">
         <table>
             <thead>
-                <tr>
-                    <th>Status</th>
-                    <th>Script / Trading Symbol</th>
-                    <th>Product</th>
-                    <th>Qty</th>
-                    <th>Avg Buy Price</th>
-                    <th>Avg Sell Price</th>
-                    <th>LTP</th>
-                    <th>Peak LTP</th>
-                    <th>Dynamic SL</th>
-                    <th>Dynamic Target</th>
-                    <th>P&L (₹)</th>
-                </tr>
+                <tr><th>Status</th><th>Script / Trading Symbol</th><th>Product</th><th>Qty</th><th>Avg Buy Price</th><th>Avg Sell Price</th><th>LTP</th><th>Peak LTP</th><th>Dynamic SL</th><th>Dynamic Target</th><th>P&L (₹)</th></tr>
             </thead>
-            <tbody id="positionsBody">
-                <tr><td colspan="11" style="color: #94a3b8;">Loading positions...</td></tr>
-            </tbody>
+            <tbody id="positionsBody"><tr><td colspan="11" style="color: #94a3b8;">Loading positions...</td></tr></tbody>
         </table>
     </div>
 
@@ -2726,27 +2134,14 @@ POSITIONS_HTML_TEMPLATE = """
     <div class="table-container">
         <table>
             <thead>
-                <tr>
-                    <th>Order Time</th>
-                    <th>Trading Symbol</th>
-                    <th>Type</th>
-                    <th>Qty</th>
-                    <th>Executed Price</th>
-                    <th>Status</th>
-                    <th>Order ID</th>
-                </tr>
+                <tr><th>Order Time</th><th>Trading Symbol</th><th>Type</th><th>Qty</th><th>Executed Price</th><th>Status</th><th>Order ID</th></tr>
             </thead>
-            <tbody id="ordersBody">
-                <tr><td colspan="7" style="color: #94a3b8;">Loading order log...</td></tr>
-            </tbody>
+            <tbody id="ordersBody"><tr><td colspan="7" style="color: #94a3b8;">Loading order log...</td></tr></tbody>
         </table>
     </div>
 
     <script>
-        let timerSeconds = 10;
-        let isSyncing = false;
-        let latestEvaluatedOrder = null;
-        let detectedOutboundIp = "";
+        let timerSeconds = 10, isSyncing = false, latestEvaluatedOrder = null, detectedOutboundIp = "";
 
         function revealStaticIpBarIfNeeded(forceShow = false) {
             const params = new URLSearchParams(window.location.search);
@@ -2765,162 +2160,90 @@ POSITIONS_HTML_TEMPLATE = """
 
         function checkStaticIpStatus() {
             fetch('/api/static_ip?_t=' + Date.now(), { cache: 'no-store' })
-                .then(res => res.json())
+                .then(r => r.json())
                 .then(data => {
                     detectedOutboundIp = data.outbound_ip || "";
                     document.getElementById("txtOutboundIp").innerText = detectedOutboundIp || "Unknown";
-                    const regText = data.primary_ip ? (data.secondary_ip ? `${data.primary_ip} / ${data.secondary_ip}` : data.primary_ip) : "Not Configured";
-                    document.getElementById("txtRegisteredIp").innerText = regText;
-
-                    const statusEl = document.getElementById("txtIpMatchStatus");
-                    if (data.is_matched) {
-                        statusEl.className = "ip-ok";
-                        statusEl.innerText = "✅ Static IP Matched (Orders Enabled)";
-                    } else if (data.error) {
-                        statusEl.className = "ip-warn";
-                        statusEl.innerText = "⚠️ " + data.error;
-                    } else {
-                        statusEl.className = "ip-warn";
-                        statusEl.innerText = "⚠️ IP Mismatch — Click Register Server IP (1 change/week limit)";
-                    }
-                })
-                .catch(err => console.error("Static IP check error:", err));
+                    document.getElementById("txtRegisteredIp").innerText = data.primary_ip ? (data.secondary_ip ? `${data.primary_ip} / ${data.secondary_ip}` : data.primary_ip) : "Not Configured";
+                    const st = document.getElementById("txtIpMatchStatus");
+                    if (data.is_matched) { st.className = "ip-ok"; st.innerText = "✅ Static IP Matched"; }
+                    else { st.className = "ip-warn"; st.innerText = data.error ? ("⚠️ " + data.error) : "⚠️ IP Mismatch"; }
+                });
         }
 
         function registerCurrentServerIp() {
-            if (!detectedOutboundIp) {
-                showToast("❌ Server outbound IP could not be detected yet.", "error");
-                return;
-            }
-            if (!confirm(`Register '${detectedOutboundIp}' as your Upstox Primary Static IP?\\n\\nNote: Upstox allows changing Static IP only once per calendar week.`)) {
-                return;
-            }
+            if (!detectedOutboundIp || !confirm(`Register '${detectedOutboundIp}' as Upstox Primary Static IP?`)) return;
             const btn = document.getElementById("btnRegisterServerIp");
-            btn.disabled = true;
-            btn.innerText = "Registering IP...";
-
-            fetch('/api/static_ip', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ primary_ip: detectedOutboundIp })
-            })
-            .then(res => res.json())
-            .then(data => {
-                if (data.success) {
-                    showToast("✅ " + data.message, "success");
-                } else {
-                    showToast("❌ " + data.message, "error");
-                }
-                checkStaticIpStatus();
-                fetchPositionsInBackground();
-            })
-            .catch(err => showToast("❌ Request failed: " + err, "error"))
-            .finally(() => {
-                btn.disabled = false;
-                btn.innerText = "⚡ Register Server IP with Upstox";
-            });
+            btn.disabled = true; btn.innerText = "Registering...";
+            fetch('/api/static_ip', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ primary_ip: detectedOutboundIp }) })
+                .then(r => r.json())
+                .then(d => { showToast((d.success ? "✅ " : "❌ ") + d.message, d.success ? "success" : "error"); checkStaticIpStatus(); fetchPositionsInBackground(); })
+                .finally(() => { btn.disabled = false; btn.innerText = "⚡ Register Server IP with Upstox"; });
         }
 
-        function updateCardPnl(elementId, cardId, value) {
-            const el = document.getElementById(elementId);
-            const card = document.getElementById(cardId);
-            const num = parseFloat(value) || 0;
-            const formatted = num.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-            
-            el.innerText = `₹ ${formatted}`;
-            if (num >= 0) {
-                card.className = "card pnl-green";
-            } else {
-                card.className = "card pnl-red";
-            }
+        function updateCardPnl(elId, cardId, val) {
+            const num = parseFloat(val) || 0;
+            document.getElementById(elId).innerText = `₹ ${num.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+            document.getElementById(cardId).className = num >= 0 ? "card pnl-green" : "card pnl-red";
         }
 
-        function renderOrderEngineState(orderState) {
-            if (!orderState) return;
-
+        function renderOrderEngineState(st) {
+            if (!st) return;
+            const mode = st.manual_order || "Manual";
             const modeBadge = document.getElementById("badgeManualCondition");
-            const wantBadge = document.getElementById("badgeWantToTrade");
-            const activeBadge = document.getElementById("badgeActiveTrades");
-            const investBadge = document.getElementById("badgeMaxInvest");
-            const syncTimeBadge = document.getElementById("badgeSheetSyncTime");
-            const statusText = document.getElementById("engineStatusText");
-            const manualPanel = document.getElementById("manualOrderPanel");
-            const resetBtn = document.getElementById("btnResetPreview");
-
-            const mode = orderState.manual_order || "Manual";
             modeBadge.innerText = mode.toUpperCase();
-            modeBadge.className = (mode.toLowerCase() === "auto") ? "badge-mode-auto" : "badge-mode-manual";
+            modeBadge.className = mode.toLowerCase() === "auto" ? "badge-mode-auto" : "badge-mode-manual";
 
-            const want = orderState.want_to_trade || "NO";
-            wantBadge.innerText = `Want to Trade (B17): ${want}`;
-            wantBadge.className = (want === "YES") ? "badge-want-yes" : "badge-want-no";
+            document.getElementById("badgeWantToTrade").innerText = `Want to Trade (B17): ${st.want_to_trade || "NO"}`;
+            const curAct = st.active_trade_count ?? 0, maxAct = st.max_active_trades ?? 1;
+            const actBadge = document.getElementById("badgeActiveTrades");
+            actBadge.innerText = `Active Trades (B28): ${curAct} / ${maxAct}`;
+            actBadge.className = "badge-pill " + (curAct >= maxAct ? "badge-active-full" : "badge-active-ok");
 
-            const curAct = orderState.active_trade_count ?? 0;
-            const maxAct = orderState.max_active_trades ?? 1;
-            activeBadge.innerText = `Active Trades (B28): ${curAct} / ${maxAct}`;
-            activeBadge.className = (curAct >= maxAct) ? "badge-active-full" : "badge-active-ok";
+            const exitCond = st.exit_condition || "NONE";
+            const exitBadge = document.getElementById("badgeExitCond");
+            exitBadge.innerText = `Exit Cond (B29): ${exitCond}`;
+            exitBadge.className = "badge-pill " + ((exitCond === "BE" || exitCond === "SE") ? "badge-active-full" : "");
 
-            const maxInv = orderState.amount_to_invest || 0;
-            investBadge.innerText = `Max Invest (B18): ₹${Number(maxInv).toLocaleString('en-IN')}`;
-            if (orderState.sheet_synced_at) {
-                syncTimeBadge.innerText = `Last Sheet Sync: ${orderState.sheet_synced_at}`;
-            }
-            statusText.innerText = orderState.status_message || "";
+            const auto320 = st.auto_exit_320 || "NO";
+            const b7Badge = document.getElementById("badgeAutoExit320");
+            b7Badge.innerText = `3:20 PM Exit (B7): ${auto320}`;
+            b7Badge.className = "badge-pill " + (auto320 === "YES" ? "badge-active-ok" : "");
 
-            if (orderState.show_static_ip_bar) {
-                revealStaticIpBarIfNeeded(true);
-            }
+            if (st.sheet_synced_at) document.getElementById("badgeSheetSyncTime").innerText = `Sync: ${st.sheet_synced_at}`;
+            document.getElementById("engineStatusText").innerText = st.status_message || "";
 
-            if (orderState.auto_execution_notice) {
-                showToast(orderState.auto_execution_notice, orderState.auto_execution_ok ? "success" : "error");
-            } else if (orderState.tsl_updates && orderState.tsl_updates.length > 0) {
-                showToast("📈 " + orderState.tsl_updates.join(" | "), "success");
-            }
+            if (st.show_static_ip_bar) revealStaticIpBarIfNeeded(true);
+            if (st.exit_execution_notice) showToast(st.exit_execution_notice, st.exit_execution_ok ? "success" : "error");
+            else if (st.auto_execution_notice) showToast(st.auto_execution_notice, st.auto_execution_ok ? "success" : "error");
+            else if (st.tsl_updates && st.tsl_updates.length > 0) showToast("📈 " + st.tsl_updates.join(" | "), "success");
 
-            if (orderState.is_cancelled) {
-                resetBtn.style.display = "inline-block";
-            } else {
-                resetBtn.style.display = "none";
-            }
+            document.getElementById("btnResetPreview").style.display = st.is_cancelled ? "inline-block" : "none";
 
-            if (orderState.show_manual_panel && orderState.evaluated_order) {
-                const ev = orderState.evaluated_order;
+            const manualPanel = document.getElementById("manualOrderPanel");
+            if (st.show_manual_panel && st.evaluated_order) {
+                const ev = st.evaluated_order;
                 latestEvaluatedOrder = ev;
                 manualPanel.style.display = "flex";
-
                 document.getElementById("moSymbolType").innerText = `${ev.symbol} (${ev.option_type})`;
                 document.getElementById("moExpiry").innerText = `${ev.expiry_month} → ${ev.expiry_date}`;
-                
-                if (ev.strike_adjusted) {
-                    document.getElementById("moStrike").innerHTML = `${ev.selected_strike} <span style="color:#fbbf24; font-size:11px;">(Req: ${ev.requested_strike})</span>`;
-                } else {
-                    document.getElementById("moStrike").innerText = `${ev.selected_strike}`;
-                }
-
+                document.getElementById("moStrike").innerHTML = ev.strike_adjusted ? `${ev.selected_strike} <span style="color:#fbbf24; font-size:11px;">(Req: ${ev.requested_strike})</span>` : `${ev.selected_strike}`;
                 document.getElementById("moActionQty").innerText = `${ev.transaction_type} | Qty: ${ev.quantity}`;
                 document.getElementById("moProduct").innerText = ev.product_label;
                 document.getElementById("moEntryPrice").innerText = `₹ ${ev.entry_price}`;
                 document.getElementById("moTotalInvest").innerText = `₹ ${Number(ev.total_investment).toLocaleString('en-IN')}`;
-                
-                document.getElementById("moStopLoss").innerText = (ev.sl_price !== null && ev.sl_price !== undefined)
-                    ? `₹ ${ev.sl_price} (${ev.sl_percent}% Dynamic)`
-                    : "Blank (Self-Monitor)";
-                
-                document.getElementById("moTarget").innerText = (ev.target_price !== null && ev.target_price !== undefined)
-                    ? `₹ ${ev.target_price} (${ev.target_percent}% Dynamic)`
-                    : "Blank (Self-Monitor)";
+                document.getElementById("moStopLoss").innerText = ev.sl_price != null ? `₹ ${ev.sl_price} (${ev.sl_percent}% Dynamic)` : "Blank";
+                document.getElementById("moTarget").innerText = ev.target_price != null ? `₹ ${ev.target_price} (${ev.target_percent}% Dynamic)` : "Blank";
 
                 const warnBadge = document.getElementById("manualGuardWarningBadge");
                 const placeBtn = document.getElementById("btnPlaceOrder");
-                if (orderState.guard_blocked) {
+                if (st.guard_blocked) {
                     warnBadge.style.display = "inline-block";
-                    warnBadge.innerText = "⚠️ " + (orderState.guard_reason || "Blocked by Active/Duplicate Trade Guard");
-                    placeBtn.disabled = true;
-                    placeBtn.innerText = "🚫 Order Blocked";
+                    warnBadge.innerText = "⚠️ " + (st.guard_reason || "Blocked");
+                    placeBtn.disabled = true; placeBtn.innerText = "🚫 Order Blocked";
                 } else {
                     warnBadge.style.display = "none";
-                    placeBtn.disabled = false;
-                    placeBtn.innerText = "✅ Place Order";
+                    placeBtn.disabled = false; placeBtn.innerText = "✅ Place Order";
                 }
             } else {
                 manualPanel.style.display = "none";
@@ -2929,162 +2252,73 @@ POSITIONS_HTML_TEMPLATE = """
 
         function executeManualOrder() {
             const btn = document.getElementById("btnPlaceOrder");
-            btn.disabled = true;
-            btn.innerText = "Placing Order...";
-
-            fetch('/api/manual_order_action', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ action: 'PLACE', evaluated_order: latestEvaluatedOrder })
-            })
-            .then(res => res.json())
-            .then(data => {
-                if (data.show_static_ip_bar) {
-                    revealStaticIpBarIfNeeded(true);
-                }
-                if (data.success) {
-                    showToast("✅ " + data.message, "success");
-                } else {
-                    showToast("❌ " + data.message, "error");
-                }
-                fetchPositionsInBackground();
-            })
-            .catch(err => {
-                showToast("❌ Order Request Failed: " + err, "error");
-            })
-            .finally(() => {
-                btn.disabled = false;
-                btn.innerText = "✅ Place Order";
-            });
+            btn.disabled = true; btn.innerText = "Placing Order...";
+            fetch('/api/manual_order_action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'PLACE', evaluated_order: latestEvaluatedOrder }) })
+                .then(r => r.json())
+                .then(d => { if (d.show_static_ip_bar) revealStaticIpBarIfNeeded(true); showToast((d.success ? "✅ " : "❌ ") + d.message, d.success ? "success" : "error"); fetchPositionsInBackground(); })
+                .finally(() => { btn.disabled = false; btn.innerText = "✅ Place Order"; });
         }
 
         function cancelManualOrder() {
-            fetch('/api/manual_order_action', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ action: 'CANCEL', signature: latestEvaluatedOrder ? latestEvaluatedOrder.signature : "" })
-            })
-            .then(res => res.json())
-            .then(data => {
-                showToast("🚫 " + data.message, "info");
-                document.getElementById("manualOrderPanel").style.display = "none";
-                fetchPositionsInBackground();
-            })
-            .catch(err => console.error("Cancel error:", err));
+            fetch('/api/manual_order_action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'CANCEL', signature: latestEvaluatedOrder ? latestEvaluatedOrder.signature : "" }) })
+                .then(r => r.json())
+                .then(d => { showToast("🚫 " + d.message, "info"); document.getElementById("manualOrderPanel").style.display = "none"; fetchPositionsInBackground(); });
         }
 
         function resetCancelledPreview() {
-            fetch('/api/manual_order_action', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ action: 'RESET' })
-            })
-            .then(res => res.json())
-            .then(() => {
-                fetchPositionsInBackground();
-            });
+            fetch('/api/manual_order_action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'RESET' }) }).then(() => fetchPositionsInBackground());
         }
 
         function fetchPositionsInBackground() {
             isSyncing = true;
             document.getElementById("syncBadge").innerText = "Syncing...";
-
             fetch('/api/positions?_t=' + Date.now(), { cache: 'no-store' })
-                .then(res => res.json())
+                .then(r => r.json())
                 .then(data => {
                     const errEl = document.getElementById("errorContainer");
-                    if (data.error) {
-                        errEl.style.display = "block";
-                        errEl.innerText = "Error Fetching Positions: " + data.error;
-                    } else {
-                        errEl.style.display = "none";
-                    }
+                    if (data.error) { errEl.style.display = "block"; errEl.innerText = "Error Fetching Positions: " + data.error; }
+                    else { errEl.style.display = "none"; }
 
-                    if (data.order_engine) {
-                        renderOrderEngineState(data.order_engine);
-                    }
-
+                    if (data.order_engine) renderOrderEngineState(data.order_engine);
                     updateCardPnl("valTotalPnl", "cardTotalPnlBox", data.total_pnl);
                     updateCardPnl("valUnrealisedPnl", "cardUnrealisedPnlBox", data.unrealised_pnl);
                     updateCardPnl("valRealisedPnl", "cardRealisedPnlBox", data.realised_pnl);
 
                     const posBody = document.getElementById("positionsBody");
                     if (data.positions && data.positions.length > 0) {
-                        let html = "";
-                        data.positions.forEach(p => {
+                        posBody.innerHTML = data.positions.map(p => {
                             const pnlNum = parseFloat(p.pnl) || 0;
-                            const pnlColor = pnlNum >= 0 ? '#22c55e' : '#ef4444';
                             const badge = p.status === 'OPEN' ? '<span class="status-open">OPEN</span>' : '<span class="status-closed">CLOSED</span>';
-                            const formattedPnl = pnlNum.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-                            const peakText = (p.best_price !== null && p.best_price !== undefined) ? `₹ ${p.best_price}` : '-';
-                            const dynSlText = (p.dynamic_sl !== null && p.dynamic_sl !== undefined) ? `<span style="color:#f87171; font-weight:bold;">₹ ${p.dynamic_sl}</span>` : '-';
-                            const dynTgtText = (p.dynamic_target !== null && p.dynamic_target !== undefined) ? `<span style="color:#4ade80; font-weight:bold;">₹ ${p.dynamic_target}</span>` : '-';
-
-                            html += `<tr>
-                                <td>${badge}</td>
-                                <td><strong>${p.trading_symbol}</strong></td>
-                                <td>${p.product}</td>
-                                <td><strong>${p.quantity}</strong></td>
-                                <td>₹ ${p.buy_price}</td>
-                                <td>₹ ${p.sell_price}</td>
-                                <td>₹ ${p.ltp}</td>
-                                <td style="color:#facc15;">${peakText}</td>
-                                <td>${dynSlText}</td>
-                                <td>${dynTgtText}</td>
-                                <td style="font-weight: bold; color: ${pnlColor};">₹ ${formattedPnl}</td>
-                            </tr>`;
-                        });
-                        posBody.innerHTML = html;
+                            const peak = p.best_price != null ? `₹ ${p.best_price}` : '-';
+                            const dSl = p.dynamic_sl != null ? `<span style="color:#f87171; font-weight:bold;">₹ ${p.dynamic_sl}</span>` : '-';
+                            const dTgt = p.dynamic_target != null ? `<span style="color:#4ade80; font-weight:bold;">₹ ${p.dynamic_target}</span>` : '-';
+                            return `<tr><td>${badge}</td><td><strong>${p.trading_symbol}</strong></td><td>${p.product}</td><td><strong>${p.quantity}</strong></td><td>₹ ${p.buy_price}</td><td>₹ ${p.sell_price}</td><td>₹ ${p.ltp}</td><td style="color:#facc15;">${peak}</td><td>${dSl}</td><td>${dTgt}</td><td style="font-weight:bold; color:${pnlNum >= 0 ? '#22c55e' : '#ef4444'};">₹ ${pnlNum.toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2})}</td></tr>`;
+                        }).join("");
                     } else {
                         posBody.innerHTML = `<tr><td colspan="11" style="color: #94a3b8;">No open or closed positions found for today.</td></tr>`;
                     }
 
                     const ordBody = document.getElementById("ordersBody");
                     if (data.orders && data.orders.length > 0) {
-                        let html = "";
-                        data.orders.forEach(o => {
-                            const typeColor = o.transaction_type === 'BUY' ? '#38bdf8' : '#f43f5e';
-                            html += `<tr>
-                                <td style="font-size: 12px; color: #94a3b8;">${o.order_timestamp}</td>
-                                <td><strong>${o.trading_symbol}</strong></td>
-                                <td style="font-weight: bold; color: ${typeColor};">${o.transaction_type}</td>
-                                <td>${o.quantity}</td>
-                                <td>₹ ${o.average_price || o.price}</td>
-                                <td><strong>${o.status}</strong></td>
-                                <td style="font-size: 11px; color: #64748b;">${o.order_id}</td>
-                            </tr>`;
-                        });
-                        ordBody.innerHTML = html;
+                        ordBody.innerHTML = data.orders.map(o => `<tr><td style="font-size:12px; color:#94a3b8;">${o.order_timestamp}</td><td><strong>${o.trading_symbol}</strong></td><td style="font-weight:bold; color:${o.transaction_type === 'BUY' ? '#38bdf8' : '#f43f5e'};">${o.transaction_type}</td><td>${o.quantity}</td><td>₹ ${o.average_price || o.price}</td><td><strong>${o.status}</strong></td><td style="font-size:11px; color:#64748b;">${o.order_id}</td></tr>`).join("");
                     } else {
                         ordBody.innerHTML = `<tr><td colspan="7" style="color: #94a3b8;">No trades executed today.</td></tr>`;
                     }
                 })
-                .catch(err => console.error("Position sync error:", err))
-                .finally(() => {
-                    isSyncing = false;
-                    document.getElementById("syncBadge").innerHTML = 'Auto Sync: <span id="countdown">' + timerSeconds + '</span>s';
-                });
-        }
-
-        function startTimer() {
-            setInterval(() => {
-                if (isSyncing) return;
-                timerSeconds--;
-                if (timerSeconds <= 0) {
-                    timerSeconds = 10;
-                    fetchPositionsInBackground();
-                }
-                document.getElementById("countdown").innerText = timerSeconds;
-            }, 1000);
+                .catch(e => console.error(e))
+                .finally(() => { isSyncing = false; document.getElementById("syncBadge").innerHTML = 'Auto Sync: <span id="countdown">' + timerSeconds + '</span>s'; });
         }
 
         revealStaticIpBarIfNeeded(false);
         fetchPositionsInBackground();
-        startTimer();
+        setInterval(() => {
+            if (isSyncing) return;
+            if (--timerSeconds <= 0) { timerSeconds = 10; fetchPositionsInBackground(); }
+            document.getElementById("countdown").innerText = timerSeconds;
+        }, 1000);
     </script>
 </body>
-</html>
-"""
+</html>"""
 
 # --- ROUTES ---
 @app.route("/health")
@@ -3093,28 +2327,21 @@ def health():
 
 @app.route("/api/static_ip", methods=["GET", "POST"])
 def api_static_ip():
-    """GET checks outbound IP vs Upstox registered Static IP; POST registers Primary/Secondary Static IP."""
     if request.method == "POST":
         data = request.get_json(silent=True) or {}
-        primary_ip = data.get("primary_ip") or get_current_outbound_ip()
-        secondary_ip = data.get("secondary_ip")
-        ok, msg = update_upstox_static_ip(primary_ip, secondary_ip)
+        ok, msg = update_upstox_static_ip(data.get("primary_ip") or get_current_outbound_ip(), data.get("secondary_ip"))
         return jsonify({"success": ok, "message": msg})
-
-    status = fetch_upstox_static_ip_status()
-    resp = jsonify(status)
+    resp = jsonify(fetch_upstox_static_ip_status())
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return resp
 
 @app.route("/api/manual_order_action", methods=["POST"])
 def api_manual_order_action():
-    """Handles Place Order, Cancel, or Reset from /Live_Trade_Position when B16 = Manual."""
     data = request.get_json(silent=True) or {}
     action = str(data.get("action", "")).upper()
 
     with ORDER_EXECUTION_LOCK:
         state = load_auto_order_state()
-
         if action == "CANCEL":
             sig = data.get("signature", "")
             if sig and sig not in state.get("cancelled_signatures", []):
@@ -3133,14 +2360,7 @@ def api_manual_order_action():
                 return jsonify({"success": False, "message": cfg_err or "Could not read DASHBOARD sheet."})
 
             positions, orders, gtt_orders, _, _, _, _ = fetch_upstox_positions()
-            guard = evaluate_trade_guards(
-                cfg["symbol"],
-                cfg["option_type"],
-                cfg["max_active_trades"],
-                positions,
-                orders,
-                gtt_orders
-            )
+            guard = evaluate_trade_guards(cfg["symbol"], cfg["option_type"], cfg["max_active_trades"], positions, orders, gtt_orders)
             if not guard["allowed"]:
                 return jsonify({"success": False, "message": guard["reason"]})
 
@@ -3152,27 +2372,24 @@ def api_manual_order_action():
             if ok:
                 state.setdefault("recent_submissions", {})[evaluated["signature"]] = time.time()
                 save_auto_order_state(state)
-            return jsonify({
-                "success": ok,
-                "message": msg,
-                "show_static_ip_bar": is_ip_err,
-                "evaluated_order": evaluated
-            })
+            return jsonify({"success": ok, "message": msg, "show_static_ip_bar": is_ip_err, "evaluated_order": evaluated})
 
     return jsonify({"success": False, "message": "Invalid action."})
 
 @app.route("/api/positions")
 def api_positions():
-    """Background API route fetching live Upstox positions, running Dynamic SL/Target trailing, and syncing DASHBOARD order engine every 10s."""
     positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, error = fetch_upstox_positions()
+    now_ist = get_ist_now()
 
-    order_engine_payload = {
+    payload = {
         "manual_order": "Manual",
         "want_to_trade": "NO",
         "amount_to_invest": 0,
         "max_active_trades": 1,
         "active_trade_count": 0,
-        "sheet_synced_at": get_ist_now().strftime("%H:%M:%S IST"),
+        "exit_condition": "NONE",
+        "auto_exit_320": "NO",
+        "sheet_synced_at": now_ist.strftime("%H:%M:%S IST"),
         "status_message": "Initializing...",
         "show_manual_panel": False,
         "evaluated_order": None,
@@ -3182,95 +2399,120 @@ def api_positions():
         "show_static_ip_bar": False,
         "auto_execution_notice": None,
         "auto_execution_ok": False,
+        "exit_execution_notice": None,
+        "exit_execution_ok": False,
         "tsl_updates": []
     }
 
     with ORDER_EXECUTION_LOCK:
         cfg, cfg_err = fetch_dashboard_order_config()
-
-        # Run Dynamic Trailing SL & Target on all open positions
-        tsl_updates = process_dynamic_sl_and_target(
-            positions=positions,
-            gtt_orders=gtt_orders,
-            default_sl_pct=cfg["sl_percent"] if cfg else None,
-            default_target_pct=cfg["target_percent"] if cfg else None
-        )
-        order_engine_payload["tsl_updates"] = tsl_updates
+        state = load_auto_order_state()
+        cooldowns = state.setdefault("exit_cooldowns", {})
 
         if cfg_err or not cfg:
-            order_engine_payload["status_message"] = cfg_err or "Unable to read DASHBOARD sheet."
+            payload["status_message"] = cfg_err or "Unable to read DASHBOARD sheet."
         else:
-            order_engine_payload["manual_order"] = cfg["manual_order"]
-            order_engine_payload["want_to_trade"] = cfg["want_to_trade"]
-            order_engine_payload["amount_to_invest"] = cfg["amount_to_invest"]
-            order_engine_payload["max_active_trades"] = cfg["max_active_trades"]
+            payload["manual_order"] = cfg["manual_order"]
+            payload["want_to_trade"] = cfg["want_to_trade"]
+            payload["amount_to_invest"] = cfg["amount_to_invest"]
+            payload["max_active_trades"] = cfg["max_active_trades"]
+            payload["exit_condition"] = cfg["exit_condition"] or "NONE"
+            payload["auto_exit_320"] = cfg["auto_exit_320"]
 
-            guard = evaluate_trade_guards(
-                cfg["symbol"],
-                cfg["option_type"],
-                cfg["max_active_trades"],
-                positions,
-                orders,
-                gtt_orders
+            # --- CONDITION 4: 3:20 PM IST FULL POSITION EXIT (ONLY IF CELL B7 == "YES") ---
+            is_after_320_pm = (now_ist.hour > 15) or (now_ist.hour == 15 and now_ist.minute >= 20)
+            block_new_entries = False
+
+            if is_after_320_pm and cfg["auto_exit_320"] == "YES":
+                block_new_entries = True
+                if time.time() - cooldowns.get("320_PM_EXIT", 0) >= 15:
+                    ex_ok, ex_msg = execute_targeted_or_full_exit(positions, orders, gtt_orders, target_underlying=None, only_options=False)
+                    if ex_msg:
+                        cooldowns["320_PM_EXIT"] = time.time()
+                        save_auto_order_state(state)
+                        payload["exit_execution_notice"] = f"⏰ 3:20 PM AUTO EXIT (B7=YES): {ex_msg}"
+                        payload["exit_execution_ok"] = bool(ex_ok)
+                        positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, _ = fetch_upstox_positions()
+                payload["status_message"] = "3:20 PM IST Square-Off Active (B7=YES) — All active positions exited."
+
+            # --- CONDITION 3: CELL B29 EXIT CONDITION (BE / SE) FOR B19 (NIFTY / BANKNIFTY) ---
+            exit_cond = cfg["exit_condition"]
+            if exit_cond in ("BE", "SE") and cfg["symbol"] in ("NIFTY", "BANKNIFTY"):
+                block_new_entries = True
+                cd_key = f"EXIT_B29_{cfg['symbol']}_{exit_cond}"
+                if time.time() - cooldowns.get(cd_key, 0) >= 15:
+                    ex_ok, ex_msg = execute_targeted_or_full_exit(positions, orders, gtt_orders, target_underlying=cfg["symbol"], only_options=True)
+                    if ex_msg:
+                        cooldowns[cd_key] = time.time()
+                        save_auto_order_state(state)
+                        payload["exit_execution_notice"] = f"🚪 EXIT CONDITION ({exit_cond} on {cfg['symbol']}): {ex_msg}"
+                        payload["exit_execution_ok"] = bool(ex_ok)
+                        positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, _ = fetch_upstox_positions()
+                if not payload["exit_execution_notice"]:
+                    payload["status_message"] = f"Exit Condition {exit_cond} active on {cfg['symbol']} (B29) — Monitoring/Flat."
+
+            # --- DYNAMIC TRAILING SL & TARGET ON REMAINING OPEN POSITIONS ---
+            payload["tsl_updates"] = process_dynamic_sl_and_target(
+                positions=positions,
+                gtt_orders=gtt_orders,
+                default_sl_pct=cfg["sl_percent"],
+                default_target_pct=cfg["target_percent"]
             )
-            order_engine_payload["active_trade_count"] = guard["active_count"]
-            order_engine_payload["guard_blocked"] = not guard["allowed"]
-            order_engine_payload["guard_reason"] = guard["reason"] if not guard["allowed"] else None
 
-            if cfg["want_to_trade"] != "YES":
-                order_engine_payload["status_message"] = "Trade Avoided — Want to Trade (B17) is not YES."
-            else:
-                evaluated, eval_err = prepare_evaluated_order(cfg)
-                if eval_err or not evaluated:
-                    order_engine_payload["status_message"] = eval_err or "Order evaluation skipped."
+            # --- EXISTING BUY / SELL & ACTIVE TRADE GUARD (B16:B28) ---
+            guard = evaluate_trade_guards(cfg["symbol"], cfg["option_type"], cfg["max_active_trades"], positions, orders, gtt_orders)
+            payload["active_trade_count"] = guard["active_count"]
+            payload["guard_blocked"] = not guard["allowed"]
+            payload["guard_reason"] = guard["reason"] if not guard["allowed"] else None
+
+            if not block_new_entries:
+                if cfg["want_to_trade"] != "YES":
+                    payload["status_message"] = "Trade Avoided — Want to Trade (B17) is not YES."
                 else:
-                    order_engine_payload["evaluated_order"] = evaluated
-                    state = load_auto_order_state()
-
-                    if cfg["manual_order"].lower() == "auto":
-                        if not guard["allowed"]:
-                            order_engine_payload["status_message"] = f"Skipped: {guard['reason']}"
-                        else:
-                            last_sub_ts = state.get("recent_submissions", {}).get(evaluated["signature"], 0)
-                            if time.time() - last_sub_ts < 25:
-                                order_engine_payload["status_message"] = "Order submitted — waiting for Upstox order book sync..."
-                            else:
-                                ok, exec_msg, is_ip_err = submit_upstox_evaluated_order(evaluated)
-                                state.setdefault("recent_submissions", {})[evaluated["signature"]] = time.time()
-                                save_auto_order_state(state)
-                                order_engine_payload["show_static_ip_bar"] = is_ip_err
-                                order_engine_payload["status_message"] = f"Auto Mode: {exec_msg}"
-                                order_engine_payload["auto_execution_notice"] = f"AUTO ORDER: {exec_msg}"
-                                order_engine_payload["auto_execution_ok"] = ok
+                    evaluated, eval_err = prepare_evaluated_order(cfg)
+                    if eval_err or not evaluated:
+                        payload["status_message"] = eval_err or "Order evaluation skipped."
                     else:
-                        is_cancelled = evaluated["signature"] in state.get("cancelled_signatures", [])
-                        order_engine_payload["is_cancelled"] = is_cancelled
-                        if is_cancelled:
-                            order_engine_payload["show_manual_panel"] = False
-                            order_engine_payload["status_message"] = "Manual Order Cancelled by User (Click Reload to restore)."
-                        else:
-                            order_engine_payload["show_manual_panel"] = True
+                        payload["evaluated_order"] = evaluated
+                        if cfg["manual_order"].lower() == "auto":
                             if not guard["allowed"]:
-                                order_engine_payload["status_message"] = f"Manual Order Blocked: {guard['reason']}"
+                                payload["status_message"] = f"Skipped: {guard['reason']}"
                             else:
-                                order_engine_payload["status_message"] = f"Awaiting Manual Approval for {evaluated['symbol']} {evaluated['selected_strike']} {evaluated['option_type']} @ ₹{evaluated['entry_price']}"
+                                last_sub = state.get("recent_submissions", {}).get(evaluated["signature"], 0)
+                                if time.time() - last_sub < 25:
+                                    payload["status_message"] = "Order submitted — waiting for Upstox order book sync..."
+                                else:
+                                    ok, exec_msg, is_ip_err = submit_upstox_evaluated_order(evaluated)
+                                    state.setdefault("recent_submissions", {})[evaluated["signature"]] = time.time()
+                                    save_auto_order_state(state)
+                                    payload["show_static_ip_bar"] = is_ip_err
+                                    payload["status_message"] = f"Auto Mode: {exec_msg}"
+                                    payload["auto_execution_notice"] = f"AUTO ORDER: {exec_msg}"
+                                    payload["auto_execution_ok"] = ok
+                        else:
+                            is_cancelled = evaluated["signature"] in state.get("cancelled_signatures", [])
+                            payload["is_cancelled"] = is_cancelled
+                            if is_cancelled:
+                                payload["show_manual_panel"] = False
+                                payload["status_message"] = "Manual Order Cancelled by User (Click Reload to restore)."
+                            else:
+                                payload["show_manual_panel"] = True
+                                payload["status_message"] = f"Manual Order Blocked: {guard['reason']}" if not guard["allowed"] else f"Awaiting Manual Approval for {evaluated['symbol']} {evaluated['selected_strike']} {evaluated['option_type']} @ ₹{evaluated['entry_price']}"
 
-    response = jsonify({
+    resp = jsonify({
         "positions": positions,
         "orders": orders,
         "total_pnl": total_pnl,
         "realised_pnl": realised_pnl,
         "unrealised_pnl": unrealised_pnl,
-        "order_engine": order_engine_payload,
+        "order_engine": payload,
         "error": error
     })
-    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    response.headers["Pragma"] = "no-cache"
-    return response
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
 
 @app.route("/Live_Trade_Position", methods=["GET"])
 def live_trade_position():
-    """Unlisted private route for real-time portfolio, trade logs & P&L."""
     return render_template_string(POSITIONS_HTML_TEMPLATE)
 
 @app.route("/api/history")
@@ -3279,42 +2521,23 @@ def api_history():
     timeframe = request.args.get("timeframe", "5minute")
     day_range = request.args.get("day_range", "1day").lower()
     chart_type = request.args.get("chart_type", "history").lower()
-
     sym_clean = "BANKNIFTY" if "BANK" in symbol else "NIFTY"
 
     if chart_type == "signal":
         tf = timeframe.lower()
-        if "15" in tf:
-            tf_str = "15_MIN"
-        elif "30" in tf:
-            tf_str = "30_MIN"
-        elif "60" in tf or "1h" in tf or "hour" in tf or "hr" in tf or "day" in tf:
-            tf_str = "1_HR"
-        else:
-            tf_str = "5_MIN"
-            
+        tf_str = "15_MIN" if "15" in tf else ("30_MIN" if "30" in tf else ("1_HR" if any(k in tf for k in ("60", "1h", "hour", "hr", "day")) else "5_MIN"))
         target_sheet = f"{sym_clean}_{tf_str}"
     else:
         target_sheet = sym_clean
 
     snapshots, err = fetch_history_from_gsheet(symbol, sheet_name=target_sheet)
-
     if err:
         return jsonify({"history": [], "count": 0, "error": err})
-
     if not snapshots:
         return jsonify({"history": [], "count": 0})
 
-    day_map = {
-        "1day": 1 * 86400,
-        "3day": 3 * 86400,
-        "1week": 7 * 86400,
-        "2week": 14 * 86400,
-        "1month": 30 * 86400,
-        "3month": 90 * 86400
-    }
+    day_map = {"1day": 86400, "3day": 259200, "1week": 604800, "2week": 1209600, "1month": 2592000, "3month": 7776000}
     max_ts = max((s["timestamp"] for s in snapshots if s["timestamp"] > 0), default=0)
-
     if max_ts > 0 and day_range in day_map:
         cutoff = max_ts - day_map[day_range]
         snapshots = [s for s in snapshots if s["timestamp"] >= cutoff or s["timestamp"] == 0]
@@ -3322,20 +2545,13 @@ def api_history():
     if timeframe == "5minute" or not snapshots:
         return jsonify({"history": snapshots, "count": len(snapshots)})
 
-    sec_map = {
-        "15minute": 15 * 60,
-        "30minute": 30 * 60,
-        "60minute": 60 * 60,
-        "day": 24 * 60 * 60
-    }
+    sec_map = {"15minute": 900, "30minute": 1800, "60minute": 3600, "day": 86400}
     interval_sec = sec_map.get(timeframe, 300)
-
     grouped = {}
     for idx, item in enumerate(snapshots):
         ts = item["timestamp"]
         bucket = (ts // interval_sec) * interval_sec if ts > 0 else (idx // (interval_sec // 300))
         grouped[bucket] = item
-
     resampled = [grouped[b] for b in sorted(grouped.keys())]
     return jsonify({"history": resampled, "count": len(resampled)})
 
@@ -3344,88 +2560,40 @@ def api_data():
     symbol = request.args.get("symbol", "NIFTY").upper()
     selected_expiry = request.args.get("expiry", "ALL").upper()
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
-    
     return jsonify({
-        "rows": rows,
-        "spot_price": spot_price,
-        "atm_strike": atm_strike,
-        "expiry": expiry,
-        "expiries": expiries,
-        "updated": updated,
-        "pcr": pcr,
-        "total_ce_oi": total_ce_oi,
-        "total_pe_oi": total_pe_oi,
-        "error": error
+        "rows": rows, "spot_price": spot_price, "atm_strike": atm_strike,
+        "expiry": expiry, "expiries": expiries, "updated": updated,
+        "pcr": pcr, "total_ce_oi": total_ce_oi, "total_pe_oi": total_pe_oi, "error": error
     })
 
 @app.route("/", methods=["GET", "HEAD"])
 def index():
     if request.method == "HEAD":
         return Response(status=200)
-
     symbol = request.args.get("symbol", "NIFTY").upper()
     selected_expiry = request.args.get("expiry", "ALL").upper()
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
-
-    return render_template_string(
-        MAIN_HTML_TEMPLATE,
-        rows=rows,
-        symbol=symbol,
-        spot_price=spot_price,
-        atm_strike=atm_strike,
-        expiry=expiry,
-        expiries=expiries,
-        updated=updated,
-        pcr=pcr,
-        total_ce_oi=total_ce_oi,
-        total_pe_oi=total_pe_oi,
-        error=error
-    )
+    return render_template_string(MAIN_HTML_TEMPLATE, rows=rows, symbol=symbol, spot_price=spot_price, atm_strike=atm_strike, expiry=expiry, expiries=expiries, updated=updated, pcr=pcr, total_ce_oi=total_ce_oi, total_pe_oi=total_pe_oi, error=error)
 
 @app.route("/analysis", methods=["GET"])
 def analysis_dashboard():
     symbol = request.args.get("symbol", "NIFTY").upper()
     selected_expiry = request.args.get("expiry", "ALL").upper()
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
-
-    return render_template_string(
-        ANALYSIS_HTML_TEMPLATE,
-        rows=rows,
-        symbol=symbol,
-        spot_price=spot_price,
-        atm_strike=atm_strike,
-        expiry=expiry,
-        expiries=expiries,
-        updated=updated,
-        pcr=pcr,
-        total_ce_oi=total_ce_oi,
-        total_pe_oi=total_pe_oi,
-        error=error
-    )
+    return render_template_string(ANALYSIS_HTML_TEMPLATE, rows=rows, symbol=symbol, spot_price=spot_price, atm_strike=atm_strike, expiry=expiry, expiries=expiries, updated=updated, pcr=pcr, total_ce_oi=total_ce_oi, total_pe_oi=total_pe_oi, error=error)
 
 @app.route("/download")
 def download_csv():
     symbol = request.args.get("symbol", "NIFTY").upper()
     selected_expiry = request.args.get("expiry", "ALL").upper()
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
-
     si = io.StringIO()
     cw = csv.writer(si)
     cw.writerow([f"Symbol: {symbol}", f"Spot Price: {spot_price}", f"ATM Strike: {atm_strike}", f"Expiry: {expiry}", f"PCR: {pcr}", f"Updated: {updated}"])
-    cw.writerow([
-        "CE OI", "CE Chg in OI", "CE Vol", "CE IV", "CE Delta", "CE Theta", "CE Vega", "CE Gamma", "CE Bid", "CE Ask", "CE LTP",
-        "STRIKE",
-        "PE LTP", "PE Bid", "PE Ask", "PE Delta", "PE Theta", "PE Vega", "PE Gamma", "PE IV", "PE Vol", "PE Chg in OI", "PE OI"
-    ])
-
+    cw.writerow(["CE OI", "CE Chg in OI", "CE Vol", "CE IV", "CE Delta", "CE Theta", "CE Vega", "CE Gamma", "CE Bid", "CE Ask", "CE LTP", "STRIKE", "PE LTP", "PE Bid", "PE Ask", "PE Delta", "PE Theta", "PE Vega", "PE Gamma", "PE IV", "PE Vol", "PE Chg in OI", "PE OI"])
     if not error:
         for r in rows:
-            cw.writerow([
-                r["ce_oi"], r["ce_oi_chg"], r["ce_vol"], r["ce_iv"], r["ce_delta"], r["ce_theta"], r["ce_vega"], r["ce_gamma"], r["ce_bid"], r["ce_ask"], r["ce_ltp"],
-                r["strike"],
-                r["pe_ltp"], r["pe_bid"], r["pe_ask"], r["pe_delta"], r["pe_theta"], r["pe_vega"], r["pe_gamma"], r["pe_iv"], r["pe_vol"], r["pe_oi_chg"], r["pe_oi"]
-            ])
-
+            cw.writerow([r["ce_oi"], r["ce_oi_chg"], r["ce_vol"], r["ce_iv"], r["ce_delta"], r["ce_theta"], r["ce_vega"], r["ce_gamma"], r["ce_bid"], r["ce_ask"], r["ce_ltp"], r["strike"], r["pe_ltp"], r["pe_bid"], r["pe_ask"], r["pe_delta"], r["pe_theta"], r["pe_vega"], r["pe_gamma"], r["pe_iv"], r["pe_vol"], r["pe_oi_chg"], r["pe_oi"]])
     output = Response(si.getvalue(), mimetype="text/csv")
     output.headers["Content-Disposition"] = f"attachment; filename={symbol}_{expiry}_Option_Chain.csv"
     return output
@@ -3434,30 +2602,11 @@ def download_csv():
 def download_history_csv():
     symbol = request.args.get("symbol", "NIFTY").upper()
     snapshots, _ = fetch_history_from_gsheet(symbol)
-
     si = io.StringIO()
     cw = csv.writer(si)
-    cw.writerow([
-        "Datetime", "Formatted Time", "Symbol", "Spot Price", "ATM Strike", "PCR",
-        "CE OI", "PE OI", "CE Chg in OI", "PE Chg in OI", "CE Vol", "PE Vol",
-        "CE IV", "PE IV", "CE Delta", "PE Delta",
-        "CE Theta", "PE Theta", "CE Vega", "PE Vega",
-        "CE Gamma", "PE Gamma", "CE Ask", "PE Bid",
-        "Min ROC (Buy)", "Max ROC (Sell)", "Cross ROC Sig", "Main Volatility", "New Signal"
-    ])
-
+    cw.writerow(["Datetime", "Formatted Time", "Symbol", "Spot Price", "ATM Strike", "PCR", "CE OI", "PE OI", "CE Chg in OI", "PE Chg in OI", "CE Vol", "PE Vol", "CE IV", "PE IV", "CE Delta", "PE Delta", "CE Theta", "PE Theta", "CE Vega", "PE Vega", "CE Gamma", "PE Gamma", "CE Ask", "PE Bid", "Min ROC (Buy)", "Max ROC (Sell)", "Cross ROC Sig", "Main Volatility", "New Signal"])
     for s in snapshots:
-        cw.writerow([
-            s.get("datetime"), s.get("formatted_time"), s.get("symbol"),
-            s.get("spot_price"), s.get("atm_strike"), s.get("pcr"),
-            s.get("ce_oi"), s.get("pe_oi"), s.get("ce_oi_chg"), s.get("pe_oi_chg"),
-            s.get("ce_vol"), s.get("pe_vol"),
-            s.get("ce_iv"), s.get("pe_iv"), s.get("ce_delta"), s.get("pe_delta"),
-            s.get("ce_theta"), s.get("pe_theta"), s.get("ce_vega"), s.get("pe_vega"),
-            s.get("ce_gamma"), s.get("pe_gamma"), s.get("ce_ask"), s.get("pe_bid"),
-            s.get("min_roc"), s.get("max_roc"), s.get("cross_roc"), s.get("main_volatility"), s.get("new_signal")
-        ])
-
+        cw.writerow([s.get("datetime"), s.get("formatted_time"), s.get("symbol"), s.get("spot_price"), s.get("atm_strike"), s.get("pcr"), s.get("ce_oi"), s.get("pe_oi"), s.get("ce_oi_chg"), s.get("pe_oi_chg"), s.get("ce_vol"), s.get("pe_vol"), s.get("ce_iv"), s.get("pe_iv"), s.get("ce_delta"), s.get("pe_delta"), s.get("ce_theta"), s.get("pe_theta"), s.get("ce_vega"), s.get("pe_vega"), s.get("ce_gamma"), s.get("pe_gamma"), s.get("ce_ask"), s.get("pe_bid"), s.get("min_roc"), s.get("max_roc"), s.get("cross_roc"), s.get("main_volatility"), s.get("new_signal")])
     output = Response(si.getvalue(), mimetype="text/csv")
     output.headers["Content-Disposition"] = f"attachment; filename={symbol}_Historical_GSheet_Memory.csv"
     return output
