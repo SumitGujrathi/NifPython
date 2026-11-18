@@ -30,6 +30,9 @@ DYNAMIC_TSL_STATE_PATH = "/tmp/upstox_dynamic_tsl_state.json"
 AUTH_THREAD_LOCK = threading.Lock()
 ORDER_EXECUTION_LOCK = threading.Lock()
 
+IST = timezone(timedelta(hours=5, minutes=30))
+DUPLICATE_COOLDOWN_SECONDS = 3600  # 1-hour gap required before re-entering same Symbol + CE/PE
+
 INSTRUMENT_KEYS = {
     "NIFTY": "NSE_INDEX|Nifty 50",
     "BANKNIFTY": "NSE_INDEX|Nifty Bank"
@@ -190,10 +193,43 @@ def update_upstox_static_ip(primary_ip, secondary_ip=None):
 
 # --- TIME & PERSISTENT STATE HELPERS ---
 def get_ist_now():
-    return datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    return datetime.now(IST)
 
 def get_ist_today_str():
     return get_ist_now().strftime("%Y-%m-%d")
+
+def parse_upstox_order_timestamp(ts_str):
+    if not ts_str:
+        return 0.0
+    s = str(ts_str).strip()
+    try:
+        iso_s = s.replace("Z", "+00:00")
+        if "T" in iso_s:
+            dt = datetime.fromisoformat(iso_s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=IST)
+            return dt.timestamp()
+    except Exception:
+        pass
+    s_clean = re.sub(r'\.\d+$', '', s)
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S", "%d-%m-%Y %H:%M:%S", "%d/%m/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M:%S", "%d-%b-%Y %H:%M:%S",
+        "%Y-%m-%d %H:%M", "%d-%m-%Y %H:%M", "%d/%m/%Y %H:%M", "%d-%b-%Y %H:%M"
+    ):
+        try:
+            return datetime.strptime(s_clean, fmt).replace(tzinfo=IST).timestamp()
+        except ValueError:
+            pass
+    return 0.0
+
+def format_duration_hm(seconds):
+    sec = max(0, int(seconds))
+    mins, rem_s = divmod(sec, 60)
+    hrs, rem_m = divmod(mins, 60)
+    if hrs > 0:
+        return f"{hrs}h {rem_m}m"
+    return f"{rem_m}m {rem_s}s"
 
 def load_auto_order_state():
     today = get_ist_today_str()
@@ -909,22 +945,23 @@ def extract_symbol_and_opt_type(trading_symbol):
     opt_match = re.search(r'(?:^|\s|\d)(CE|PE)(?:\s|$|\d)', ts)
     return underlying, (opt_match.group(1) if opt_match else None)
 
-def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, positions, orders, gtt_orders=None, target_txn_type=None):
+def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, positions, orders, gtt_orders=None, recent_submissions=None):
     """
-    Blocks duplicate orders for the same Symbol (NIFTY/BANKNIFTY) + Option Type (CE/PE) across:
-    1. Currently Open Positions
-    2. Currently Open Regular Orders
-    3. Currently Active GTT Orders
-    4. ALL Existing Non-Failed Orders in Today's Order Book (even if SL/Target already closed the position, and regardless of strike!)
-    5. ALL Existing Non-Failed GTT Orders Today
+    Trade & Duplicate Guard:
+    1. Always blocks if the same Symbol (NIFTY/BANKNIFTY) + Option Type (CE/PE) is currently open/active.
+    2. If a previous trade on the same Symbol + Option Type hit SL or closed, enforces a 1-hour (3600s) gap
+       from the most recent order on that Symbol + Option Type (regardless of strike price) before allowing a new buy/sell.
+    3. Enforces max_active_trades (Cell B28).
     """
     gtt_orders = gtt_orders or []
+    recent_submissions = recent_submissions or {}
+    now_ts = get_ist_now().timestamp()
+
     t_sym = str(target_symbol or "").strip().upper()
     t_opt = str(target_opt_type or "").strip().upper()
-    t_txn = str(target_txn_type or "").strip().upper()
     active_items, open_pos_syms = [], {}
 
-    # 1. Active Open Positions
+    # 1. Currently Active Open Positions (qty != 0)
     for p in positions:
         qty = p.get("quantity", 0) or 0
         ts = str(p.get("trading_symbol", "")).strip().upper()
@@ -933,7 +970,7 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
             u, opt = extract_symbol_and_opt_type(ts)
             active_items.append({"source": "Active Position", "trading_symbol": ts, "underlying": u, "option_type": opt})
 
-    # 2. Open Regular Orders
+    # 2. Currently Open Regular Orders
     for o in orders:
         st = str(o.get("status", "")).strip().lower()
         ts = str(o.get("trading_symbol", "")).strip().upper()
@@ -944,7 +981,7 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
                 u, opt = extract_symbol_and_opt_type(ts)
                 active_items.append({"source": f"Open Order ({o.get('status', '')})", "trading_symbol": ts, "underlying": u, "option_type": opt})
 
-    # 3. Active GTT Orders
+    # 3. Currently Active GTT Orders
     for g in gtt_orders:
         st = str(g.get("status", "")).strip().lower()
         ts = str(g.get("trading_symbol", "")).strip().upper()
@@ -954,7 +991,7 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
 
     active_count = len(active_items)
 
-    # Check active items first
+    # Block immediately if same Symbol + Option Type is currently open/active
     dups = [i for i in active_items if i["underlying"] == t_sym and i["option_type"] == t_opt]
     if dups:
         m = dups[0]
@@ -965,36 +1002,47 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
             "reason": f"Duplicate Blocked: {t_sym} {t_opt} already active/open ({m['trading_symbol']} - {m['source']})."
         }
 
-    # 4. Check ALL existing orders in today's Upstox Order Book (including executed/complete orders after SL/Target hit)
+    # 4. Enforce 1-Hour (3600s) Cooldown Gap from the latest order on the same Symbol + Option Type (any strike)
+    latest_order_ts = 0.0
+    latest_order_label = ""
+    has_executed_history = False
+
     for o in orders:
         st = str(o.get("status", "")).strip().lower()
         ts = str(o.get("trading_symbol", "")).strip().upper()
-        txn = str(o.get("transaction_type", "")).strip().upper()
         if not ts or st in FAILED_ORDER_STATUSES:
             continue
         u, opt = extract_symbol_and_opt_type(ts)
-        if u == t_sym and opt == t_opt and (not t_txn or txn == t_txn):
-            return {
-                "allowed": False,
-                "active_count": active_count,
-                "max_active_trades": max_active_trades,
-                "reason": f"Duplicate Blocked: {t_sym} {t_opt} ({txn}) already exists in today's order book ({ts} - {o.get('status', '')})."
-            }
+        if u == t_sym and opt == t_opt:
+            has_executed_history = True
+            ots = parse_upstox_order_timestamp(o.get("order_timestamp", ""))
+            if ots > latest_order_ts:
+                latest_order_ts = ots
+                latest_order_label = f"{ts} ({o.get('transaction_type', '')} - {o.get('status', '')})"
 
-    # 5. Check ALL existing non-failed GTT orders today
-    for g in gtt_orders:
-        st = str(g.get("status", "")).strip().lower()
-        ts = str(g.get("trading_symbol", "")).strip().upper()
-        txn = str(g.get("transaction_type", "")).strip().upper()
-        if not ts or st in FAILED_ORDER_STATUSES:
-            continue
-        u, opt = extract_symbol_and_opt_type(ts)
-        if u == t_sym and opt == t_opt and (not t_txn or txn == t_txn):
+    # Also check local submission timestamp (bridges API sync delay or active GTT placement)
+    for k, sub_ts in recent_submissions.items():
+        parts = str(k).split("|")
+        if len(parts) >= 2 and parts[0].upper() == t_sym and parts[1].upper() == t_opt:
+            sub_f = float(sub_ts or 0)
+            effective_window = DUPLICATE_COOLDOWN_SECONDS if has_executed_history else 30
+            if (now_ts - sub_f) < effective_window and sub_f > latest_order_ts:
+                latest_order_ts = sub_f
+                latest_order_label = f"{t_sym} {t_opt} (Recent Order)"
+
+    if latest_order_ts > 0:
+        elapsed = now_ts - latest_order_ts
+        if 0 <= elapsed < DUPLICATE_COOLDOWN_SECONDS:
+            remaining = DUPLICATE_COOLDOWN_SECONDS - elapsed
+            last_ist_str = datetime.fromtimestamp(latest_order_ts, tz=IST).strftime("%H:%M:%S IST")
             return {
                 "allowed": False,
                 "active_count": active_count,
                 "max_active_trades": max_active_trades,
-                "reason": f"Duplicate Blocked: {t_sym} {t_opt} ({txn}) already exists in today's GTT orders ({ts} - {g.get('status', '')})."
+                "reason": (
+                    f"1-Hr Cooldown Active: {t_sym} {t_opt} last traded at {last_ist_str} "
+                    f"({latest_order_label}). Wait {format_duration_hm(remaining)} for 1h gap."
+                )
             }
 
     if max_active_trades is not None and active_count >= max_active_trades:
@@ -2111,7 +2159,7 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
 <body>
     <h2>🔐 Private Live Trade & Positions Dashboard</h2>
     <div class="subtitle">
-        <span>Real-time Upstox Portfolio, Automated Google Sheet Order Engine, Exit Triggers (B29 / 3:20 PM B7) & Dynamic SL/Target</span>
+        <span>Real-time Upstox Portfolio, Automated Google Sheet Order Engine (1-Hr Duplicate Cooldown), Exit Triggers (B29 / 3:20 PM B7) & Dynamic SL/Target</span>
         <span class="timer-badge" id="syncBadge">Auto Sync: <span id="countdown">10</span>s</span>
     </div>
 
@@ -2422,7 +2470,7 @@ def api_manual_order_action():
                 positions,
                 orders,
                 gtt_orders,
-                target_txn_type=cfg["transaction_type"]
+                recent_submissions=state.get("recent_submissions", {})
             )
             if not guard["allowed"]:
                 return jsonify({"success": False, "message": guard["reason"]})
@@ -2433,7 +2481,7 @@ def api_manual_order_action():
 
             ok, msg, is_ip_err = submit_upstox_evaluated_order(evaluated)
             if ok:
-                state.setdefault("recent_submissions", {})[evaluated["duplicate_key"]] = time.time()
+                state.setdefault("recent_submissions", {})[evaluated["duplicate_key"]] = get_ist_now().timestamp()
                 save_auto_order_state(state)
             return jsonify({"success": ok, "message": msg, "show_static_ip_bar": is_ip_err, "evaluated_order": evaluated})
 
@@ -2522,7 +2570,7 @@ def api_positions():
                 default_target_pct=cfg["target_percent"]
             )
 
-            # --- EXISTING BUY / SELL & FULL ORDER-BOOK DUPLICATE GUARD (B16:B28) ---
+            # --- EXISTING BUY / SELL & 1-HOUR DUPLICATE COOLDOWN GUARD (B16:B28) ---
             guard = evaluate_trade_guards(
                 cfg["symbol"],
                 cfg["option_type"],
@@ -2530,7 +2578,7 @@ def api_positions():
                 positions,
                 orders,
                 gtt_orders,
-                target_txn_type=cfg["transaction_type"]
+                recent_submissions=state.get("recent_submissions", {})
             )
             payload["active_trade_count"] = guard["active_count"]
             payload["guard_blocked"] = not guard["allowed"]
@@ -2549,17 +2597,13 @@ def api_positions():
                             if not guard["allowed"]:
                                 payload["status_message"] = f"Skipped: {guard['reason']}"
                             else:
-                                last_sub = state.get("recent_submissions", {}).get(evaluated["duplicate_key"], 0)
-                                if time.time() - last_sub < 25:
-                                    payload["status_message"] = f"Order for {cfg['symbol']} {cfg['option_type']} already submitted — waiting for Upstox order book sync..."
-                                else:
-                                    ok, exec_msg, is_ip_err = submit_upstox_evaluated_order(evaluated)
-                                    state.setdefault("recent_submissions", {})[evaluated["duplicate_key"]] = time.time()
-                                    save_auto_order_state(state)
-                                    payload["show_static_ip_bar"] = is_ip_err
-                                    payload["status_message"] = f"Auto Mode: {exec_msg}"
-                                    payload["auto_execution_notice"] = f"AUTO ORDER: {exec_msg}"
-                                    payload["auto_execution_ok"] = ok
+                                ok, exec_msg, is_ip_err = submit_upstox_evaluated_order(evaluated)
+                                state.setdefault("recent_submissions", {})[evaluated["duplicate_key"]] = now_ist.timestamp()
+                                save_auto_order_state(state)
+                                payload["show_static_ip_bar"] = is_ip_err
+                                payload["status_message"] = f"Auto Mode: {exec_msg}"
+                                payload["auto_execution_notice"] = f"AUTO ORDER: {exec_msg}"
+                                payload["auto_execution_ok"] = ok
                         else:
                             is_cancelled = evaluated["signature"] in state.get("cancelled_signatures", [])
                             payload["is_cancelled"] = is_cancelled
