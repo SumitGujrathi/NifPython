@@ -42,6 +42,10 @@ OPEN_ORDER_STATUSES = {
     "scheduled", "active"
 }
 
+FAILED_ORDER_STATUSES = {
+    "rejected", "cancelled", "canceled", "expired", "failed"
+}
+
 AUTH_COOLDOWN = {"last_failure_time": 0, "cooldown_duration": 1500}
 
 def get_upstox_proxies():
@@ -515,12 +519,6 @@ def exit_position_at_market(pos, headers, proxies):
         return False, f"Market Exit Exception for {ts}: {e}"
 
 def execute_targeted_or_full_exit(positions, orders, gtt_orders, target_underlying=None, only_options=False):
-    """
-    Cancels matching open regular orders & GTT orders, then exits matching active positions at MARKET rate.
-    - If target_underlying is None: exits ALL active positions & cancels ALL open orders (used for 3:20 PM IST B7=YES).
-    - If target_underlying is 'NIFTY' or 'BANKNIFTY' (with only_options=True): exits all active CE/PE positions and cancels
-      all open regular & GTT orders for that underlying (used for B29 = BE / SE).
-    """
     token = get_valid_token()
     if not token:
         return False, "Upstox token unavailable for exit."
@@ -557,26 +555,23 @@ def execute_targeted_or_full_exit(positions, orders, gtt_orders, target_underlyi
     ]
 
     if not matching_positions and not matching_open_orders and not matching_gtt_orders:
-        return None, None  # Nothing active to cancel or exit
+        return None, None
 
     logs = []
     all_ok = True
 
-    # 1. Cancel matching open regular orders first (releases margin / avoids duplicate fills)
     for o in matching_open_orders:
         ok, msg = cancel_upstox_regular_order(o["order_id"], headers, proxies)
         logs.append(msg)
         if not ok:
             all_ok = False
 
-    # 2. Cancel matching active/scheduled GTT orders (SL / Target / Entry GTTs for that strike)
     for g in matching_gtt_orders:
         ok, msg = cancel_upstox_gtt_order(g["gtt_order_id"], headers, proxies)
         logs.append(msg)
         if not ok:
             all_ok = False
 
-    # 3. Exit matching active positions at MARKET rate
     for p in matching_positions:
         ok, msg = exit_position_at_market(p, headers, proxies)
         logs.append(msg)
@@ -587,7 +582,6 @@ def execute_targeted_or_full_exit(positions, orders, gtt_orders, target_underlyi
 
 # --- GOOGLE SHEET DASHBOARD CONFIG (B7, B16:B28, B29) ---
 def fetch_dashboard_order_config():
-    """Fetches cells A1:Z32 from Google Sheet tab 'DASHBOARD' preserving exact 1-based row numbers (B7, B16:B29)."""
     sheet_id = SPREADSHEET_ID or "1fpXdodshvwHcduwffOhEK54K-a7a4TmOZF2Q-EgVRzM"
     cb = int(time.time() * 1000)
     headers = {
@@ -621,7 +615,6 @@ def fetch_dashboard_order_config():
         return None, last_err or "Could not fetch DASHBOARD sheet."
 
     try:
-        # Preserve empty lines so 1-based row indices (Row 7 = index 6, Row 16 = index 15, Row 29 = index 28) stay exact!
         grid = list(csv.reader(io.StringIO(raw_csv.lstrip('\ufeff'))))
 
         label_values = {}
@@ -648,11 +641,9 @@ def fetch_dashboard_order_config():
                     return label_values[k]
             return exact_val
 
-        # B7 -> 3:20 PM Auto Exit ("YES" / "NO")
         b7_raw = resolve_field(["3_20_pm_exit", "auto_exit_3_20", "exit_at_3_20", "square_off_3_20", "auto_square_off"], 7, prefer_exact_row=True).strip().upper()
         auto_exit_320 = "YES" if b7_raw in ("YES", "Y", "TRUE", "1") else "NO"
 
-        # B16:B28 -> Existing Order Configuration
         manual_raw = resolve_field(["manual_order"], 16)
         manual_mode = "Auto" if manual_raw.strip().lower() == "auto" else "Manual"
 
@@ -691,7 +682,6 @@ def fetch_dashboard_order_config():
         active_raw = resolve_field(["active_trade", "active_trades", "max_active_trade", "max_active_trades"], 28).replace(",", "").strip()
         max_active_trades = int(float(active_raw)) if active_raw != "" else 1
 
-        # B29 -> Exit Condition ("BE" / "SE" / blank)
         exit_cond_raw = resolve_field(["exit_condition", "exit_signal"], 29, prefer_exact_row=True).strip().upper()
 
         return {
@@ -818,9 +808,11 @@ def prepare_evaluated_order(cfg):
 
     strike_adjusted = (int(selected["strike"]) != int(req_strike))
     signature = f"{cfg['manual_order']}|{symbol}|{expiry_date}|{int(selected['strike'])}|{opt_type}|{txn_type}|{qty}|{cfg['product']}|{sl_percent}|{target_percent}"
+    duplicate_key = f"{symbol}|{opt_type}|{txn_type}"
 
     return {
         "signature": signature,
+        "duplicate_key": duplicate_key,
         "manual_order": cfg["manual_order"],
         "want_to_trade": cfg["want_to_trade"],
         "symbol": symbol,
@@ -917,10 +909,22 @@ def extract_symbol_and_opt_type(trading_symbol):
     opt_match = re.search(r'(?:^|\s|\d)(CE|PE)(?:\s|$|\d)', ts)
     return underlying, (opt_match.group(1) if opt_match else None)
 
-def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, positions, orders, gtt_orders=None):
+def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, positions, orders, gtt_orders=None, target_txn_type=None):
+    """
+    Blocks duplicate orders for the same Symbol (NIFTY/BANKNIFTY) + Option Type (CE/PE) across:
+    1. Currently Open Positions
+    2. Currently Open Regular Orders
+    3. Currently Active GTT Orders
+    4. ALL Existing Non-Failed Orders in Today's Order Book (even if SL/Target already closed the position, and regardless of strike!)
+    5. ALL Existing Non-Failed GTT Orders Today
+    """
     gtt_orders = gtt_orders or []
+    t_sym = str(target_symbol or "").strip().upper()
+    t_opt = str(target_opt_type or "").strip().upper()
+    t_txn = str(target_txn_type or "").strip().upper()
     active_items, open_pos_syms = [], {}
 
+    # 1. Active Open Positions
     for p in positions:
         qty = p.get("quantity", 0) or 0
         ts = str(p.get("trading_symbol", "")).strip().upper()
@@ -929,6 +933,7 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
             u, opt = extract_symbol_and_opt_type(ts)
             active_items.append({"source": "Active Position", "trading_symbol": ts, "underlying": u, "option_type": opt})
 
+    # 2. Open Regular Orders
     for o in orders:
         st = str(o.get("status", "")).strip().lower()
         ts = str(o.get("trading_symbol", "")).strip().upper()
@@ -939,6 +944,7 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
                 u, opt = extract_symbol_and_opt_type(ts)
                 active_items.append({"source": f"Open Order ({o.get('status', '')})", "trading_symbol": ts, "underlying": u, "option_type": opt})
 
+    # 3. Active GTT Orders
     for g in gtt_orders:
         st = str(g.get("status", "")).strip().lower()
         ts = str(g.get("trading_symbol", "")).strip().upper()
@@ -947,15 +953,64 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
             active_items.append({"source": f"Active GTT ({g.get('status', '')})", "trading_symbol": ts, "underlying": u, "option_type": opt})
 
     active_count = len(active_items)
-    dups = [i for i in active_items if i["underlying"] == str(target_symbol).upper() and i["option_type"] == str(target_opt_type).upper()]
+
+    # Check active items first
+    dups = [i for i in active_items if i["underlying"] == t_sym and i["option_type"] == t_opt]
     if dups:
         m = dups[0]
-        return {"allowed": False, "active_count": active_count, "max_active_trades": max_active_trades, "reason": f"Duplicate Blocked: {target_symbol} {target_opt_type} already active/open ({m['trading_symbol']} - {m['source']})."}
+        return {
+            "allowed": False,
+            "active_count": active_count,
+            "max_active_trades": max_active_trades,
+            "reason": f"Duplicate Blocked: {t_sym} {t_opt} already active/open ({m['trading_symbol']} - {m['source']})."
+        }
+
+    # 4. Check ALL existing orders in today's Upstox Order Book (including executed/complete orders after SL/Target hit)
+    for o in orders:
+        st = str(o.get("status", "")).strip().lower()
+        ts = str(o.get("trading_symbol", "")).strip().upper()
+        txn = str(o.get("transaction_type", "")).strip().upper()
+        if not ts or st in FAILED_ORDER_STATUSES:
+            continue
+        u, opt = extract_symbol_and_opt_type(ts)
+        if u == t_sym and opt == t_opt and (not t_txn or txn == t_txn):
+            return {
+                "allowed": False,
+                "active_count": active_count,
+                "max_active_trades": max_active_trades,
+                "reason": f"Duplicate Blocked: {t_sym} {t_opt} ({txn}) already exists in today's order book ({ts} - {o.get('status', '')})."
+            }
+
+    # 5. Check ALL existing non-failed GTT orders today
+    for g in gtt_orders:
+        st = str(g.get("status", "")).strip().lower()
+        ts = str(g.get("trading_symbol", "")).strip().upper()
+        txn = str(g.get("transaction_type", "")).strip().upper()
+        if not ts or st in FAILED_ORDER_STATUSES:
+            continue
+        u, opt = extract_symbol_and_opt_type(ts)
+        if u == t_sym and opt == t_opt and (not t_txn or txn == t_txn):
+            return {
+                "allowed": False,
+                "active_count": active_count,
+                "max_active_trades": max_active_trades,
+                "reason": f"Duplicate Blocked: {t_sym} {t_opt} ({txn}) already exists in today's GTT orders ({ts} - {g.get('status', '')})."
+            }
 
     if max_active_trades is not None and active_count >= max_active_trades:
-        return {"allowed": False, "active_count": active_count, "max_active_trades": max_active_trades, "reason": f"Active Trade Limit Reached ({active_count}/{max_active_trades} active). Close existing trade/open order first."}
+        return {
+            "allowed": False,
+            "active_count": active_count,
+            "max_active_trades": max_active_trades,
+            "reason": f"Active Trade Limit Reached ({active_count}/{max_active_trades} active). Close existing trade/open order first."
+        }
 
-    return {"allowed": True, "active_count": active_count, "max_active_trades": max_active_trades, "reason": f"Eligible ({active_count}/{max_active_trades} active trades)."}
+    return {
+        "allowed": True,
+        "active_count": active_count,
+        "max_active_trades": max_active_trades,
+        "reason": f"Eligible ({active_count}/{max_active_trades} active trades)."
+    }
 
 # --- GOOGLE SHEET HISTORICAL & SIGNAL DATA LOADER ---
 def parse_timestamp(dt_str):
@@ -2360,7 +2415,15 @@ def api_manual_order_action():
                 return jsonify({"success": False, "message": cfg_err or "Could not read DASHBOARD sheet."})
 
             positions, orders, gtt_orders, _, _, _, _ = fetch_upstox_positions()
-            guard = evaluate_trade_guards(cfg["symbol"], cfg["option_type"], cfg["max_active_trades"], positions, orders, gtt_orders)
+            guard = evaluate_trade_guards(
+                cfg["symbol"],
+                cfg["option_type"],
+                cfg["max_active_trades"],
+                positions,
+                orders,
+                gtt_orders,
+                target_txn_type=cfg["transaction_type"]
+            )
             if not guard["allowed"]:
                 return jsonify({"success": False, "message": guard["reason"]})
 
@@ -2370,7 +2433,7 @@ def api_manual_order_action():
 
             ok, msg, is_ip_err = submit_upstox_evaluated_order(evaluated)
             if ok:
-                state.setdefault("recent_submissions", {})[evaluated["signature"]] = time.time()
+                state.setdefault("recent_submissions", {})[evaluated["duplicate_key"]] = time.time()
                 save_auto_order_state(state)
             return jsonify({"success": ok, "message": msg, "show_static_ip_bar": is_ip_err, "evaluated_order": evaluated})
 
@@ -2459,8 +2522,16 @@ def api_positions():
                 default_target_pct=cfg["target_percent"]
             )
 
-            # --- EXISTING BUY / SELL & ACTIVE TRADE GUARD (B16:B28) ---
-            guard = evaluate_trade_guards(cfg["symbol"], cfg["option_type"], cfg["max_active_trades"], positions, orders, gtt_orders)
+            # --- EXISTING BUY / SELL & FULL ORDER-BOOK DUPLICATE GUARD (B16:B28) ---
+            guard = evaluate_trade_guards(
+                cfg["symbol"],
+                cfg["option_type"],
+                cfg["max_active_trades"],
+                positions,
+                orders,
+                gtt_orders,
+                target_txn_type=cfg["transaction_type"]
+            )
             payload["active_trade_count"] = guard["active_count"]
             payload["guard_blocked"] = not guard["allowed"]
             payload["guard_reason"] = guard["reason"] if not guard["allowed"] else None
@@ -2478,12 +2549,12 @@ def api_positions():
                             if not guard["allowed"]:
                                 payload["status_message"] = f"Skipped: {guard['reason']}"
                             else:
-                                last_sub = state.get("recent_submissions", {}).get(evaluated["signature"], 0)
+                                last_sub = state.get("recent_submissions", {}).get(evaluated["duplicate_key"], 0)
                                 if time.time() - last_sub < 25:
-                                    payload["status_message"] = "Order submitted — waiting for Upstox order book sync..."
+                                    payload["status_message"] = f"Order for {cfg['symbol']} {cfg['option_type']} already submitted — waiting for Upstox order book sync..."
                                 else:
                                     ok, exec_msg, is_ip_err = submit_upstox_evaluated_order(evaluated)
-                                    state.setdefault("recent_submissions", {})[evaluated["signature"]] = time.time()
+                                    state.setdefault("recent_submissions", {})[evaluated["duplicate_key"]] = time.time()
                                     save_auto_order_state(state)
                                     payload["show_static_ip_bar"] = is_ip_err
                                     payload["status_message"] = f"Auto Mode: {exec_msg}"
