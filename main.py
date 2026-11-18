@@ -31,7 +31,7 @@ AUTH_THREAD_LOCK = threading.Lock()
 ORDER_EXECUTION_LOCK = threading.Lock()
 
 IST = timezone(timedelta(hours=5, minutes=30))
-DUPLICATE_COOLDOWN_SECONDS = 3600  # 1-hour gap required before re-entering same Symbol + CE/PE
+DUPLICATE_COOLDOWN_SECONDS = 1800  # 30 Min gap required before re-entering same Symbol + CE/PE
 
 INSTRUMENT_KEYS = {
     "NIFTY": "NSE_INDEX|Nifty 50",
