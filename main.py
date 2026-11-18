@@ -31,7 +31,7 @@ AUTH_THREAD_LOCK = threading.Lock()
 ORDER_EXECUTION_LOCK = threading.Lock()
 
 IST = timezone(timedelta(hours=5, minutes=30))
-DUPLICATE_COOLDOWN_SECONDS = 1800  # 30 Min gap required before re-entering same Symbol + CE/PE
+DUPLICATE_COOLDOWN_SECONDS = 3600  # 1-hour gap required before re-entering same Symbol + CE/PE
 
 INSTRUMENT_KEYS = {
     "NIFTY": "NSE_INDEX|Nifty 50",
@@ -476,7 +476,7 @@ def process_dynamic_sl_and_target(positions, gtt_orders, default_sl_pct=None, de
         save_dynamic_tsl_state(tsl_state)
     return updates_log
 
-# --- EXIT CONDITION (B29 = BE / SE) & 3:20 PM AUTO EXIT (B7 = YES) ---
+# --- EXIT CONDITION (BE -> CE / SE -> PE) & 3:20 PM AUTO EXIT (ONLY WHEN B7 == YES) ---
 def cancel_upstox_regular_order(order_id, headers, proxies):
     try:
         res = requests.delete(
@@ -554,7 +554,7 @@ def exit_position_at_market(pos, headers, proxies):
     except Exception as e:
         return False, f"Market Exit Exception for {ts}: {e}"
 
-def execute_targeted_or_full_exit(positions, orders, gtt_orders, target_underlying=None, only_options=False):
+def execute_targeted_or_full_exit(positions, orders, gtt_orders, target_underlying=None, target_opt_type=None, only_options=False):
     token = get_valid_token()
     if not token:
         return False, "Upstox token unavailable for exit."
@@ -567,16 +567,21 @@ def execute_targeted_or_full_exit(positions, orders, gtt_orders, target_underlyi
     proxies = get_upstox_proxies()
 
     def matches_contract(trading_symbol):
-        if target_underlying is None:
+        if target_underlying is None and target_opt_type is None and not only_options:
             return True
         u, opt = extract_symbol_and_opt_type(trading_symbol)
-        if u != target_underlying.upper():
+        if target_underlying is not None and u != target_underlying.upper():
+            return False
+        if target_opt_type is not None and opt != target_opt_type.upper():
             return False
         if only_options and opt not in ("CE", "PE"):
             return False
         return True
 
-    matching_positions = [p for p in positions if (p.get("quantity", 0) or 0) != 0 and matches_contract(p.get("trading_symbol", ""))]
+    matching_positions = [
+        p for p in positions
+        if (p.get("quantity", 0) or 0) != 0 and matches_contract(p.get("trading_symbol", ""))
+    ]
     matching_open_orders = [
         o for o in orders
         if str(o.get("status", "")).strip().lower() in OPEN_ORDER_STATUSES
@@ -596,18 +601,21 @@ def execute_targeted_or_full_exit(positions, orders, gtt_orders, target_underlyi
     logs = []
     all_ok = True
 
+    # 1. Cancel matching open regular orders first
     for o in matching_open_orders:
         ok, msg = cancel_upstox_regular_order(o["order_id"], headers, proxies)
         logs.append(msg)
         if not ok:
             all_ok = False
 
+    # 2. Cancel matching active GTT orders second
     for g in matching_gtt_orders:
         ok, msg = cancel_upstox_gtt_order(g["gtt_order_id"], headers, proxies)
         logs.append(msg)
         if not ok:
             all_ok = False
 
+    # 3. Exit matching active positions at MARKET price
     for p in matching_positions:
         ok, msg = exit_position_at_market(p, headers, proxies)
         logs.append(msg)
@@ -616,7 +624,7 @@ def execute_targeted_or_full_exit(positions, orders, gtt_orders, target_underlyi
 
     return all_ok, " | ".join(logs)
 
-# --- GOOGLE SHEET DASHBOARD CONFIG (B7, B16:B28, B29) ---
+# --- GOOGLE SHEET DASHBOARD CONFIG (B7, B16:B29) ---
 def fetch_dashboard_order_config():
     sheet_id = SPREADSHEET_ID or "1fpXdodshvwHcduwffOhEK54K-a7a4TmOZF2Q-EgVRzM"
     cb = int(time.time() * 1000)
@@ -626,7 +634,7 @@ def fetch_dashboard_order_config():
         "Pragma": "no-cache"
     }
     urls = [
-        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&headers=0&sheet=DASHBOARD&range=A1:Z32&_cb={cb}",
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&headers=0&sheet=DASHBOARD&range=A1:Z40&_cb={cb}",
         f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&headers=0&sheet=DASHBOARD&_cb={cb}"
     ]
 
@@ -677,7 +685,11 @@ def fetch_dashboard_order_config():
                     return label_values[k]
             return exact_val
 
-        b7_raw = resolve_field(["3_20_pm_exit", "auto_exit_3_20", "exit_at_3_20", "square_off_3_20", "auto_square_off"], 7, prefer_exact_row=True).strip().upper()
+        b7_raw = resolve_field(
+            ["3_20_pm_exit", "auto_exit_3_20", "exit_at_3_20", "square_off_3_20", "auto_square_off", "auto_exit", "exit_enabled", "3_20_exit", "320_pm_exit"],
+            7,
+            prefer_exact_row=True
+        ).strip().upper()
         auto_exit_320 = "YES" if b7_raw in ("YES", "Y", "TRUE", "1") else "NO"
 
         manual_raw = resolve_field(["manual_order"], 16)
@@ -718,7 +730,25 @@ def fetch_dashboard_order_config():
         active_raw = resolve_field(["active_trade", "active_trades", "max_active_trade", "max_active_trades"], 28).replace(",", "").strip()
         max_active_trades = int(float(active_raw)) if active_raw != "" else 1
 
-        exit_cond_raw = resolve_field(["exit_condition", "exit_signal"], 29, prefer_exact_row=True).strip().upper()
+        exit_cond_raw = resolve_field(
+            ["exit_condition", "exit_signal", "exit", "exit_cond", "ce_pe_exit", "signal_exit", "trade_exit", "exit_type", "exit_status", "new_signal", "signal"],
+            29,
+            prefer_exact_row=True
+        ).strip().upper()
+
+        # Failsafe: if BE or SE is placed in any signal/order cell (B16:B35 or B23/B17) or gviz shifted rows, catch it so it NEVER triggers a Buy order
+        if exit_cond_raw not in ("BE", "SE"):
+            for candidate in (txn_raw, opt_raw, want_raw):
+                if candidate in ("BE", "SE"):
+                    exit_cond_raw = candidate
+                    break
+        if exit_cond_raw not in ("BE", "SE"):
+            for r_idx in range(min(len(grid), 40)):
+                if len(grid[r_idx]) >= 2:
+                    b_val = str(grid[r_idx][1]).strip().upper()
+                    if b_val in ("BE", "SE"):
+                        exit_cond_raw = b_val
+                        break
 
         return {
             "auto_exit_320": auto_exit_320,
@@ -949,8 +979,7 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
     """
     Trade & Duplicate Guard:
     1. Always blocks if the same Symbol (NIFTY/BANKNIFTY) + Option Type (CE/PE) is currently open/active.
-    2. If a previous trade on the same Symbol + Option Type hit SL or closed, enforces a 1-hour (3600s) gap
-       from the most recent order on that Symbol + Option Type (regardless of strike price) before allowing a new buy/sell.
+    2. Enforces a 1-hour (3600s) gap from the most recent order on that Symbol + Option Type (any strike).
     3. Enforces max_active_trades (Cell B28).
     """
     gtt_orders = gtt_orders or []
@@ -961,7 +990,6 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
     t_opt = str(target_opt_type or "").strip().upper()
     active_items, open_pos_syms = [], {}
 
-    # 1. Currently Active Open Positions (qty != 0)
     for p in positions:
         qty = p.get("quantity", 0) or 0
         ts = str(p.get("trading_symbol", "")).strip().upper()
@@ -970,7 +998,6 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
             u, opt = extract_symbol_and_opt_type(ts)
             active_items.append({"source": "Active Position", "trading_symbol": ts, "underlying": u, "option_type": opt})
 
-    # 2. Currently Open Regular Orders
     for o in orders:
         st = str(o.get("status", "")).strip().lower()
         ts = str(o.get("trading_symbol", "")).strip().upper()
@@ -981,7 +1008,6 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
                 u, opt = extract_symbol_and_opt_type(ts)
                 active_items.append({"source": f"Open Order ({o.get('status', '')})", "trading_symbol": ts, "underlying": u, "option_type": opt})
 
-    # 3. Currently Active GTT Orders
     for g in gtt_orders:
         st = str(g.get("status", "")).strip().lower()
         ts = str(g.get("trading_symbol", "")).strip().upper()
@@ -991,7 +1017,6 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
 
     active_count = len(active_items)
 
-    # Block immediately if same Symbol + Option Type is currently open/active
     dups = [i for i in active_items if i["underlying"] == t_sym and i["option_type"] == t_opt]
     if dups:
         m = dups[0]
@@ -1002,7 +1027,6 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
             "reason": f"Duplicate Blocked: {t_sym} {t_opt} already active/open ({m['trading_symbol']} - {m['source']})."
         }
 
-    # 4. Enforce 1-Hour (3600s) Cooldown Gap from the latest order on the same Symbol + Option Type (any strike)
     latest_order_ts = 0.0
     latest_order_label = ""
     has_executed_history = False
@@ -1020,7 +1044,6 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
                 latest_order_ts = ots
                 latest_order_label = f"{ts} ({o.get('transaction_type', '')} - {o.get('status', '')})"
 
-    # Also check local submission timestamp (bridges API sync delay or active GTT placement)
     for k, sub_ts in recent_submissions.items():
         parts = str(k).split("|")
         if len(parts) >= 2 and parts[0].upper() == t_sym and parts[1].upper() == t_opt:
@@ -1221,36 +1244,21 @@ def fetch_upstox_positions():
         ord_res = requests.get("https://api.upstox.com/v2/order/retrieve-all", headers=headers, timeout=10)
         orders_raw = ord_res.json().get("data", []) if ord_res.status_code == 200 else []
 
-        gtt_orders = []
-        try:
-            gtt_res = requests.get("https://api.upstox.com/v3/order/gtt", headers=headers, timeout=8)
-            if gtt_res.status_code == 200:
-                for g in (gtt_res.json().get("data", []) or []):
-                    rules = g.get("rules", []) or []
-                    er = next((r for r in rules if str(r.get("strategy", "")).upper() == "ENTRY"), rules[0] if rules else {})
-                    gtt_orders.append({
-                        "gtt_order_id": g.get("gtt_order_id", ""),
-                        "type": g.get("type", "MULTIPLE"),
-                        "instrument_token": g.get("instrument_token", ""),
-                        "trading_symbol": g.get("trading_symbol", ""),
-                        "transaction_type": g.get("transaction_type", ""),
-                        "quantity": g.get("quantity", 0),
-                        "status": er.get("status") or g.get("status", ""),
-                        "raw_rules": rules
-                    })
-        except Exception:
-            pass
-
+        token_to_symbol = {}
         positions, total_pnl, realised_pnl, unrealised_pnl = [], 0.0, 0.0, 0.0
         for p in positions_raw:
             qty = p.get("quantity", 0)
             pnl = p.get("pnl", 0.0) or 0.0
+            ts = p.get("trading_symbol", "")
+            itok = p.get("instrument_token", "")
+            if itok and ts:
+                token_to_symbol[itok] = ts
             total_pnl += pnl
             unrealised_pnl += (p.get("unrealised", 0.0) or 0.0)
             realised_pnl += (p.get("realised", 0.0) or 0.0)
             positions.append({
-                "trading_symbol": p.get("trading_symbol", ""),
-                "instrument_token": p.get("instrument_token", ""),
+                "trading_symbol": ts,
+                "instrument_token": itok,
                 "product": p.get("product", ""),
                 "quantity": qty,
                 "buy_price": round(p.get("buy_price", 0.0) or 0.0, 2),
@@ -1263,16 +1271,44 @@ def fetch_upstox_positions():
                 "status": "OPEN" if qty != 0 else "CLOSED"
             })
 
-        orders = [{
-            "order_id": o.get("order_id", ""),
-            "trading_symbol": o.get("trading_symbol", ""),
-            "transaction_type": o.get("transaction_type", ""),
-            "quantity": o.get("quantity", 0),
-            "price": o.get("price", 0.0),
-            "average_price": o.get("average_price", 0.0),
-            "status": o.get("status", ""),
-            "order_timestamp": o.get("order_timestamp", "")
-        } for o in orders_raw]
+        orders = []
+        for o in orders_raw:
+            ts = o.get("trading_symbol", "")
+            itok = o.get("instrument_token", "")
+            if itok and ts:
+                token_to_symbol[itok] = ts
+            orders.append({
+                "order_id": o.get("order_id", ""),
+                "trading_symbol": ts,
+                "transaction_type": o.get("transaction_type", ""),
+                "quantity": o.get("quantity", 0),
+                "price": o.get("price", 0.0),
+                "average_price": o.get("average_price", 0.0),
+                "status": o.get("status", ""),
+                "order_timestamp": o.get("order_timestamp", "")
+            })
+
+        gtt_orders = []
+        try:
+            gtt_res = requests.get("https://api.upstox.com/v3/order/gtt", headers=headers, timeout=8)
+            if gtt_res.status_code == 200:
+                for g in (gtt_res.json().get("data", []) or []):
+                    rules = g.get("rules", []) or []
+                    er = next((r for r in rules if str(r.get("strategy", "")).upper() == "ENTRY"), rules[0] if rules else {})
+                    itok = g.get("instrument_token", "")
+                    g_ts = g.get("trading_symbol") or token_to_symbol.get(itok, "")
+                    gtt_orders.append({
+                        "gtt_order_id": g.get("gtt_order_id", ""),
+                        "type": g.get("type", "MULTIPLE"),
+                        "instrument_token": itok,
+                        "trading_symbol": g_ts,
+                        "transaction_type": g.get("transaction_type", ""),
+                        "quantity": g.get("quantity", 0),
+                        "status": er.get("status") or g.get("status", ""),
+                        "raw_rules": rules
+                    })
+        except Exception:
+            pass
 
         return positions, orders, gtt_orders, round(total_pnl, 2), round(realised_pnl, 2), round(unrealised_pnl, 2), None
     except Exception as e:
@@ -2159,7 +2195,7 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
 <body>
     <h2>🔐 Private Live Trade & Positions Dashboard</h2>
     <div class="subtitle">
-        <span>Real-time Upstox Portfolio, Automated Google Sheet Order Engine (1-Hr Duplicate Cooldown), Exit Triggers (B29 / 3:20 PM B7) & Dynamic SL/Target</span>
+        <span>Real-time Upstox Portfolio, Automated Google Sheet Order Engine (1-Hr Duplicate Cooldown), Auto-Exit (B7=YES: BE→CE / SE→PE & 3:20 PM) & Dynamic SL/Target</span>
         <span class="timer-badge" id="syncBadge">Auto Sync: <span id="countdown">10</span>s</span>
     </div>
 
@@ -2180,7 +2216,7 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
             <span id="badgeWantToTrade" class="badge-pill">Want to Trade (B17): -</span>
             <span id="badgeActiveTrades" class="badge-pill badge-active-ok">Active Trades (B28): -</span>
             <span id="badgeExitCond" class="badge-pill">Exit Cond (B29): -</span>
-            <span id="badgeAutoExit320" class="badge-pill">3:20 PM Exit (B7): -</span>
+            <span id="badgeAutoExit320" class="badge-pill">Auto Exit (B7): -</span>
             <span id="badgeSheetSyncTime" style="color: #64748b; font-size: 12px;">Sync: -</span>
         </div>
         <div style="display: flex; align-items: center; gap: 10px;">
@@ -2310,7 +2346,7 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
 
             const auto320 = st.auto_exit_320 || "NO";
             const b7Badge = document.getElementById("badgeAutoExit320");
-            b7Badge.innerText = `3:20 PM Exit (B7): ${auto320}`;
+            b7Badge.innerText = `Auto Exit (B7): ${auto320}`;
             b7Badge.className = "badge-pill " + (auto320 === "YES" ? "badge-active-ok" : "");
 
             if (st.sheet_synced_at) document.getElementById("badgeSheetSyncTime").innerText = `Sync: ${st.sheet_synced_at}`;
@@ -2462,6 +2498,9 @@ def api_manual_order_action():
             if cfg_err or not cfg:
                 return jsonify({"success": False, "message": cfg_err or "Could not read DASHBOARD sheet."})
 
+            if cfg["exit_condition"] in ("BE", "SE"):
+                return jsonify({"success": False, "message": f"Blocked: Exit Condition '{cfg['exit_condition']}' is active in DASHBOARD."})
+
             positions, orders, gtt_orders, _, _, _, _ = fetch_upstox_positions()
             guard = evaluate_trade_guards(
                 cfg["symbol"],
@@ -2530,37 +2569,52 @@ def api_positions():
             payload["exit_condition"] = cfg["exit_condition"] or "NONE"
             payload["auto_exit_320"] = cfg["auto_exit_320"]
 
-            # --- CONDITION 4: 3:20 PM IST FULL POSITION EXIT (ONLY IF CELL B7 == "YES") ---
+            b7_enabled = (cfg["auto_exit_320"] == "YES")
             is_after_320_pm = (now_ist.hour > 15) or (now_ist.hour == 15 and now_ist.minute >= 20)
             block_new_entries = False
 
-            if is_after_320_pm and cfg["auto_exit_320"] == "YES":
+            # --- CONDITION 4: 3:20 PM IST FULL POSITION & ORDER EXIT (ONLY IF CELL B7 == "YES") ---
+            if is_after_320_pm and b7_enabled:
                 block_new_entries = True
                 if time.time() - cooldowns.get("320_PM_EXIT", 0) >= 15:
-                    ex_ok, ex_msg = execute_targeted_or_full_exit(positions, orders, gtt_orders, target_underlying=None, only_options=False)
+                    ex_ok, ex_msg = execute_targeted_or_full_exit(
+                        positions, orders, gtt_orders,
+                        target_underlying=None, target_opt_type=None, only_options=False
+                    )
                     if ex_msg:
                         cooldowns["320_PM_EXIT"] = time.time()
                         save_auto_order_state(state)
                         payload["exit_execution_notice"] = f"⏰ 3:20 PM AUTO EXIT (B7=YES): {ex_msg}"
                         payload["exit_execution_ok"] = bool(ex_ok)
                         positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, _ = fetch_upstox_positions()
-                payload["status_message"] = "3:20 PM IST Square-Off Active (B7=YES) — All active positions exited."
+                payload["status_message"] = "3:20 PM IST Square-Off Active (B7=YES) — All active positions & open orders exited."
 
-            # --- CONDITION 3: CELL B29 EXIT CONDITION (BE / SE) FOR B19 (NIFTY / BANKNIFTY) ---
+            # --- CONDITION 3: EXIT CONDITION BE -> CE / SE -> PE (ONLY EXECUTES EXIT IF CELL B7 == "YES") ---
             exit_cond = cfg["exit_condition"]
-            if exit_cond in ("BE", "SE") and cfg["symbol"] in ("NIFTY", "BANKNIFTY"):
+            if exit_cond in ("BE", "SE"):
+                # Never place a new entry order when signal is BE or SE
                 block_new_entries = True
-                cd_key = f"EXIT_B29_{cfg['symbol']}_{exit_cond}"
-                if time.time() - cooldowns.get(cd_key, 0) >= 15:
-                    ex_ok, ex_msg = execute_targeted_or_full_exit(positions, orders, gtt_orders, target_underlying=cfg["symbol"], only_options=True)
-                    if ex_msg:
-                        cooldowns[cd_key] = time.time()
-                        save_auto_order_state(state)
-                        payload["exit_execution_notice"] = f"🚪 EXIT CONDITION ({exit_cond} on {cfg['symbol']}): {ex_msg}"
-                        payload["exit_execution_ok"] = bool(ex_ok)
-                        positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, _ = fetch_upstox_positions()
-                if not payload["exit_execution_notice"]:
-                    payload["status_message"] = f"Exit Condition {exit_cond} active on {cfg['symbol']} (B29) — Monitoring/Flat."
+                target_opt = "CE" if exit_cond == "BE" else "PE"
+
+                if b7_enabled:
+                    cd_key = f"EXIT_{cfg['symbol']}_{exit_cond}_{target_opt}"
+                    if time.time() - cooldowns.get(cd_key, 0) >= 15:
+                        ex_ok, ex_msg = execute_targeted_or_full_exit(
+                            positions, orders, gtt_orders,
+                            target_underlying=cfg["symbol"],
+                            target_opt_type=target_opt,
+                            only_options=True
+                        )
+                        if ex_msg:
+                            cooldowns[cd_key] = time.time()
+                            save_auto_order_state(state)
+                            payload["exit_execution_notice"] = f"🚪 EXIT CONDITION ({exit_cond} → {cfg['symbol']} {target_opt} @ MARKET): {ex_msg}"
+                            payload["exit_execution_ok"] = bool(ex_ok)
+                            positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, _ = fetch_upstox_positions()
+                    if not payload["exit_execution_notice"]:
+                        payload["status_message"] = f"Exit Condition {exit_cond} ({cfg['symbol']} {target_opt}) active (B7=YES) — Open {target_opt} orders & positions exited."
+                else:
+                    payload["status_message"] = f"Exit Signal {exit_cond} ({cfg['symbol']} {target_opt}) detected, but B7 is '{cfg['auto_exit_320']}' — Auto-Exit avoided & new Buy blocked."
 
             # --- DYNAMIC TRAILING SL & TARGET ON REMAINING OPEN POSITIONS ---
             payload["tsl_updates"] = process_dynamic_sl_and_target(
