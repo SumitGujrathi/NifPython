@@ -335,7 +335,7 @@ def compute_dynamic_sl_target(side, entry_price, current_ltp, prev_best_price, s
 
     return {"best_price": round(best_price, 2), "favorable_move": round(fav, 2), "new_sl": new_sl, "new_target": new_target}
 
-def modify_upstox_gtt_sl_target(gtt_order, new_sl, new_target):
+def modify_upstox_gtt_sl_target(gtt_order, new_sl, new_target, new_entry=None, new_qty=None):
     token = get_valid_token()
     if not token:
         return False, "Upstox token unavailable."
@@ -345,34 +345,86 @@ def modify_upstox_gtt_sl_target(gtt_order, new_sl, new_target):
     if not gtt_order_id or not entry_rule:
         return False, "Missing GTT ID or ENTRY rule."
 
-    updated_rules = [{"strategy": "ENTRY", "trigger_type": entry_rule.get("trigger_type", "IMMEDIATE"), "trigger_price": float(entry_rule.get("trigger_price", 0.05))}]
+    entry_trigger = float(new_entry) if (new_entry is not None and float(new_entry) > 0) else float(entry_rule.get("trigger_price", 0.05))
+    qty_val = int(new_qty) if (new_qty is not None and int(new_qty) > 0) else int(gtt_order.get("quantity", 1))
+
+    updated_rules = [{"strategy": "ENTRY", "trigger_type": entry_rule.get("trigger_type", "IMMEDIATE"), "trigger_price": entry_trigger}]
     existing_tgt = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "TARGET"), None)
-    if new_target is not None:
+    if new_target is not None and float(new_target) > 0:
         updated_rules.append({"strategy": "TARGET", "trigger_type": "IMMEDIATE", "trigger_price": float(new_target)})
-    elif existing_tgt:
+    elif existing_tgt and new_target is None:
         updated_rules.append({"strategy": "TARGET", "trigger_type": existing_tgt.get("trigger_type", "IMMEDIATE"), "trigger_price": float(existing_tgt.get("trigger_price", 0.05))})
 
     existing_sl = next((r for r in raw_rules if str(r.get("strategy", "")).upper() == "STOPLOSS"), None)
-    if new_sl is not None:
+    if new_sl is not None and float(new_sl) > 0:
         updated_rules.append({"strategy": "STOPLOSS", "trigger_type": "IMMEDIATE", "trigger_price": float(new_sl)})
-    elif existing_sl:
+    elif existing_sl and new_sl is None:
         updated_rules.append({"strategy": "STOPLOSS", "trigger_type": existing_sl.get("trigger_type", "IMMEDIATE"), "trigger_price": float(existing_sl.get("trigger_price", 0.05))})
 
     try:
         res = HTTP_SESSION.put(
             "https://api.upstox.com/v3/order/gtt/modify",
-            json={"type": gtt_order.get("type", "MULTIPLE"), "quantity": int(gtt_order.get("quantity", 1)), "gtt_order_id": gtt_order_id, "rules": updated_rules},
+            json={"type": gtt_order.get("type", "MULTIPLE"), "quantity": qty_val, "gtt_order_id": gtt_order_id, "rules": updated_rules},
             headers={"Accept": "application/json", "Content-Type": "application/json", "Authorization": f"Bearer {token}"},
             proxies=get_upstox_proxies(),
             timeout=8
         )
         rj = res.json() if res.content else {}
         if res.status_code == 200 and rj.get("status") == "success":
-            return True, f"Updated {gtt_order_id} -> SL: {new_sl or 'N/A'} | Target: {new_target or 'N/A'}"
+            return True, f"Updated GTT {gtt_order_id} -> Qty: {qty_val} | Entry: {entry_trigger} | SL: {new_sl or 'N/A'} | Target: {new_target or 'N/A'}"
         err = rj.get("errors", [{}])[0].get("message") if isinstance(rj.get("errors"), list) and rj.get("errors") else res.text
         return False, f"GTT Modify Rejected ({res.status_code}): {err}"
     except Exception as e:
         return False, f"GTT Modify Exception: {e}"
+
+def modify_upstox_regular_order(order_id, quantity, price, trigger_price=0.0, order_type="LIMIT", validity="DAY", disclosed_quantity=0):
+    token = get_valid_token()
+    if not token:
+        return False, "Upstox token unavailable."
+    clean_oid = str(order_id or "").strip()
+    if not clean_oid:
+        return False, "Order ID is required."
+
+    clean_type = str(order_type or "LIMIT").strip().upper()
+    if clean_type not in ("LIMIT", "MARKET", "SL", "SL-M"):
+        clean_type = "LIMIT"
+
+    qty_val = int(quantity)
+    if qty_val <= 0:
+        return False, "Quantity must be greater than 0."
+
+    price_val = 0.0 if clean_type in ("MARKET", "SL-M") else round_tick(float(price or 0))
+    trig_val = round_tick(float(trigger_price or 0)) if clean_type in ("SL", "SL-M") else 0.0
+
+    if clean_type in ("LIMIT", "SL") and price_val <= 0:
+        return False, f"Limit price must be > 0 for {clean_type} orders."
+    if clean_type in ("SL", "SL-M") and trig_val <= 0:
+        return False, f"Trigger price must be > 0 for {clean_type} orders."
+
+    payload = {
+        "quantity": qty_val,
+        "validity": str(validity or "DAY").strip().upper() or "DAY",
+        "price": price_val,
+        "order_id": clean_oid,
+        "order_type": clean_type,
+        "disclosed_quantity": int(disclosed_quantity or 0),
+        "trigger_price": trig_val
+    }
+    try:
+        res = HTTP_SESSION.put(
+            "https://api-hft.upstox.com/v3/order/modify",
+            json=payload,
+            headers={"Accept": "application/json", "Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+            proxies=get_upstox_proxies(),
+            timeout=8
+        )
+        rj = res.json() if res.content else {}
+        if res.status_code == 200 and rj.get("status") == "success":
+            return True, f"Order {clean_oid} Modified -> {clean_type} | Qty: {qty_val} | Price: ₹{price_val} | Trigger: ₹{trig_val}"
+        err = rj.get("errors", [{}])[0].get("message") if isinstance(rj.get("errors"), list) and rj.get("errors") else res.text
+        return False, f"Order Modify Rejected ({res.status_code}): {err}"
+    except Exception as e:
+        return False, f"Order Modify Exception: {e}"
 
 def process_dynamic_sl_and_target(positions, gtt_orders, default_sl_pct=None, default_target_pct=None):
     tsl_state = load_dynamic_tsl_state()
@@ -498,7 +550,7 @@ def process_dynamic_sl_and_target(positions, gtt_orders, default_sl_pct=None, de
         save_dynamic_tsl_state(tsl_state)
     return updates_log
 
-# --- EXIT CONDITION (BE -> CE / SE -> PE) & 3:20 PM AUTO EXIT (ONLY WHEN B7 == YES) ---
+# --- EXIT CONDITION (B7 -> B29 BE/SE) & 3:20 PM AUTO EXIT (B8 == YES) ---
 def cancel_upstox_regular_order(order_id, headers, proxies):
     try:
         res = HTTP_SESSION.delete(
@@ -623,7 +675,6 @@ def execute_targeted_or_full_exit(positions, orders, gtt_orders, target_underlyi
     logs = []
     all_ok = True
 
-    # Cancel open orders & GTTs concurrently for instant release of margin
     cancel_tasks = []
     with ThreadPoolExecutor(max_workers=6) as ex:
         for o in matching_open_orders:
@@ -636,7 +687,6 @@ def execute_targeted_or_full_exit(positions, orders, gtt_orders, target_underlyi
             if not ok:
                 all_ok = False
 
-    # Exit matching active positions at MARKET price concurrently
     if matching_positions:
         with ThreadPoolExecutor(max_workers=4) as ex:
             exit_futs = [ex.submit(exit_position_at_market, p, headers, proxies) for p in matching_positions]
@@ -648,7 +698,7 @@ def execute_targeted_or_full_exit(positions, orders, gtt_orders, target_underlyi
 
     return all_ok, " | ".join(logs)
 
-# --- GOOGLE SHEET DASHBOARD CONFIG (B7, B16:B29) WITH FAST MICRO-CACHE & FALLBACK ---
+# --- GOOGLE SHEET DASHBOARD CONFIG (B7, B8, B16:B29) ---
 def fetch_dashboard_order_config(force_fresh=False):
     now = time.time()
     with CACHE_LOCK:
@@ -663,7 +713,6 @@ def fetch_dashboard_order_config(force_fresh=False):
         "Cache-Control": "no-cache, no-store, must-revalidate",
         "Pragma": "no-cache"
     }
-    # Narrow range A1:D35 makes Google Sheets gviz respond ~3x faster than A1:Z40
     url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&headers=0&sheet=DASHBOARD&range=A1:D35&_cb={cb}"
 
     raw_csv, last_err = None, None
@@ -685,7 +734,6 @@ def fetch_dashboard_order_config(force_fresh=False):
 
     if not raw_csv:
         LAST_DIAGNOSTICS["gsheet_status"] = f"WARN ({last_err})"
-        # Stale-while-error fallback: use last valid config if < 30s old so a brief Google blip doesn't stall trading
         with CACHE_LOCK:
             if DASHBOARD_CFG_CACHE["cfg"] is not None and (now - DASHBOARD_CFG_CACHE["ts"]) < 30.0:
                 return dict(DASHBOARD_CFG_CACHE["cfg"]), None
@@ -718,12 +766,21 @@ def fetch_dashboard_order_config(force_fresh=False):
                     return label_values[k]
             return exact_val
 
+        # Cell B7 -> Controls B29 (BE / SE) Signal Exit
         b7_raw = resolve_field(
-            ["3_20_pm_exit", "auto_exit_3_20", "exit_at_3_20", "square_off_3_20", "auto_square_off", "auto_exit", "exit_enabled", "3_20_exit", "320_pm_exit"],
+            ["signal_exit", "be_se_exit", "exit_on_signal", "auto_exit_signal", "exit_signal_enabled"],
             7,
             prefer_exact_row=True
         ).strip().upper()
-        auto_exit_320 = "YES" if b7_raw in ("YES", "Y", "TRUE", "1") else "NO"
+        signal_exit_b7 = "YES" if b7_raw in ("YES", "Y", "TRUE", "1") else "NO"
+
+        # Cell B8 -> Controls 3:20 PM IST Full Exit
+        b8_raw = resolve_field(
+            ["3_20_pm_exit", "auto_exit_3_20", "exit_at_3_20", "square_off_3_20", "auto_square_off", "3_20_exit", "320_pm_exit"],
+            8,
+            prefer_exact_row=True
+        ).strip().upper()
+        auto_exit_320_b8 = "YES" if b8_raw in ("YES", "Y", "TRUE", "1") else "NO"
 
         manual_raw = resolve_field(["manual_order"], 16)
         manual_mode = "Auto" if manual_raw.strip().lower() == "auto" else "Manual"
@@ -783,7 +840,8 @@ def fetch_dashboard_order_config(force_fresh=False):
                         break
 
         cfg = {
-            "auto_exit_320": auto_exit_320,
+            "signal_exit_b7": signal_exit_b7,
+            "auto_exit_320_b8": auto_exit_320_b8,
             "manual_order": manual_mode,
             "manual_order_raw": manual_raw or manual_mode,
             "want_to_trade": want_to_trade,
@@ -1380,14 +1438,22 @@ def fetch_upstox_positions():
             itok = o.get("instrument_token", "")
             if itok and ts:
                 token_to_symbol[itok] = ts
+            st_raw = str(o.get("status", "")).strip()
             orders.append({
                 "order_id": o.get("order_id", ""),
                 "trading_symbol": ts,
+                "instrument_token": itok,
                 "transaction_type": o.get("transaction_type", ""),
+                "order_type": o.get("order_type", "LIMIT"),
+                "product": o.get("product", "I"),
+                "validity": o.get("validity", "DAY"),
                 "quantity": o.get("quantity", 0),
+                "disclosed_quantity": o.get("disclosed_quantity", 0),
                 "price": o.get("price", 0.0),
+                "trigger_price": o.get("trigger_price", 0.0),
                 "average_price": o.get("average_price", 0.0),
-                "status": o.get("status", ""),
+                "status": st_raw,
+                "is_open": st_raw.lower() in OPEN_ORDER_STATUSES,
                 "order_timestamp": o.get("order_timestamp", "")
             })
 
@@ -1395,16 +1461,24 @@ def fetch_upstox_positions():
         for g in gtt_raw:
             rules = g.get("rules", []) or []
             er = next((r for r in rules if str(r.get("strategy", "")).upper() == "ENTRY"), rules[0] if rules else {})
+            tr = next((r for r in rules if str(r.get("strategy", "")).upper() == "TARGET"), None)
+            sr = next((r for r in rules if str(r.get("strategy", "")).upper() == "STOPLOSS"), None)
             itok = g.get("instrument_token", "")
             g_ts = g.get("trading_symbol") or token_to_symbol.get(itok, "")
+            g_status = str(er.get("status") or g.get("status", "")).strip()
             gtt_orders.append({
                 "gtt_order_id": g.get("gtt_order_id", ""),
                 "type": g.get("type", "MULTIPLE"),
                 "instrument_token": itok,
                 "trading_symbol": g_ts,
                 "transaction_type": g.get("transaction_type", ""),
+                "product": g.get("product", "I"),
                 "quantity": g.get("quantity", 0),
-                "status": er.get("status") or g.get("status", ""),
+                "entry_price": er.get("trigger_price", 0.0) if er else 0.0,
+                "target_price": tr.get("trigger_price", None) if tr else None,
+                "sl_price": sr.get("trigger_price", None) if sr else None,
+                "status": g_status,
+                "is_open": g_status.lower() in OPEN_ORDER_STATUSES,
                 "raw_rules": rules
             })
 
@@ -1627,7 +1701,7 @@ MAIN_HTML_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>"""
 
-# --- ANALYSIS DASHBOARD TEMPLATE ---
+# --- ANALYSIS DASHBOARD TEMPLATE (TIME-ONLY HOVER TOOLTIP & VERTICAL CROSSHAIR) ---
 ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
@@ -1659,7 +1733,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
     <h2>📊 {{ symbol }} Advanced Analytics & Google Sheet Memory Dashboard</h2>
-    <div class="subtitle">Live background auto-sync — Real-time Google Sheet snapshots & strike positioning</div>
+    <div class="subtitle">Live background auto-sync — Hover over any chart line to inspect exact timestamp</div>
 
     <div class="nav-bar">
         <label style="color: #94a3b8; font-weight: bold;">Symbol:</label>
@@ -1782,8 +1856,58 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 
         const DATE_PALETTE = ['#38bdf8', '#facc15', '#4ade80', '#f472b6', '#a78bfa', '#fb923c', '#2dd4bf'];
 
+        // Vertical Hover Crosshair Plugin (draws clean vertical line at hovered X position)
+        const hoverCrosshairPlugin = {
+            id: 'hoverCrosshairPlugin',
+            afterDatasetsDraw: (chart) => {
+                const active = chart.tooltip && chart.tooltip.getActiveElements ? chart.tooltip.getActiveElements() : [];
+                if (!active || active.length === 0) return;
+                const { ctx, chartArea } = chart;
+                if (!chartArea) return;
+                const x = active[0].element.x;
+                ctx.save();
+                ctx.beginPath();
+                ctx.moveTo(x, chartArea.top);
+                ctx.lineTo(x, chartArea.bottom);
+                ctx.lineWidth = 1.5;
+                ctx.strokeStyle = 'rgba(248, 250, 252, 0.55)';
+                ctx.setLineDash([4, 4]);
+                ctx.stroke();
+                ctx.restore();
+            }
+        };
+
+        // Shared Time-Only Tooltip Config (shows ONLY the time/X-axis label, hiding all metric values)
+        function buildTimeOnlyTooltipConfig(prefixLabel) {
+            return {
+                enabled: true,
+                mode: 'index',
+                intersect: false,
+                displayColors: false,
+                backgroundColor: 'rgba(15, 23, 42, 0.94)',
+                borderColor: '#38bdf8',
+                borderWidth: 1,
+                titleColor: '#38bdf8',
+                titleFont: { size: 13, weight: 'bold', family: 'Segoe UI' },
+                titleMarginBottom: 0,
+                padding: { top: 7, bottom: 7, left: 11, right: 11 },
+                callbacks: {
+                    title: (items) => {
+                        if (!items || !items.length) return '';
+                        const idx = items[0].dataIndex;
+                        const chart = items[0].chart;
+                        if (chart._hoverTimes && chart._hoverTimes[idx]) {
+                            return `${prefixLabel}: ${chart._hoverTimes[idx]}`;
+                        }
+                        return `${prefixLabel}: ${items[0].label || ''}`;
+                    },
+                    label: () => null
+                }
+            };
+        }
+
         function buildDateMeta(snapshots) {
-            const dates = [], colors = [], groups = [];
+            const dates = [], colors = [], groups = [], hoverTimes = [];
             const dateColorMap = {};
             let paletteIdx = 0;
 
@@ -1792,6 +1916,9 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                 if (!dStr && s.datetime && String(s.datetime).includes(" ")) {
                     dStr = String(s.datetime).split(" ")[0].trim();
                 }
+                const tStr = (s.formatted_time || s.datetime || "").trim();
+                hoverTimes.push(dStr && dStr !== "Session" ? `${tStr} (${dStr})` : tStr);
+
                 if (!dStr) dStr = "Session";
                 if (!(dStr in dateColorMap)) {
                     dateColorMap[dStr] = DATE_PALETTE[paletteIdx % DATE_PALETTE.length];
@@ -1806,7 +1933,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     groups[groups.length - 1].end = i;
                 }
             });
-            return { dates, colors, groups };
+            return { dates, colors, groups, hoverTimes };
         }
 
         const dateBandPlugin = {
@@ -1951,9 +2078,8 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     responsive: true,
                     maintainAspectRatio: false,
                     animation: false,
-                    interaction: { mode: null },
-                    hover: { mode: null },
-                    events: ['click'],
+                    interaction: { mode: 'index', intersect: false },
+                    hover: { mode: 'index', intersect: false },
                     scales: {
                         x: {
                             ticks: {
@@ -1966,10 +2092,10 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     },
                     plugins: {
                         legend: { labels: { color: '#f8fafc', font: { size: 13 } } },
-                        tooltip: { enabled: false }
+                        tooltip: buildTimeOnlyTooltipConfig('Time')
                     }
                 },
-                plugins: [dateBandPlugin, zeroLinePlugin, signalLabelPlugin]
+                plugins: [dateBandPlugin, zeroLinePlugin, signalLabelPlugin, hoverCrosshairPlugin]
             });
             loadSignalChart(true);
         }
@@ -1984,6 +2110,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                         if (isManualChange || !hasSignalData) {
                             signalChartObj._dateColors = [];
                             signalChartObj._dateGroups = [];
+                            signalChartObj._hoverTimes = [];
                             signalChartObj.data.labels = [data.error || "No data found for Main Signal."];
                             signalChartObj.data.datasets = [{ label: 'Status', data: [0], borderColor: '#ef4444' }];
                             signalChartObj.update('none');
@@ -1995,14 +2122,15 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     const meta = buildDateMeta(snapshots);
                     signalChartObj._dateColors = meta.colors;
                     signalChartObj._dateGroups = meta.groups;
+                    signalChartObj._hoverTimes = meta.hoverTimes;
 
                     const times = snapshots.map(s => s.formatted_time || s.datetime);
                     signalChartObj.data.labels = times;
                     signalChartObj.data.datasets = [
-                        { label: 'Min ROC (Buy)', data: snapshots.map(s => s.min_roc || 0), borderColor: '#22c55e', borderWidth: 2, pointRadius: 0, pointHoverRadius: 0, tension: 0.2 },
-                        { label: 'Max ROC (Sell)', data: snapshots.map(s => s.max_roc || 0), borderColor: '#ef4444', borderWidth: 2, pointRadius: 0, pointHoverRadius: 0, tension: 0.2 },
-                        { label: 'Cross ROC Sig', data: snapshots.map(s => s.cross_roc || 0), borderColor: '#facc15', borderWidth: 2, pointRadius: 0, pointHoverRadius: 0, tension: 0.2 },
-                        { label: 'Main Volatility', data: snapshots.map(s => s.main_volatility || 0), signalLabels: snapshots.map(s => s.new_signal || ""), borderColor: '#38bdf8', borderWidth: 3, pointRadius: 3, pointHoverRadius: 0, tension: 0.2 }
+                        { label: 'Min ROC (Buy)', data: snapshots.map(s => s.min_roc || 0), borderColor: '#22c55e', borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: 0.2 },
+                        { label: 'Max ROC (Sell)', data: snapshots.map(s => s.max_roc || 0), borderColor: '#ef4444', borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: 0.2 },
+                        { label: 'Cross ROC Sig', data: snapshots.map(s => s.cross_roc || 0), borderColor: '#facc15', borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: 0.2 },
+                        { label: 'Main Volatility', data: snapshots.map(s => s.main_volatility || 0), signalLabels: snapshots.map(s => s.new_signal || ""), borderColor: '#38bdf8', borderWidth: 3, pointRadius: 3, pointHoverRadius: 4, tension: 0.2 }
                     ];
                     signalChartObj.update('none');
                 })
@@ -2018,6 +2146,8 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     responsive: true,
                     maintainAspectRatio: false,
                     animation: false,
+                    interaction: { mode: 'index', intersect: false },
+                    hover: { mode: 'index', intersect: false },
                     scales: {
                         x: {
                             ticks: {
@@ -2031,10 +2161,10 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     },
                     plugins: {
                         legend: { labels: { color: '#f8fafc', font: { size: 13 } } },
-                        tooltip: { mode: 'index', intersect: false }
+                        tooltip: buildTimeOnlyTooltipConfig('Time')
                     }
                 },
-                plugins: [dateBandPlugin]
+                plugins: [dateBandPlugin, hoverCrosshairPlugin]
             });
             loadHistoricalChart(true);
         }
@@ -2051,6 +2181,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                         if (isManualChange || !hasHistoryData) {
                             historyChartObj._dateColors = [];
                             historyChartObj._dateGroups = [];
+                            historyChartObj._hoverTimes = [];
                             historyChartObj.data.labels = [data.error || "No data found in Google Sheet."];
                             historyChartObj.data.datasets = [{ label: 'Status', data: [0], borderColor: '#ef4444' }];
                             historyChartObj.update('none');
@@ -2062,6 +2193,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     const meta = buildDateMeta(snapshots);
                     historyChartObj._dateColors = meta.colors;
                     historyChartObj._dateGroups = meta.groups;
+                    historyChartObj._hoverTimes = meta.hoverTimes;
 
                     const times = snapshots.map(s => s.formatted_time || s.datetime);
                     let datasets = [];
@@ -2175,13 +2307,18 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     responsive: true,
                     maintainAspectRatio: false,
                     animation: false,
+                    interaction: { mode: 'index', intersect: false },
+                    hover: { mode: 'index', intersect: false },
                     scales: {
                         x: { ticks: { color: '#94a3b8', font: { weight: 'bold' } }, grid: { color: '#334155' } },
                         y: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } }
                     },
-                    plugins: { legend: { labels: { color: '#f8fafc', font: { size: 13 } } }, tooltip: { mode: 'index', intersect: false } }
+                    plugins: {
+                        legend: { labels: { color: '#f8fafc', font: { size: 13 } } },
+                        tooltip: buildTimeOnlyTooltipConfig('Strike')
+                    }
                 },
-                plugins: [spotLinePlugin]
+                plugins: [spotLinePlugin, hoverCrosshairPlugin]
             });
         }
 
@@ -2250,7 +2387,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>"""
 
-# --- LIVE TRADE & POSITION DASHBOARD TEMPLATE (3-SECOND FAST POLLING + LATENCY MONITOR) ---
+# --- LIVE TRADE & POSITION DASHBOARD TEMPLATE (B7/B8 SPLIT + EDIT OPEN ORDERS & GTT MODAL) ---
 POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
@@ -2282,6 +2419,10 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
         .btn-place-order:disabled { opacity: 0.45; cursor: not-allowed; background-color: #475569; color: #94a3b8; }
         .btn-cancel-order { background-color: #ef4444; color: #ffffff; border: none; padding: 10px 20px; border-radius: 8px; font-weight: 700; font-size: 13px; cursor: pointer; }
         .btn-reset-preview { background-color: #334155; color: #e2e8f0; border: 1px solid #475569; padding: 5px 12px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; }
+        .btn-sm-edit { background-color: #2563eb; color: #ffffff; border: none; padding: 4px 10px; border-radius: 5px; font-size: 11px; font-weight: 700; cursor: pointer; margin-right: 4px; }
+        .btn-sm-edit:hover { background-color: #1d4ed8; }
+        .btn-sm-cancel { background-color: #dc2626; color: #ffffff; border: none; padding: 4px 10px; border-radius: 5px; font-size: 11px; font-weight: 700; cursor: pointer; }
+        .btn-sm-cancel:hover { background-color: #b91c1c; }
         .toast-banner { padding: 12px 16px; border-radius: 8px; margin-bottom: 18px; font-weight: 600; font-size: 13px; display: none; }
         .toast-success { background: #064e3b; color: #6ee7b7; border: 1px solid #10b981; }
         .toast-error { background: #450a0a; color: #fca5a5; border: 1px solid #ef4444; }
@@ -2301,12 +2442,24 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
         .status-open { background-color: #065f46; color: #34d399; padding: 3px 8px; border-radius: 12px; font-weight: bold; font-size: 11px; }
         .status-closed { background-color: #334155; color: #94a3b8; padding: 3px 8px; border-radius: 12px; font-weight: bold; font-size: 11px; }
         .error-msg { color: #f87171; font-weight: bold; padding: 15px; background: #450a0a; border-radius: 8px; margin-bottom: 20px; }
+
+        /* Edit Order Modal */
+        .modal-backdrop { position: fixed; inset: 0; background: rgba(2, 6, 23, 0.82); display: none; align-items: center; justify-content: center; z-index: 9999; }
+        .modal-card { background: #1e293b; border: 2px solid #38bdf8; border-radius: 12px; padding: 22px 26px; width: 420px; max-width: 92vw; box-shadow: 0 20px 35px rgba(0,0,0,0.6); }
+        .modal-title { font-size: 17px; font-weight: 800; color: #38bdf8; margin-bottom: 4px; }
+        .modal-sub { font-size: 12px; color: #94a3b8; margin-bottom: 16px; }
+        .modal-row { margin-bottom: 12px; }
+        .modal-row label { display: block; font-size: 12px; color: #cbd5e1; font-weight: 600; margin-bottom: 4px; }
+        .modal-row input, .modal-row select { width: 100%; box-sizing: border-box; padding: 9px 12px; background: #0f172a; border: 1px solid #475569; border-radius: 6px; color: #f8fafc; font-size: 14px; font-weight: 600; }
+        .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+        .btn-modal-save { background: #22c55e; color: #052e16; border: none; padding: 9px 18px; border-radius: 6px; font-weight: 800; font-size: 13px; cursor: pointer; }
+        .btn-modal-close { background: #475569; color: #f8fafc; border: none; padding: 9px 16px; border-radius: 6px; font-weight: 700; font-size: 13px; cursor: pointer; }
     </style>
 </head>
 <body>
     <h2>🔐 Private Live Trade & Positions Dashboard</h2>
     <div class="subtitle">
-        <span>High-Speed Parallel Upstox Engine (3s Signal Sync, 1-Hr Cooldown, B7=YES Auto-Exit & Dynamic SL/Target)</span>
+        <span>High-Speed Parallel Upstox Engine (B7 Signal Exit, B8 3:20 PM Exit, Edit Open Orders & Dynamic SL/Target)</span>
         <div style="display: flex; align-items: center; gap: 8px;">
             <span class="latency-badge" id="latencyBadge">Upstox: -ms | Sheet: -ms</span>
             <span class="timer-badge" id="syncBadge">Fast Sync: <span id="countdown">3</span>s</span>
@@ -2330,7 +2483,8 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
             <span id="badgeWantToTrade" class="badge-pill">Want to Trade (B17): -</span>
             <span id="badgeActiveTrades" class="badge-pill badge-active-ok">Active Trades (B28): -</span>
             <span id="badgeExitCond" class="badge-pill">Exit Cond (B29): -</span>
-            <span id="badgeAutoExit320" class="badge-pill">Auto Exit (B7): -</span>
+            <span id="badgeSignalExitB7" class="badge-pill">Signal Exit (B7): -</span>
+            <span id="badgeAutoExitB8" class="badge-pill">3:20 Exit (B8): -</span>
             <span id="badgeSheetSyncTime" style="color: #64748b; font-size: 12px;">Sync: -</span>
         </div>
         <div style="display: flex; align-items: center; gap: 10px;">
@@ -2383,19 +2537,94 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
         </table>
     </div>
 
-    <div class="section-title">📋 Today's Executed Trades & Orders Log</div>
+    <div class="section-title">🎯 Active & Today's GTT Orders (Edit SL / Target / Entry)</div>
     <div class="table-container">
         <table>
             <thead>
-                <tr><th>Order Time</th><th>Trading Symbol</th><th>Type</th><th>Qty</th><th>Executed Price</th><th>Status</th><th>Order ID</th></tr>
+                <tr><th>GTT ID</th><th>Trading Symbol</th><th>Side</th><th>Qty</th><th>Entry Trigger</th><th>Target Price</th><th>StopLoss Price</th><th>Status</th><th>Action</th></tr>
             </thead>
-            <tbody id="ordersBody"><tr><td colspan="7" style="color: #94a3b8;">Loading order log...</td></tr></tbody>
+            <tbody id="gttOrdersBody"><tr><td colspan="9" style="color: #94a3b8;">Loading GTT orders...</td></tr></tbody>
         </table>
+    </div>
+
+    <div class="section-title">📋 Today's Executed Trades & Open Orders Log (Edit / Cancel Open Orders)</div>
+    <div class="table-container">
+        <table>
+            <thead>
+                <tr><th>Order Time</th><th>Trading Symbol</th><th>Type</th><th>Order Type</th><th>Qty</th><th>Price / Exec</th><th>Trigger</th><th>Status</th><th>Order ID</th><th>Action</th></tr>
+            </thead>
+            <tbody id="ordersBody"><tr><td colspan="10" style="color: #94a3b8;">Loading order log...</td></tr></tbody>
+        </table>
+    </div>
+
+    <!-- Edit Regular Order Modal -->
+    <div id="editRegularModal" class="modal-backdrop">
+        <div class="modal-card">
+            <div class="modal-title">✏️ Modify Open Order</div>
+            <div class="modal-sub" id="editRegSubtitle">Order ID: -</div>
+            <input type="hidden" id="editRegOrderId">
+            <input type="hidden" id="editRegValidity" value="DAY">
+            <div class="modal-row">
+                <label>Order Type</label>
+                <select id="editRegOrderType" onchange="onRegOrderTypeChange()">
+                    <option value="LIMIT">LIMIT</option>
+                    <option value="MARKET">MARKET</option>
+                    <option value="SL">SL (Stop-Loss Limit)</option>
+                    <option value="SL-M">SL-M (Stop-Loss Market)</option>
+                </select>
+            </div>
+            <div class="modal-row">
+                <label>Quantity</label>
+                <input type="number" id="editRegQty" min="1" step="1">
+            </div>
+            <div class="modal-row" id="editRegPriceRow">
+                <label>Limit Price (₹)</label>
+                <input type="number" id="editRegPrice" min="0" step="0.05">
+            </div>
+            <div class="modal-row" id="editRegTriggerRow">
+                <label>Trigger Price (₹) — Required for SL / SL-M</label>
+                <input type="number" id="editRegTrigger" min="0" step="0.05">
+            </div>
+            <div class="modal-actions">
+                <button class="btn-modal-close" onclick="closeEditModals()">Cancel</button>
+                <button id="btnSaveRegOrder" class="btn-modal-save" onclick="submitRegularOrderModify()">💾 Update Order</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit GTT Order Modal -->
+    <div id="editGttModal" class="modal-backdrop">
+        <div class="modal-card">
+            <div class="modal-title">✏️ Modify GTT Order</div>
+            <div class="modal-sub" id="editGttSubtitle">GTT ID: -</div>
+            <input type="hidden" id="editGttOrderId">
+            <div class="modal-row">
+                <label>Quantity</label>
+                <input type="number" id="editGttQty" min="1" step="1">
+            </div>
+            <div class="modal-row">
+                <label>Entry Trigger Price (₹)</label>
+                <input type="number" id="editGttEntry" min="0.05" step="0.05">
+            </div>
+            <div class="modal-row">
+                <label>Target Trigger Price (₹) — Optional</label>
+                <input type="number" id="editGttTarget" min="0" step="0.05" placeholder="Leave blank if none">
+            </div>
+            <div class="modal-row">
+                <label>StopLoss Trigger Price (₹) — Optional</label>
+                <input type="number" id="editGttSl" min="0" step="0.05" placeholder="Leave blank if none">
+            </div>
+            <div class="modal-actions">
+                <button class="btn-modal-close" onclick="closeEditModals()">Cancel</button>
+                <button id="btnSaveGttOrder" class="btn-modal-save" onclick="submitGttOrderModify()">💾 Update GTT</button>
+            </div>
+        </div>
     </div>
 
     <script>
         const POLL_INTERVAL_SEC = 3;
         let timerSeconds = POLL_INTERVAL_SEC, isSyncing = false, latestEvaluatedOrder = null, detectedOutboundIp = "";
+        let latestOrdersList = [], latestGttList = [];
 
         function revealStaticIpBarIfNeeded(forceShow = false) {
             const params = new URLSearchParams(window.location.search);
@@ -2465,10 +2694,15 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
             exitBadge.innerText = `Exit Cond (B29): ${exitCond}`;
             exitBadge.className = "badge-pill " + ((exitCond === "BE" || exitCond === "SE") ? "badge-active-full" : "");
 
-            const auto320 = st.auto_exit_320 || "NO";
-            const b7Badge = document.getElementById("badgeAutoExit320");
-            b7Badge.innerText = `Auto Exit (B7): ${auto320}`;
-            b7Badge.className = "badge-pill " + (auto320 === "YES" ? "badge-active-ok" : "");
+            const sigExitB7 = st.signal_exit_b7 || "NO";
+            const b7Badge = document.getElementById("badgeSignalExitB7");
+            b7Badge.innerText = `Signal Exit (B7): ${sigExitB7}`;
+            b7Badge.className = "badge-pill " + (sigExitB7 === "YES" ? "badge-active-ok" : "");
+
+            const autoExitB8 = st.auto_exit_320_b8 || "NO";
+            const b8Badge = document.getElementById("badgeAutoExitB8");
+            b8Badge.innerText = `3:20 Exit (B8): ${autoExitB8}`;
+            b8Badge.className = "badge-pill " + (autoExitB8 === "YES" ? "badge-active-ok" : "");
 
             if (st.sheet_synced_at) document.getElementById("badgeSheetSyncTime").innerText = `Sync: ${st.sheet_synced_at}`;
             document.getElementById("engineStatusText").innerText = st.status_message || "";
@@ -2510,6 +2744,97 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
+        // --- OPEN ORDER & GTT EDIT / CANCEL HANDLERS ---
+        function onRegOrderTypeChange() {
+            const ot = document.getElementById("editRegOrderType").value;
+            document.getElementById("editRegPriceRow").style.display = (ot === "MARKET" || ot === "SL-M") ? "none" : "block";
+            document.getElementById("editRegTriggerRow").style.display = (ot === "SL" || ot === "SL-M") ? "block" : "none";
+        }
+
+        function openEditRegularModal(orderId) {
+            const ord = latestOrdersList.find(o => String(o.order_id) === String(orderId));
+            if (!ord) return;
+            document.getElementById("editRegOrderId").value = ord.order_id;
+            document.getElementById("editRegValidity").value = ord.validity || "DAY";
+            document.getElementById("editRegSubtitle").innerText = `${ord.trading_symbol} (${ord.transaction_type}) | ID: ${ord.order_id}`;
+            document.getElementById("editRegOrderType").value = ["LIMIT", "MARKET", "SL", "SL-M"].includes((ord.order_type || "").toUpperCase()) ? ord.order_type.toUpperCase() : "LIMIT";
+            document.getElementById("editRegQty").value = ord.quantity || 1;
+            document.getElementById("editRegPrice").value = ord.price || 0;
+            document.getElementById("editRegTrigger").value = ord.trigger_price || 0;
+            onRegOrderTypeChange();
+            document.getElementById("editRegularModal").style.display = "flex";
+        }
+
+        function openEditGttModal(gttId) {
+            const gtt = latestGttList.find(g => String(g.gtt_order_id) === String(gttId));
+            if (!gtt) return;
+            document.getElementById("editGttOrderId").value = gtt.gtt_order_id;
+            document.getElementById("editGttSubtitle").innerText = `${gtt.trading_symbol || gtt.instrument_token} (${gtt.transaction_type}) | GTT: ${gtt.gtt_order_id}`;
+            document.getElementById("editGttQty").value = gtt.quantity || 1;
+            document.getElementById("editGttEntry").value = gtt.entry_price || "";
+            document.getElementById("editGttTarget").value = gtt.target_price != null ? gtt.target_price : "";
+            document.getElementById("editGttSl").value = gtt.sl_price != null ? gtt.sl_price : "";
+            document.getElementById("editGttModal").style.display = "flex";
+        }
+
+        function closeEditModals() {
+            document.getElementById("editRegularModal").style.display = "none";
+            document.getElementById("editGttModal").style.display = "none";
+        }
+
+        function submitRegularOrderModify() {
+            const btn = document.getElementById("btnSaveRegOrder");
+            btn.disabled = true; btn.innerText = "Updating...";
+            const payload = {
+                kind: "REGULAR",
+                order_id: document.getElementById("editRegOrderId").value,
+                order_type: document.getElementById("editRegOrderType").value,
+                quantity: parseInt(document.getElementById("editRegQty").value, 10),
+                price: parseFloat(document.getElementById("editRegPrice").value || 0),
+                trigger_price: parseFloat(document.getElementById("editRegTrigger").value || 0),
+                validity: document.getElementById("editRegValidity").value
+            };
+            fetch('/api/modify_order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+                .then(r => r.json())
+                .then(d => {
+                    showToast((d.success ? "✅ " : "❌ ") + d.message, d.success ? "success" : "error");
+                    if (d.success) { closeEditModals(); fetchPositionsInBackground(); }
+                })
+                .finally(() => { btn.disabled = false; btn.innerText = "💾 Update Order"; });
+        }
+
+        function submitGttOrderModify() {
+            const btn = document.getElementById("btnSaveGttOrder");
+            btn.disabled = true; btn.innerText = "Updating...";
+            const tgtRaw = document.getElementById("editGttTarget").value.trim();
+            const slRaw = document.getElementById("editGttSl").value.trim();
+            const payload = {
+                kind: "GTT",
+                gtt_order_id: document.getElementById("editGttOrderId").value,
+                quantity: parseInt(document.getElementById("editGttQty").value, 10),
+                entry_price: parseFloat(document.getElementById("editGttEntry").value || 0),
+                target_price: tgtRaw !== "" ? parseFloat(tgtRaw) : 0,
+                sl_price: slRaw !== "" ? parseFloat(slRaw) : 0
+            };
+            fetch('/api/modify_order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+                .then(r => r.json())
+                .then(d => {
+                    showToast((d.success ? "✅ " : "❌ ") + d.message, d.success ? "success" : "error");
+                    if (d.success) { closeEditModals(); fetchPositionsInBackground(); }
+                })
+                .finally(() => { btn.disabled = false; btn.innerText = "💾 Update GTT"; });
+        }
+
+        function cancelSingleOpenOrder(kind, id) {
+            if (!confirm(`Cancel ${kind} order '${id}'?`)) return;
+            fetch('/api/cancel_open_order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind, id }) })
+                .then(r => r.json())
+                .then(d => {
+                    showToast((d.success ? "✅ " : "❌ ") + d.message, d.success ? "success" : "error");
+                    fetchPositionsInBackground();
+                });
+        }
+
         function executeManualOrder() {
             const btn = document.getElementById("btnPlaceOrder");
             btn.disabled = true; btn.innerText = "Placing Order...";
@@ -2544,6 +2869,9 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
                     if (data.error) { errEl.style.display = "block"; errEl.innerText = "Error Fetching Positions: " + data.error; }
                     else { errEl.style.display = "none"; }
 
+                    latestOrdersList = data.orders || [];
+                    latestGttList = data.gtt_orders || [];
+
                     renderOrderEngineState(data.order_engine, data.diagnostics);
                     updateCardPnl("valTotalPnl", "cardTotalPnlBox", data.total_pnl);
                     updateCardPnl("valUnrealisedPnl", "cardUnrealisedPnlBox", data.unrealised_pnl);
@@ -2563,11 +2891,28 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
                         posBody.innerHTML = `<tr><td colspan="11" style="color: #94a3b8;">No open or closed positions found for today.</td></tr>`;
                     }
 
-                    const ordBody = document.getElementById("ordersBody");
-                    if (data.orders && data.orders.length > 0) {
-                        ordBody.innerHTML = data.orders.map(o => `<tr><td style="font-size:12px; color:#94a3b8;">${o.order_timestamp}</td><td><strong>${o.trading_symbol}</strong></td><td style="font-weight:bold; color:${o.transaction_type === 'BUY' ? '#38bdf8' : '#f43f5e'};">${o.transaction_type}</td><td>${o.quantity}</td><td>₹ ${o.average_price || o.price}</td><td><strong>${o.status}</strong></td><td style="font-size:11px; color:#64748b;">${o.order_id}</td></tr>`).join("");
+                    const gttBody = document.getElementById("gttOrdersBody");
+                    if (latestGttList.length > 0) {
+                        gttBody.innerHTML = latestGttList.map(g => {
+                            const actions = g.is_open
+                                ? `<button class="btn-sm-edit" onclick="openEditGttModal('${g.gtt_order_id}')">✏️ Edit</button><button class="btn-sm-cancel" onclick="cancelSingleOpenOrder('GTT','${g.gtt_order_id}')">❌</button>`
+                                : `<span style="color:#64748b; font-size:11px;">Locked</span>`;
+                            return `<tr><td style="font-size:11px; color:#94a3b8;">${g.gtt_order_id}</td><td><strong>${g.trading_symbol || g.instrument_token}</strong></td><td style="font-weight:bold; color:${g.transaction_type === 'BUY' ? '#38bdf8' : '#f43f5e'};">${g.transaction_type}</td><td>${g.quantity}</td><td>₹ ${g.entry_price || '-'}</td><td style="color:#4ade80;">${g.target_price != null ? '₹ ' + g.target_price : '-'}</td><td style="color:#f87171;">${g.sl_price != null ? '₹ ' + g.sl_price : '-'}</td><td><strong>${g.status}</strong></td><td>${actions}</td></tr>`;
+                        }).join("");
                     } else {
-                        ordBody.innerHTML = `<tr><td colspan="7" style="color: #94a3b8;">No trades executed today.</td></tr>`;
+                        gttBody.innerHTML = `<tr><td colspan="9" style="color: #94a3b8;">No active GTT orders found.</td></tr>`;
+                    }
+
+                    const ordBody = document.getElementById("ordersBody");
+                    if (latestOrdersList.length > 0) {
+                        ordBody.innerHTML = latestOrdersList.map(o => {
+                            const actions = o.is_open
+                                ? `<button class="btn-sm-edit" onclick="openEditRegularModal('${o.order_id}')">✏️ Edit</button><button class="btn-sm-cancel" onclick="cancelSingleOpenOrder('REGULAR','${o.order_id}')">❌</button>`
+                                : `<span style="color:#64748b; font-size:11px;">-</span>`;
+                            return `<tr><td style="font-size:12px; color:#94a3b8;">${o.order_timestamp}</td><td><strong>${o.trading_symbol}</strong></td><td style="font-weight:bold; color:${o.transaction_type === 'BUY' ? '#38bdf8' : '#f43f5e'};">${o.transaction_type}</td><td>${o.order_type || 'LIMIT'}</td><td>${o.quantity}</td><td>₹ ${o.average_price || o.price}</td><td>₹ ${o.trigger_price || 0}</td><td><strong>${o.status}</strong></td><td style="font-size:11px; color:#64748b;">${o.order_id}</td><td>${actions}</td></tr>`;
+                        }).join("");
+                    } else {
+                        ordBody.innerHTML = `<tr><td colspan="10" style="color: #94a3b8;">No trades executed today.</td></tr>`;
                     }
                 })
                 .catch(e => {
@@ -2619,6 +2964,68 @@ def api_static_ip():
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return resp
 
+@app.route("/api/modify_order", methods=["POST"])
+def api_modify_order():
+    data = request.get_json(silent=True) or {}
+    kind = str(data.get("kind", "REGULAR")).strip().upper()
+
+    with ORDER_EXECUTION_LOCK:
+        if kind == "GTT":
+            gtt_id = str(data.get("gtt_order_id", "")).strip()
+            if not gtt_id:
+                return jsonify({"success": False, "message": "Missing GTT Order ID."})
+            _, _, gtt_orders, _, _, _, err = fetch_upstox_positions()
+            if err:
+                return jsonify({"success": False, "message": err})
+            target_gtt = next((g for g in gtt_orders if str(g.get("gtt_order_id")) == gtt_id), None)
+            if not target_gtt:
+                return jsonify({"success": False, "message": f"Active GTT {gtt_id} not found."})
+
+            new_qty = int(data.get("quantity") or target_gtt.get("quantity") or 1)
+            new_entry = float(data.get("entry_price") or target_gtt.get("entry_price") or 0.05)
+            new_tgt = float(data.get("target_price") or 0)
+            new_sl = float(data.get("sl_price") or 0)
+            ok, msg = modify_upstox_gtt_sl_target(
+                target_gtt,
+                new_sl=new_sl if new_sl > 0 else 0,
+                new_target=new_tgt if new_tgt > 0 else 0,
+                new_entry=new_entry,
+                new_qty=new_qty
+            )
+            return jsonify({"success": ok, "message": msg})
+
+        # Default: Regular Open Order Modify
+        order_id = str(data.get("order_id", "")).strip()
+        ok, msg = modify_upstox_regular_order(
+            order_id=order_id,
+            quantity=data.get("quantity", 1),
+            price=data.get("price", 0.0),
+            trigger_price=data.get("trigger_price", 0.0),
+            order_type=data.get("order_type", "LIMIT"),
+            validity=data.get("validity", "DAY"),
+            disclosed_quantity=data.get("disclosed_quantity", 0)
+        )
+        return jsonify({"success": ok, "message": msg})
+
+@app.route("/api/cancel_open_order", methods=["POST"])
+def api_cancel_open_order():
+    data = request.get_json(silent=True) or {}
+    kind = str(data.get("kind", "REGULAR")).strip().upper()
+    oid = str(data.get("id", "")).strip()
+    if not oid:
+        return jsonify({"success": False, "message": "Missing order ID."})
+    token = get_valid_token()
+    if not token:
+        return jsonify({"success": False, "message": "Upstox token unavailable."})
+    headers = {"Accept": "application/json", "Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+    proxies = get_upstox_proxies()
+    with ORDER_EXECUTION_LOCK:
+        if kind == "GTT":
+            ok, msg = cancel_upstox_gtt_order(oid, headers, proxies)
+        else:
+            ok, msg = cancel_upstox_regular_order(oid, headers, proxies)
+    return jsonify({"success": ok, "message": msg})
+
 @app.route("/api/manual_order_action", methods=["POST"])
 def api_manual_order_action():
     data = request.get_json(silent=True) or {}
@@ -2641,7 +3048,6 @@ def api_manual_order_action():
         return jsonify({"success": True, "message": "Cancelled state cleared."})
 
     if action == "PLACE":
-        # Fetch sheet & positions OUTSIDE lock for instant responsiveness
         cfg, cfg_err = fetch_dashboard_order_config(force_fresh=True)
         if cfg_err or not cfg:
             return jsonify({"success": False, "message": cfg_err or "Could not read DASHBOARD sheet."})
@@ -2681,7 +3087,6 @@ def api_positions():
     cycle_t0 = time.time()
     now_ist = get_ist_now()
 
-    # Fetch Upstox portfolio & Google Sheet DASHBOARD config in PARALLEL without holding any lock!
     with ThreadPoolExecutor(max_workers=2) as ex:
         fut_upstox = ex.submit(fetch_upstox_positions)
         fut_sheet = ex.submit(fetch_dashboard_order_config, False)
@@ -2695,7 +3100,8 @@ def api_positions():
         "max_active_trades": 1,
         "active_trade_count": 0,
         "exit_condition": "NONE",
-        "auto_exit_320": "NO",
+        "signal_exit_b7": "NO",
+        "auto_exit_320_b8": "NO",
         "sheet_synced_at": now_ist.strftime("%H:%M:%S IST"),
         "status_message": "Initializing...",
         "show_manual_panel": False,
@@ -2719,17 +3125,19 @@ def api_positions():
         payload["amount_to_invest"] = cfg["amount_to_invest"]
         payload["max_active_trades"] = cfg["max_active_trades"]
         payload["exit_condition"] = cfg["exit_condition"] or "NONE"
-        payload["auto_exit_320"] = cfg["auto_exit_320"]
+        payload["signal_exit_b7"] = cfg["signal_exit_b7"]
+        payload["auto_exit_320_b8"] = cfg["auto_exit_320_b8"]
 
-        b7_enabled = (cfg["auto_exit_320"] == "YES")
+        b7_signal_exit_enabled = (cfg["signal_exit_b7"] == "YES")
+        b8_320_exit_enabled = (cfg["auto_exit_320_b8"] == "YES")
         is_after_320_pm = (now_ist.hour > 15) or (now_ist.hour == 15 and now_ist.minute >= 20)
         block_new_entries = False
 
         state = load_auto_order_state()
         cooldowns = state.get("exit_cooldowns", {})
 
-        # --- CONDITION 4: 3:20 PM IST FULL POSITION & ORDER EXIT (ONLY IF CELL B7 == "YES") ---
-        if is_after_320_pm and b7_enabled:
+        # --- PART 2: 3:20 PM IST FULL LIVE TRADE EXIT (ONLY IF CELL B8 == "YES") ---
+        if is_after_320_pm and b8_320_exit_enabled:
             block_new_entries = True
             if time.time() - cooldowns.get("320_PM_EXIT", 0) >= 15:
                 with ORDER_EXECUTION_LOCK:
@@ -2743,18 +3151,18 @@ def api_positions():
                         if ex_msg:
                             cooldowns["320_PM_EXIT"] = time.time()
                             save_auto_order_state(state)
-                            payload["exit_execution_notice"] = f"⏰ 3:20 PM AUTO EXIT (B7=YES): {ex_msg}"
+                            payload["exit_execution_notice"] = f"⏰ 3:20 PM AUTO EXIT (B8=YES): {ex_msg}"
                             payload["exit_execution_ok"] = bool(ex_ok)
                             positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, _ = fetch_upstox_positions()
-            payload["status_message"] = "3:20 PM IST Square-Off Active (B7=YES) — All active positions & open orders exited."
+            payload["status_message"] = "3:20 PM IST Square-Off Active (B8=YES) — All live positions & open orders exited."
 
-        # --- CONDITION 3: EXIT CONDITION BE -> CE / SE -> PE (ONLY EXECUTES EXIT IF CELL B7 == "YES") ---
+        # --- PART 1: SIGNAL EXIT CONDITION B29 == BE / SE (ONLY EXECUTES EXIT IF CELL B7 == "YES") ---
         exit_cond = cfg["exit_condition"]
         if exit_cond in ("BE", "SE"):
             block_new_entries = True
             target_opt = "CE" if exit_cond == "BE" else "PE"
 
-            if b7_enabled:
+            if b7_signal_exit_enabled:
                 cd_key = f"EXIT_{cfg['symbol']}_{exit_cond}_{target_opt}"
                 if time.time() - cooldowns.get(cd_key, 0) >= 15:
                     with ORDER_EXECUTION_LOCK:
@@ -2770,13 +3178,13 @@ def api_positions():
                             if ex_msg:
                                 cooldowns[cd_key] = time.time()
                                 save_auto_order_state(state)
-                                payload["exit_execution_notice"] = f"🚪 EXIT CONDITION ({exit_cond} → {cfg['symbol']} {target_opt} @ MARKET): {ex_msg}"
+                                payload["exit_execution_notice"] = f"🚪 EXIT CONDITION ({exit_cond} → {cfg['symbol']} {target_opt} @ MARKET, B7=YES): {ex_msg}"
                                 payload["exit_execution_ok"] = bool(ex_ok)
                                 positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, _ = fetch_upstox_positions()
                 if not payload["exit_execution_notice"]:
                     payload["status_message"] = f"Exit Condition {exit_cond} ({cfg['symbol']} {target_opt}) active (B7=YES) — Open {target_opt} orders & positions exited."
             else:
-                payload["status_message"] = f"Exit Signal {exit_cond} ({cfg['symbol']} {target_opt}) detected, but B7 is '{cfg['auto_exit_320']}' — Auto-Exit avoided & new Buy blocked."
+                payload["status_message"] = f"Exit Signal {exit_cond} ({cfg['symbol']} {target_opt}) detected, but B7 is '{cfg['signal_exit_b7']}' — Auto-Exit avoided & new entry blocked."
 
         # --- DYNAMIC TRAILING SL & TARGET ON REMAINING OPEN POSITIONS ---
         if any((p.get("quantity", 0) or 0) != 0 for p in positions):
@@ -2787,7 +3195,7 @@ def api_positions():
                 default_target_pct=cfg["target_percent"]
             )
 
-        # --- CHECK GUARDS FIRST BEFORE FETCHING OPTION CHAIN (AVOIDS UNNECESSARY API CALLS) ---
+        # --- CHECK GUARDS FIRST BEFORE FETCHING OPTION CHAIN ---
         state = load_auto_order_state()
         guard = evaluate_trade_guards(
             cfg["symbol"],
@@ -2806,7 +3214,6 @@ def api_positions():
             if cfg["want_to_trade"] != "YES":
                 payload["status_message"] = "Trade Avoided — Want to Trade (B17) is not YES."
             elif cfg["manual_order"].lower() == "auto" and not guard["allowed"]:
-                # Skip fetching option chain completely when Auto mode is blocked by cooldown/active trade
                 payload["status_message"] = f"Skipped: {guard['reason']}"
             else:
                 evaluated, eval_err = prepare_evaluated_order(cfg)
@@ -2847,6 +3254,7 @@ def api_positions():
     resp = jsonify({
         "positions": positions,
         "orders": orders,
+        "gtt_orders": gtt_orders,
         "total_pnl": total_pnl,
         "realised_pnl": realised_pnl,
         "unrealised_pnl": unrealised_pnl,
