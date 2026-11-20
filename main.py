@@ -1210,7 +1210,7 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
         "reason": f"Eligible ({active_count}/{max_active_trades} active trades)."
     }
 
-# --- GOOGLE SHEET HISTORICAL & SIGNAL DATA LOADER (WITH TTL CACHE) ---
+# --- GOOGLE SHEET HISTORICAL & SIGNAL DATA LOADER (WITH TTL CACHE & COL AF:AI SUPPORT) ---
 def parse_timestamp(dt_str):
     if not dt_str:
         return 0
@@ -1288,12 +1288,24 @@ def fetch_history_from_gsheet(symbol="NIFTY", sheet_name=None):
                 header_idx = i
                 break
 
-        reader = csv.DictReader(io.StringIO("\n".join(lines[header_idx:])))
+        parsed_rows = list(csv.reader(io.StringIO("\n".join(lines[header_idx:]))))
+        if len(parsed_rows) < 2:
+            return [], f"Google Sheet connected ({sheet_name or symbol}) but no data rows found."
+
+        header_cells = parsed_rows[0]
+        norm_headers = [re.sub(r'^[^\w]+', '', str(h)).strip().lower() for h in header_cells]
+
         snapshots = []
-        for row in reader:
-            if not row:
+        for row_cells in parsed_rows[1:]:
+            if not row_cells:
                 continue
-            norm_r = {re.sub(r'^[^\w]+', '', str(k)).strip().lower(): str(v).strip() for k, v in row.items() if k is not None}
+
+            norm_r = {}
+            for c_i, h_key in enumerate(norm_headers):
+                if h_key and c_i < len(row_cells):
+                    val_str = str(row_cells[c_i]).strip()
+                    if h_key not in norm_r or val_str != "":
+                        norm_r[h_key] = val_str
 
             def safe_num(primary, alts=[], default=0.0):
                 for n in [primary.lower()] + [a.lower() for a in alts]:
@@ -1321,11 +1333,29 @@ def fetch_history_from_gsheet(symbol="NIFTY", sheet_name=None):
                             return kv
                 return ""
 
+            def get_col_or_named(col_index_0based, primary, alts=[]):
+                # Prefer direct positional column (AF=31, AG=32, AH=33, AI=34) if valid signal or header matches,
+                # plus named lookup fallback so both positional and shifted sheets work seamlessly.
+                pos_val = str(row_cells[col_index_0based]).strip().upper() if len(row_cells) > col_index_0based else ""
+                if pos_val in ("B", "BE", "S", "SE"):
+                    return pos_val
+                named_val = safe_str(primary, alts).strip().upper()
+                if named_val in ("B", "BE", "S", "SE"):
+                    return named_val
+                return pos_val if pos_val not in ("5 MIN SIGNAL", "15 MIN SIGNAL", "30 MIN SIGNAL", "1 HR SIGNAL") else named_val
+
             time_val = str(norm_r.get("time", norm_r.get("datetime", norm_r.get("timestamp", norm_r.get("date & time", norm_r.get("date and time", ""))))))
             if not time_val or time_val.lower() in ("nan", "none", "", "0.0"):
                 continue
 
             date_str, formatted_time = extract_date_and_time_parts(time_val)
+
+            # Col AF (31) = 5 Min Signal, Col AG (32) = 15 Min Signal, Col AH (33) = 30 Min Signal, Col AI (34) = 1 HR Signal
+            sig_5m = get_col_or_named(31, "5 Min Signal", ["5min signal", "5_min_signal", "5m signal", "5 min sig"])
+            sig_15m = get_col_or_named(32, "15 Min Signal", ["15min signal", "15_min_signal", "15m signal", "15 min sig"])
+            sig_30m = get_col_or_named(33, "30 Min Signal", ["30min signal", "30_min_signal", "30m signal", "30 min sig"])
+            sig_1h = get_col_or_named(34, "1 HR Signal", ["1hr signal", "1_hr_signal", "1 hour signal", "1h signal", "60 min signal", "1 hr sig"])
+
             snapshots.append({
                 "timestamp": parse_timestamp(time_val),
                 "datetime": time_val,
@@ -1351,7 +1381,11 @@ def fetch_history_from_gsheet(symbol="NIFTY", sheet_name=None):
                 "max_roc": safe_num("Max ROC (Sell)", ["max_roc", "max roc"]),
                 "cross_roc": safe_num("Cross ROC Sig", ["cross_roc_sig", "cross roc"]),
                 "main_volatility": safe_num("Main Volatility", ["main_vol", "volatility"]),
-                "new_signal": safe_str("New Signal", ["signal", "sig"])
+                "new_signal": safe_str("New Signal", ["signal", "sig"]).strip().upper(),
+                "signal_5m": sig_5m,
+                "signal_15m": sig_15m,
+                "signal_30m": sig_30m,
+                "signal_1h": sig_1h
             })
 
         if not snapshots:
@@ -1701,7 +1735,7 @@ MAIN_HTML_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>"""
 
-# --- ANALYSIS DASHBOARD TEMPLATE (TIME-ONLY HOVER TOOLTIP & VERTICAL CROSSHAIR) ---
+# --- ANALYSIS DASHBOARD TEMPLATE (CHART 2 INTERVAL SIGNALS AF/AG/AH/AI + TIME-ONLY HOVER) ---
 ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
@@ -1733,7 +1767,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
     <h2>📊 {{ symbol }} Advanced Analytics & Google Sheet Memory Dashboard</h2>
-    <div class="subtitle">Live background auto-sync — Hover over any chart line to inspect exact timestamp</div>
+    <div class="subtitle">Live background auto-sync — Chart 2 displays interval B / S / BE / SE signals (Cols AF–AI) & Time-only hover</div>
 
     <div class="nav-bar">
         <label style="color: #94a3b8; font-weight: bold;">Symbol:</label>
@@ -1796,7 +1830,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 
     <div class="chart-box">
         <div class="chart-header">
-            <span class="chart-title">2 - 📈 Historical Snapshot Trend (Google Sheet Memory)</span>
+            <span class="chart-title">2 - 📈 Historical Snapshot Trend (Google Sheet Memory — B / BE / S / SE Signals)</span>
             <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
                 <label style="color: #94a3b8; font-weight: bold;">Head of Dropdown:</label>
                 <select id="historyMetricSelector" onchange="loadHistoricalChart(true)">
@@ -1856,7 +1890,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 
         const DATE_PALETTE = ['#38bdf8', '#facc15', '#4ade80', '#f472b6', '#a78bfa', '#fb923c', '#2dd4bf'];
 
-        // Vertical Hover Crosshair Plugin (draws clean vertical line at hovered X position)
+        // Vertical Hover Crosshair Plugin
         const hoverCrosshairPlugin = {
             id: 'hoverCrosshairPlugin',
             afterDatasetsDraw: (chart) => {
@@ -1877,7 +1911,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             }
         };
 
-        // Shared Time-Only Tooltip Config (shows ONLY the time/X-axis label, hiding all metric values)
+        // Time-Only Tooltip Config (hides all metric numbers on hover)
         function buildTimeOnlyTooltipConfig(prefixLabel) {
             return {
                 enabled: true,
@@ -1975,14 +2009,16 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             }
         };
 
+        // Shared B / BE / S / SE Badge Renderer for both Chart 2 & Chart 3
         const signalLabelPlugin = {
             id: 'signalLabelPlugin',
             afterDatasetsDraw: (chart) => {
-                const { ctx } = chart;
+                const { ctx, chartArea } = chart;
+                const minTop = chartArea ? chartArea.top + 2 : 2;
                 chart.data.datasets.forEach((dataset, datasetIndex) => {
-                    if (dataset.label === 'Main Volatility') {
+                    if (Array.isArray(dataset.signalLabels) && dataset.signalLabels.length > 0) {
                         const meta = chart.getDatasetMeta(datasetIndex);
-                        const signals = dataset.signalLabels || [];
+                        const signals = dataset.signalLabels;
                         meta.data.forEach((element, index) => {
                             const rawSig = (signals[index] || "").trim().toUpperCase();
                             if (rawSig === 'B' || rawSig === 'BE' || rawSig === 'S' || rawSig === 'SE') {
@@ -1992,7 +2028,8 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                                 ctx.font = 'bold 11px Segoe UI';
                                 const textW = ctx.measureText(rawSig).width;
                                 const padX = 5, boxH = 16, boxW = textW + padX * 2;
-                                const boxX = x - boxW / 2, boxY = y - boxH - 6;
+                                const boxX = x - boxW / 2;
+                                const boxY = Math.max(minTop, y - boxH - 6);
 
                                 ctx.fillStyle = '#0f172a';
                                 ctx.strokeStyle = badgeColor;
@@ -2164,7 +2201,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                         tooltip: buildTimeOnlyTooltipConfig('Time')
                     }
                 },
-                plugins: [dateBandPlugin, hoverCrosshairPlugin]
+                plugins: [dateBandPlugin, signalLabelPlugin, hoverCrosshairPlugin]
             });
             loadHistoricalChart(true);
         }
@@ -2173,6 +2210,16 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             const metric = document.getElementById('historyMetricSelector').value;
             const dayRange = document.getElementById('historyDayRangeSelector').value;
             const timeframe = document.getElementById('historyTimeframeSelector').value;
+
+            // Map selected Chart 2 Interval -> Sheet column (AF=5m, AG=15m, AH=30m, AI=1h)
+            const tfSignalKeyMap = {
+                "5minute": "signal_5m",
+                "15minute": "signal_15m",
+                "30minute": "signal_30m",
+                "60minute": "signal_1h",
+                "day": "signal_1h"
+            };
+            const activeSigKey = tfSignalKeyMap[timeframe] || "signal_5m";
 
             fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&metric=${metric}&day_range=${dayRange}&chart_type=history`)
                 .then(res => res.json())
@@ -2196,6 +2243,8 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     historyChartObj._hoverTimes = meta.hoverTimes;
 
                     const times = snapshots.map(s => s.formatted_time || s.datetime);
+                    const chart2Signals = snapshots.map(s => (s[activeSigKey] || "").trim().toUpperCase());
+                    const sigPointRadii = chart2Signals.map(sig => ['B', 'BE', 'S', 'SE'].includes(sig) ? 4.5 : 1.5);
                     let datasets = [];
 
                     if (metric === "price_pcr") {
@@ -2203,7 +2252,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                         const spotVals = snapshots.map(s => s.spot_price);
                         const pcrVals = snapshots.map(s => s.pcr);
                         datasets.push({ label: 'Relation 2: PCR', data: pcrVals, borderColor: '#06b6d4', borderWidth: 2, tension: 0.2, yAxisID: 'y' });
-                        datasets.push({ label: 'Relation 1: Price LTP', data: spotVals, borderColor: '#facc15', backgroundColor: 'rgba(250, 204, 21, 0.1)', borderWidth: 2, tension: 0.2, yAxisID: 'y1', fill: true });
+                        datasets.push({ label: 'Relation 1: Price LTP', data: spotVals, signalLabels: chart2Signals, borderColor: '#facc15', backgroundColor: 'rgba(250, 204, 21, 0.1)', borderWidth: 2, pointRadius: sigPointRadii, pointHoverRadius: 5, tension: 0.2, yAxisID: 'y1', fill: true });
                         datasets.push({ label: 'Price Trend', data: computeLinearTrend(spotVals), borderColor: '#ca8a04', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, yAxisID: 'y1' });
                     } else {
                         historyChartObj.options.scales.y1.display = false;
@@ -2227,7 +2276,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 
                         datasets.push({ label: `Relation 1: ${cfg.r1}`, data: ceVals, borderColor: '#ef4444', borderWidth: 2, tension: 0.2, yAxisID: 'y' });
                         datasets.push({ label: `Relation 2: ${cfg.r2}`, data: peVals, borderColor: '#22c55e', borderWidth: 2, tension: 0.2, yAxisID: 'y' });
-                        datasets.push({ label: `Average (${cfg.r1} & ${cfg.r2})`, data: avgVals, borderColor: '#facc15', borderWidth: 2, tension: 0.2, yAxisID: 'y' });
+                        datasets.push({ label: `Average (${cfg.r1} & ${cfg.r2})`, data: avgVals, signalLabels: chart2Signals, borderColor: '#facc15', borderWidth: 2, pointRadius: sigPointRadii, pointHoverRadius: 5, tension: 0.2, yAxisID: 'y' });
                         datasets.push({ label: `${cfg.r1} Trend`, data: computeLinearTrend(ceVals), borderColor: '#f87171', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, yAxisID: 'y' });
                         datasets.push({ label: `${cfg.r2} Trend`, data: computeLinearTrend(peVals), borderColor: '#4ade80', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, yAxisID: 'y' });
                     }
@@ -2994,7 +3043,6 @@ def api_modify_order():
             )
             return jsonify({"success": ok, "message": msg})
 
-        # Default: Regular Open Order Modify
         order_id = str(data.get("order_id", "")).strip()
         ok, msg = modify_upstox_regular_order(
             order_id=order_id,
@@ -3302,10 +3350,19 @@ def api_history():
     sec_map = {"15minute": 900, "30minute": 1800, "60minute": 3600, "day": 86400}
     interval_sec = sec_map.get(timeframe, 300)
     grouped = {}
+    sig_fields = ("new_signal", "signal_5m", "signal_15m", "signal_30m", "signal_1h")
     for idx, item in enumerate(snapshots):
         ts = item["timestamp"]
         bucket = (ts // interval_sec) * interval_sec if ts > 0 else (idx // (interval_sec // 300))
-        grouped[bucket] = item
+        if bucket not in grouped:
+            grouped[bucket] = dict(item)
+        else:
+            prev = grouped[bucket]
+            merged = dict(item)
+            for sf in sig_fields:
+                if not merged.get(sf) and prev.get(sf):
+                    merged[sf] = prev[sf]
+            grouped[bucket] = merged
     resampled = [grouped[b] for b in sorted(grouped.keys())][-1500:]
     return jsonify({"history": resampled, "count": len(resampled)})
 
@@ -3358,9 +3415,9 @@ def download_history_csv():
     snapshots, _ = fetch_history_from_gsheet(symbol)
     si = io.StringIO()
     cw = csv.writer(si)
-    cw.writerow(["Datetime", "Formatted Time", "Symbol", "Spot Price", "ATM Strike", "PCR", "CE OI", "PE OI", "CE Chg in OI", "PE Chg in OI", "CE Vol", "PE Vol", "CE IV", "PE IV", "CE Delta", "PE Delta", "CE Theta", "PE Theta", "CE Vega", "PE Vega", "CE Gamma", "PE Gamma", "CE Ask", "PE Bid", "Min ROC (Buy)", "Max ROC (Sell)", "Cross ROC Sig", "Main Volatility", "New Signal"])
+    cw.writerow(["Datetime", "Formatted Time", "Symbol", "Spot Price", "ATM Strike", "PCR", "CE OI", "PE OI", "CE Chg in OI", "PE Chg in OI", "CE Vol", "PE Vol", "CE IV", "PE IV", "CE Delta", "PE Delta", "CE Theta", "PE Theta", "CE Vega", "PE Vega", "CE Gamma", "PE Gamma", "CE Ask", "PE Bid", "Min ROC (Buy)", "Max ROC (Sell)", "Cross ROC Sig", "Main Volatility", "New Signal", "5 Min Signal", "15 Min Signal", "30 Min Signal", "1 HR Signal"])
     for s in snapshots:
-        cw.writerow([s.get("datetime"), s.get("formatted_time"), s.get("symbol"), s.get("spot_price"), s.get("atm_strike"), s.get("pcr"), s.get("ce_oi"), s.get("pe_oi"), s.get("ce_oi_chg"), s.get("pe_oi_chg"), s.get("ce_vol"), s.get("pe_vol"), s.get("ce_iv"), s.get("pe_iv"), s.get("ce_delta"), s.get("pe_delta"), s.get("ce_theta"), s.get("pe_theta"), s.get("ce_vega"), s.get("pe_vega"), s.get("ce_gamma"), s.get("pe_gamma"), s.get("ce_ask"), s.get("pe_bid"), s.get("min_roc"), s.get("max_roc"), s.get("cross_roc"), s.get("main_volatility"), s.get("new_signal")])
+        cw.writerow([s.get("datetime"), s.get("formatted_time"), s.get("symbol"), s.get("spot_price"), s.get("atm_strike"), s.get("pcr"), s.get("ce_oi"), s.get("pe_oi"), s.get("ce_oi_chg"), s.get("pe_oi_chg"), s.get("ce_vol"), s.get("pe_vol"), s.get("ce_iv"), s.get("pe_iv"), s.get("ce_delta"), s.get("pe_delta"), s.get("ce_theta"), s.get("pe_theta"), s.get("ce_vega"), s.get("pe_vega"), s.get("ce_gamma"), s.get("pe_gamma"), s.get("ce_ask"), s.get("pe_bid"), s.get("min_roc"), s.get("max_roc"), s.get("cross_roc"), s.get("main_volatility"), s.get("new_signal"), s.get("signal_5m"), s.get("signal_15m"), s.get("signal_30m"), s.get("signal_1h")])
     output = Response(si.getvalue(), mimetype="text/csv")
     output.headers["Content-Disposition"] = f"attachment; filename={symbol}_Historical_GSheet_Memory.csv"
     return output
