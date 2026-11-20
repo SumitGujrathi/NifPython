@@ -53,7 +53,7 @@ FAILED_ORDER_STATUSES = {
 
 AUTH_COOLDOWN = {"last_failure_time": 0, "cooldown_duration": 1500}
 
-# --- PERSISTENT HTTP CONNECTION POOL (ELIMINATES REPEATED SSL HANDSHAKES) ---
+# --- PERSISTENT HTTP CONNECTION POOL ---
 HTTP_SESSION = requests.Session()
 _http_adapter = HTTPAdapter(pool_connections=30, pool_maxsize=30, max_retries=0)
 HTTP_SESSION.mount("https://", _http_adapter)
@@ -62,10 +62,10 @@ HTTP_SESSION.mount("http://", _http_adapter)
 # --- IN-MEMORY STALE-WHILE-REVALIDATE (SWR) CACHES ---
 EXPIRY_CACHE = {}                 # symbol -> {"ts": float, "expiries": list}
 CHAIN_CACHE = {}                  # (instrument_key, expiry) -> {"ts": float, "data": list}
-CHAIN_REFRESH_INFLIGHT = set()    # active background refresh keys
+CHAIN_REFRESH_INFLIGHT = set()
 DASHBOARD_CFG_CACHE = {"ts": 0.0, "cfg": None, "latency_ms": 0}
 HISTORY_CACHE = {}                # sheet_key -> {"ts": float, "snapshots": list}
-HISTORY_REFRESH_INFLIGHT = set()  # active background refresh keys
+HISTORY_REFRESH_INFLIGHT = set()
 
 LAST_DIAGNOSTICS = {
     "upstox_ms": 0,
@@ -769,7 +769,6 @@ def fetch_dashboard_order_config(force_fresh=False):
                     return label_values[k]
             return exact_val
 
-        # Cell B7 -> Controls B29 (BE / SE) Signal Exit
         b7_raw = resolve_field(
             ["signal_exit", "be_se_exit", "exit_on_signal", "auto_exit_signal", "exit_signal_enabled"],
             7,
@@ -777,7 +776,6 @@ def fetch_dashboard_order_config(force_fresh=False):
         ).strip().upper()
         signal_exit_b7 = "YES" if b7_raw in ("YES", "Y", "TRUE", "1") else "NO"
 
-        # Cell B8 -> Controls 3:20 PM IST Full Exit
         b8_raw = resolve_field(
             ["3_20_pm_exit", "auto_exit_3_20", "exit_at_3_20", "square_off_3_20", "auto_square_off", "3_20_exit", "320_pm_exit"],
             8,
@@ -1328,7 +1326,6 @@ def _download_and_parse_gsheet(symbol, sheet_name):
                     return nospace_map[ns]
             return fallback_idx
 
-        # Resolve all column indices ONCE (O(1) lookup per row)
         idx_time = find_col(["time", "datetime", "timestamp", "date & time", "date and time"], 0)
         idx_sym = find_col(["symbol"], 1)
         idx_spot = find_col(["price ltp", "spot_price", "ltp"])
@@ -1869,12 +1866,14 @@ MAIN_HTML_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>"""
 
-# --- ANALYSIS DASHBOARD TEMPLATE (FAST PARALLEL LOAD + CHART 2 INTERVAL SIGNALS AF/AG/AH/AI + TIME-ONLY HOVER) ---
+# --- ANALYSIS DASHBOARD TEMPLATE (INTERACTIVE AREA ZOOM & PAN ON CHART 2 & 3) ---
 ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
     <title>{{ symbol }} Option Chain & Technical Chart Analysis</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #0f172a; color: #f8fafc; }
         h2 { color: #38bdf8; margin-bottom: 5px; }
@@ -1883,6 +1882,11 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         .btn { padding: 9px 18px; color: #fff; background-color: #3b82f6; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 14px; border: none; cursor: pointer; }
         .btn-table { background-color: #64748b; }
         .btn-dl { background-color: #10b981; font-size: 12px; padding: 6px 12px; text-decoration: none; color: #fff; border-radius: 6px; font-weight: bold; }
+        .zoom-toolbar { display: inline-flex; align-items: center; gap: 6px; background: #0f172a; padding: 4px 8px; border-radius: 8px; border: 1px solid #334155; }
+        .btn-zoom { background-color: #334155; color: #f8fafc; border: 1px solid #475569; padding: 5px 10px; border-radius: 5px; font-size: 12px; font-weight: 700; cursor: pointer; transition: background-color 0.15s; }
+        .btn-zoom:hover { background-color: #475569; }
+        .btn-zoom-reset { background-color: #1e293b; color: #94a3b8; border: 1px solid #475569; padding: 5px 10px; border-radius: 5px; font-size: 12px; font-weight: 700; cursor: pointer; }
+        .btn-zoom-reset.active-zoom { background-color: #f59e0b; color: #0f172a; border-color: #fbbf24; }
         select { padding: 9px 14px; background: #0f172a; color: #38bdf8; border: 1px solid #334155; border-radius: 6px; font-weight: 600; font-size: 14px; outline: none; }
         .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; }
         .card { background: #1e293b; padding: 16px; border-radius: 10px; border-left: 5px solid #3b82f6; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
@@ -1893,15 +1897,17 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         .gauge-pe { background-color: #22c55e; height: 100%; transition: width 0.4s ease; }
         .gauge-ce { background-color: #ef4444; height: 100%; transition: width 0.4s ease; }
         .chart-box { background: #1e293b; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); margin-bottom: 30px; position: relative; }
-        .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px; }
+        .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 10px; }
         .chart-title { font-size: 18px; font-weight: bold; color: #f8fafc; }
+        .zoom-hint { font-size: 12px; color: #94a3b8; margin-bottom: 10px; }
         .timer-badge { background: #0284c7; color: #ffffff; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
         .error-msg { color: #f87171; font-weight: bold; padding: 15px; background: #450a0a; border-radius: 8px; }
+        .canvas-wrap { position: relative; height: 420px; width: 100%; }
     </style>
 </head>
 <body>
     <h2>📊 {{ symbol }} Advanced Analytics & Google Sheet Memory Dashboard</h2>
-    <div class="subtitle">High-speed parallel auto-sync — Chart 2 displays interval B / S / BE / SE signals (Cols AF–AI) & Time-only hover</div>
+    <div class="subtitle">High-speed parallel auto-sync — Drag across any section on Chart 2 or 3 to zoom into specific dates/times</div>
 
     <div class="nav-bar">
         <label style="color: #94a3b8; font-weight: bold;">Symbol:</label>
@@ -1965,7 +1971,13 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="chart-box">
         <div class="chart-header">
             <span class="chart-title">2 - 📈 Historical Snapshot Trend (Google Sheet Memory — B / BE / S / SE Signals)</span>
-            <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+            <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+                <div class="zoom-toolbar">
+                    <button type="button" id="histDragModeBtn" class="btn-zoom" onclick="toggleChartDragMode('history')" title="Switch between Drag-to-Zoom Area and Drag-to-Pan">🔍 Drag: Zoom</button>
+                    <button type="button" class="btn-zoom" onclick="stepChartZoom('history', 1.35)" title="Zoom In">+</button>
+                    <button type="button" class="btn-zoom" onclick="stepChartZoom('history', 0.74)" title="Zoom Out">−</button>
+                    <button type="button" id="histResetZoomBtn" class="btn-zoom-reset" onclick="resetChartZoom('history')" title="Reset Zoom (or Double-Click Chart)">🔄 Reset Zoom</button>
+                </div>
                 <label style="color: #94a3b8; font-weight: bold;">Head of Dropdown:</label>
                 <select id="historyMetricSelector" onchange="loadHistoricalChart(true)">
                     <option value="price_pcr" selected>Price LTP / PCR</option>
@@ -1990,16 +2002,25 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                 <select id="historyTimeframeSelector" onchange="loadHistoricalChart(true)">
                     <option value="5minute" selected>5 Min</option><option value="15minute">15 Min</option><option value="30minute">30 Min</option><option value="60minute">1 Hour</option><option value="day">1 Day</option>
                 </select>
-                <a id="downloadHistoryBtn" href="/download_history?symbol={{ symbol }}" class="btn-dl">📥 Download Google Sheet Memory CSV</a>
+                <a id="downloadHistoryBtn" href="/download_history?symbol={{ symbol }}" class="btn-dl">📥 CSV</a>
             </div>
         </div>
-        <canvas id="historyChart" style="max-height: 420px;"></canvas>
+        <div class="zoom-hint">💡 <strong>Zoom Controls:</strong> Drag across any region to zoom in • Scroll wheel to zoom in/out at cursor • Hold <strong>Shift + Drag</strong> (or toggle to Pan) to scroll left/right • Double-click chart to reset</div>
+        <div class="canvas-wrap">
+            <canvas id="historyChart" ondblclick="resetChartZoom('history')"></canvas>
+        </div>
     </div>
 
     <div class="chart-box">
         <div class="chart-header">
             <span class="chart-title">3 - 🚀 Main Signal (B / BE / S / SE)</span>
-            <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+            <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+                <div class="zoom-toolbar">
+                    <button type="button" id="sigDragModeBtn" class="btn-zoom" onclick="toggleChartDragMode('signal')" title="Switch between Drag-to-Zoom Area and Drag-to-Pan">🔍 Drag: Zoom</button>
+                    <button type="button" class="btn-zoom" onclick="stepChartZoom('signal', 1.35)" title="Zoom In">+</button>
+                    <button type="button" class="btn-zoom" onclick="stepChartZoom('signal', 0.74)" title="Zoom Out">−</button>
+                    <button type="button" id="sigResetZoomBtn" class="btn-zoom-reset" onclick="resetChartZoom('signal')" title="Reset Zoom (or Double-Click Chart)">🔄 Reset Zoom</button>
+                </div>
                 <label style="color: #94a3b8; font-weight: bold;">Data Day Range:</label>
                 <select id="signalDayRangeSelector" onchange="loadSignalChart(true)">
                     <option value="1day" selected>1 Day</option><option value="3day">3 Day</option><option value="1week">1 Week</option>
@@ -2011,7 +2032,10 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                 </select>
             </div>
         </div>
-        <canvas id="signalChart" style="max-height: 420px;"></canvas>
+        <div class="zoom-hint">💡 <strong>Zoom Controls:</strong> Drag across any region to zoom in • Scroll wheel to zoom in/out at cursor • Hold <strong>Shift + Drag</strong> (or toggle to Pan) to scroll left/right • Double-click chart to reset</div>
+        <div class="canvas-wrap">
+            <canvas id="signalChart" ondblclick="resetChartZoom('signal')"></canvas>
+        </div>
     </div>
 
     <script>
@@ -2025,6 +2049,92 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 
         const DATE_PALETTE = ['#38bdf8', '#facc15', '#4ade80', '#f472b6', '#a78bfa', '#fb923c', '#2dd4bf'];
 
+        function updateZoomBadge(chart) {
+            if (!chart) return;
+            const btnId = chart === historyChartObj ? 'histResetZoomBtn' : (chart === signalChartObj ? 'sigResetZoomBtn' : null);
+            if (!btnId) return;
+            const btn = document.getElementById(btnId);
+            if (!btn) return;
+            const zoomed = typeof chart.isZoomedOrPanned === 'function' ? chart.isZoomedOrPanned() : (chart.options.scales.x.min !== undefined || chart.options.scales.x.max !== undefined);
+            if (zoomed) {
+                btn.classList.add('active-zoom');
+            } else {
+                btn.classList.remove('active-zoom');
+            }
+        }
+
+        function buildInteractiveZoomOptions() {
+            return {
+                limits: {
+                    x: { min: 'original', max: 'original', minRange: 4 }
+                },
+                pan: {
+                    enabled: true,
+                    mode: 'x',
+                    modifierKey: 'shift',
+                    onPanComplete: ({ chart }) => updateZoomBadge(chart)
+                },
+                zoom: {
+                    wheel: {
+                        enabled: true,
+                        speed: 0.12
+                    },
+                    pinch: {
+                        enabled: true
+                    },
+                    drag: {
+                        enabled: true,
+                        backgroundColor: 'rgba(56, 189, 248, 0.24)',
+                        borderColor: '#38bdf8',
+                        borderWidth: 1.5,
+                        threshold: 6
+                    },
+                    mode: 'x',
+                    onZoomComplete: ({ chart }) => updateZoomBadge(chart)
+                }
+            };
+        }
+
+        function toggleChartDragMode(chartKey) {
+            const chart = chartKey === 'history' ? historyChartObj : signalChartObj;
+            const btn = document.getElementById(chartKey === 'history' ? 'histDragModeBtn' : 'sigDragModeBtn');
+            if (!chart || !chart.options.plugins.zoom) return;
+
+            const isCurrentlyZoom = chart.options.plugins.zoom.zoom.drag.enabled;
+            if (isCurrentlyZoom) {
+                chart.options.plugins.zoom.zoom.drag.enabled = false;
+                chart.options.plugins.zoom.pan.modifierKey = null;
+                btn.innerText = '✋ Drag: Pan';
+                btn.style.backgroundColor = '#0284c7';
+            } else {
+                chart.options.plugins.zoom.zoom.drag.enabled = true;
+                chart.options.plugins.zoom.pan.modifierKey = 'shift';
+                btn.innerText = '🔍 Drag: Zoom';
+                btn.style.backgroundColor = '#334155';
+            }
+            chart.update('none');
+        }
+
+        function stepChartZoom(chartKey, factor) {
+            const chart = chartKey === 'history' ? historyChartObj : signalChartObj;
+            if (!chart || typeof chart.zoom !== 'function') return;
+            chart.zoom(factor, 'none');
+            updateZoomBadge(chart);
+        }
+
+        function resetChartZoom(chartKey) {
+            const chart = chartKey === 'history' ? historyChartObj : signalChartObj;
+            if (!chart) return;
+            if (typeof chart.resetZoom === 'function') {
+                chart.resetZoom('none');
+            } else if (chart.options && chart.options.scales && chart.options.scales.x) {
+                delete chart.options.scales.x.min;
+                delete chart.options.scales.x.max;
+                chart.update('none');
+            }
+            updateZoomBadge(chart);
+        }
+
         const hoverCrosshairPlugin = {
             id: 'hoverCrosshairPlugin',
             afterDatasetsDraw: (chart) => {
@@ -2033,6 +2143,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                 const { ctx, chartArea } = chart;
                 if (!chartArea) return;
                 const x = active[0].element.x;
+                if (x < chartArea.left || x > chartArea.right) return;
                 ctx.save();
                 ctx.beginPath();
                 ctx.moveTo(x, chartArea.top);
@@ -2113,13 +2224,22 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                 const xScale = scales.x;
 
                 ctx.save();
+                ctx.beginPath();
+                ctx.rect(left, top, right - left, bottom - top);
+                ctx.clip();
+
                 groups.forEach((g, idx) => {
                     const xStart = idx === 0 ? left : (xScale.getPixelForValue(g.start - 1) + xScale.getPixelForValue(g.start)) / 2;
                     const xEnd = idx === groups.length - 1 ? right : (xScale.getPixelForValue(g.end) + xScale.getPixelForValue(g.end + 1)) / 2;
-                    ctx.fillStyle = idx % 2 === 0 ? 'rgba(56, 189, 248, 0.04)' : 'rgba(250, 204, 21, 0.05)';
-                    ctx.fillRect(xStart, top, xEnd - xStart, bottom - top);
+                    if (xEnd < left || xStart > right) return;
 
-                    if (idx > 0) {
+                    const visStart = Math.max(left, xStart);
+                    const visEnd = Math.min(right, xEnd);
+
+                    ctx.fillStyle = idx % 2 === 0 ? 'rgba(56, 189, 248, 0.04)' : 'rgba(250, 204, 21, 0.05)';
+                    ctx.fillRect(visStart, top, visEnd - visStart, bottom - top);
+
+                    if (idx > 0 && xStart >= left && xStart <= right) {
                         ctx.beginPath();
                         ctx.moveTo(xStart, top);
                         ctx.lineTo(xStart, bottom);
@@ -2130,12 +2250,12 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                         ctx.setLineDash([]);
                     }
 
-                    if (g.date && g.date !== "Session" && (xEnd - xStart) > 48) {
+                    if (g.date && g.date !== "Session" && (visEnd - visStart) > 48) {
                         ctx.fillStyle = g.color;
                         ctx.font = 'bold 11px Segoe UI';
                         ctx.textAlign = 'left';
                         ctx.textBaseline = 'top';
-                        ctx.fillText(g.date, xStart + 6, top + 6);
+                        ctx.fillText(g.date, visStart + 6, top + 6);
                     }
                 });
                 ctx.restore();
@@ -2147,6 +2267,9 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             afterDatasetsDraw: (chart) => {
                 const { ctx, chartArea } = chart;
                 const minTop = chartArea ? chartArea.top + 2 : 2;
+                const minLeft = chartArea ? chartArea.left : 0;
+                const maxRight = chartArea ? chartArea.right : Infinity;
+
                 chart.data.datasets.forEach((dataset, datasetIndex) => {
                     if (Array.isArray(dataset.signalLabels) && dataset.signalLabels.length > 0) {
                         const meta = chart.getDatasetMeta(datasetIndex);
@@ -2155,6 +2278,8 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                             const rawSig = (signals[index] || "").trim().toUpperCase();
                             if (rawSig === 'B' || rawSig === 'BE' || rawSig === 'S' || rawSig === 'SE') {
                                 const { x, y } = element.tooltipPosition();
+                                if (x < minLeft || x > maxRight) return;
+
                                 const badgeColor = rawSig === 'B' ? '#22c55e' : (rawSig === 'BE' ? '#f59e0b' : (rawSig === 'S' ? '#ef4444' : '#38bdf8'));
                                 ctx.save();
                                 ctx.font = 'bold 11px Segoe UI';
@@ -2261,7 +2386,8 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     },
                     plugins: {
                         legend: { labels: { color: '#f8fafc', font: { size: 13 } } },
-                        tooltip: buildTimeOnlyTooltipConfig('Time')
+                        tooltip: buildTimeOnlyTooltipConfig('Time'),
+                        zoom: buildInteractiveZoomOptions()
                     }
                 },
                 plugins: [dateBandPlugin, zeroLinePlugin, signalLabelPlugin, hoverCrosshairPlugin]
@@ -2277,6 +2403,9 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             return fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&day_range=${dayRange}&chart_type=signal`, { signal: sigAbortCtrl.signal })
                 .then(res => res.json())
                 .then(data => {
+                    if (isManualChange) {
+                        resetChartZoom('signal');
+                    }
                     if (data.error || !(data.history && data.history.length)) {
                         if (isManualChange || !hasSignalData) {
                             signalChartObj._dateColors = [];
@@ -2304,6 +2433,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                         { label: 'Main Volatility', data: snapshots.map(s => s.main_volatility || 0), signalLabels: snapshots.map(s => s.new_signal || ""), borderColor: '#38bdf8', borderWidth: 3, pointRadius: 3, pointHoverRadius: 4, tension: 0.2 }
                     ];
                     signalChartObj.update('none');
+                    updateZoomBadge(signalChartObj);
                 })
                 .catch(err => { if (err.name !== 'AbortError') console.error("Signal chart error:", err); });
         }
@@ -2332,7 +2462,8 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     },
                     plugins: {
                         legend: { labels: { color: '#f8fafc', font: { size: 13 } } },
-                        tooltip: buildTimeOnlyTooltipConfig('Time')
+                        tooltip: buildTimeOnlyTooltipConfig('Time'),
+                        zoom: buildInteractiveZoomOptions()
                     }
                 },
                 plugins: [dateBandPlugin, signalLabelPlugin, hoverCrosshairPlugin]
@@ -2359,6 +2490,9 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             return fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&metric=${metric}&day_range=${dayRange}&chart_type=history`, { signal: histAbortCtrl.signal })
                 .then(res => res.json())
                 .then(data => {
+                    if (isManualChange) {
+                        resetChartZoom('history');
+                    }
                     if (data.error || !(data.history && data.history.length)) {
                         if (isManualChange || !hasHistoryData) {
                             historyChartObj._dateColors = [];
@@ -2418,6 +2552,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     historyChartObj.data.labels = times;
                     historyChartObj.data.datasets = datasets;
                     historyChartObj.update('none');
+                    updateZoomBadge(historyChartObj);
                 })
                 .catch(err => { if (err.name !== 'AbortError') console.error("Historical chart error:", err); });
         }
@@ -2597,7 +2732,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>"""
 
-# --- LIVE TRADE & POSITION DASHBOARD TEMPLATE (B7/B8 SPLIT + EDIT OPEN ORDERS & GTT MODAL) ---
+# --- LIVE TRADE & POSITION DASHBOARD TEMPLATE ---
 POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
@@ -3519,7 +3654,6 @@ def api_history():
                 grouped[bucket] = merged
         sliced = [grouped[b] for b in sorted(grouped.keys())][-1500:]
 
-    # Trim JSON payload to only fields needed by the requested chart (75% smaller network payload)
     if chart_type == "signal":
         slim = [{
             "datetime": s["datetime"],
@@ -3618,10 +3752,10 @@ def download_history_csv():
     cw = csv.writer(si)
     cw.writerow(["Datetime", "Formatted Time", "Symbol", "Spot Price", "ATM Strike", "PCR", "CE OI", "PE OI", "CE Chg in OI", "PE Chg in OI", "CE Vol", "PE Vol", "CE IV", "PE IV", "CE Delta", "PE Delta", "CE Theta", "PE Theta", "CE Vega", "PE Vega", "CE Gamma", "PE Gamma", "CE Ask", "PE Bid", "Min ROC (Buy)", "Max ROC (Sell)", "Cross ROC Sig", "Main Volatility", "New Signal", "5 Min Signal", "15 Min Signal", "30 Min Signal", "1 HR Signal"])
     for s in snapshots:
-        cw.writerow([s.get("datetime"), s.get("formatted_time"), s.get("symbol"), s.get("spot_price"), s.get("atm_strike"), s.get("pcr"), s.get("ce_oi"), s.get("pe_oi"), s.get("ce_oi_chg"), s.get("pe_oi_chg"), s.get("ce_vol"), s.get("pe_vol"), s.get("ce_iv"), s.get("ce_iv"), s.get("ce_delta"), s.get("pe_delta"), s.get("ce_theta"), s.get("pe_theta"), s.get("ce_vega"), s.get("pe_vega"), s.get("ce_gamma"), s.get("pe_gamma"), s.get("ce_ask"), s.get("pe_bid"), s.get("min_roc"), s.get("max_roc"), s.get("cross_roc"), s.get("main_volatility"), s.get("new_signal"), s.get("signal_5m"), s.get("signal_15m"), s.get("signal_30m"), s.get("signal_1h")])
+        cw.writerow([s.get("datetime"), s.get("formatted_time"), s.get("symbol"), s.get("spot_price"), s.get("atm_strike"), s.get("pcr"), s.get("ce_oi"), s.get("pe_oi"), s.get("ce_oi_chg"), s.get("pe_oi_chg"), s.get("ce_vol"), s.get("pe_vol"), s.get("ce_iv"), s.get("pe_iv"), s.get("ce_delta"), s.get("pe_delta"), s.get("ce_theta"), s.get("pe_theta"), s.get("ce_vega"), s.get("pe_vega"), s.get("ce_gamma"), s.get("pe_gamma"), s.get("ce_ask"), s.get("pe_bid"), s.get("min_roc"), s.get("max_roc"), s.get("cross_roc"), s.get("main_volatility"), s.get("new_signal"), s.get("signal_5m"), s.get("signal_15m"), s.get("signal_30m"), s.get("signal_1h")])
     output = Response(si.getvalue(), mimetype="text/csv")
-    output.headers["Content-Disposition"] = f"attachment; filename={symbol}_Historical_GSheet_Memory.csv"
+    output.headers["Content-Disposition"] = f"attachment; filename={symbol}_GoogleSheet_Historical_Trend.csv"
     return output
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
