@@ -59,7 +59,7 @@ _http_adapter = HTTPAdapter(pool_connections=30, pool_maxsize=30, max_retries=0)
 HTTP_SESSION.mount("https://", _http_adapter)
 HTTP_SESSION.mount("http://", _http_adapter)
 
-# --- IN-MEMORY STALE-WHILE-REVALIDATE (SWR) CACHES ---
+# --- IN-MEMORY CACHES ---
 EXPIRY_CACHE = {}                 # symbol -> {"ts": float, "expiries": list}
 CHAIN_CACHE = {}                  # (instrument_key, expiry) -> {"ts": float, "data": list}
 CHAIN_REFRESH_INFLIGHT = set()
@@ -68,7 +68,6 @@ DASHBOARD_CFG_CACHE = {"ts": 0.0, "cfg": None, "latency_ms": 0}
 DASHBOARD_REFRESH_INFLIGHT = False
 
 HISTORY_CACHE = {}                # sheet_key -> {"ts": float, "snapshots": list, "sheet_used": str}
-HISTORY_REFRESH_INFLIGHT = set()
 
 LAST_DIAGNOSTICS = {
     "upstox_ms": 0,
@@ -817,7 +816,6 @@ def _download_dashboard_config():
         active_raw = resolve_field(["active_trade", "active_trades", "max_active_trade", "max_active_trades"], 28).replace(",", "").strip()
         max_active_trades = int(float(active_raw)) if active_raw != "" else 1
 
-        # Exact row B29 or explicit exit_condition label (never scan random B1:B15 display cells)
         exit_cond_raw = resolve_field(
             ["exit_condition", "exit_signal", "exit", "exit_cond", "ce_pe_exit", "trade_exit", "exit_type", "exit_status"],
             29,
@@ -1239,7 +1237,7 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
         "reason": f"Eligible ({active_count}/{max_active_trades} active trades)."
     }
 
-# --- ULTRA-FAST VECTORIZED GOOGLE SHEET PARSER & SWR CACHE ---
+# --- ULTRA-FAST VECTORIZED GOOGLE SHEET PARSER & CACHE ---
 _DT_SPLIT_RE = re.compile(r'[\sT]+')
 _DATE_PART_RE = re.compile(r'^(\d{1,4})[/\-](\d{1,2})[/\-](\d{1,4})$')
 
@@ -1333,12 +1331,14 @@ def _download_and_parse_gsheet(symbol, sheet_name, expected_kind="history"):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept-Encoding": "gzip, deflate",
-        "Cache-Control": "no-cache"
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache"
     }
     raw_csv, used_sheet, last_err = None, None, None
 
     for s_name in candidate_sheets:
-        url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={urllib.parse.quote(s_name)}"
+        cb = int(time.time() * 1000)
+        url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={urllib.parse.quote(s_name)}&_cb={cb}"
         try:
             res = HTTP_SESSION.get(url, headers=headers, timeout=4.5)
             if res.status_code == 200:
@@ -1576,49 +1576,17 @@ def _download_and_parse_gsheet(symbol, sheet_name, expected_kind="history"):
         LAST_DIAGNOSTICS["gsheet_ms"] = int((time.time() - t0) * 1000)
         return [], used_sheet, f"Parsing error reading Google Sheet CSV: {e}"
 
-def _bg_refresh_history(cache_key, symbol, sheet_name, expected_kind):
-    try:
-        snaps, used_sheet, err = _download_and_parse_gsheet(symbol, sheet_name, expected_kind=expected_kind)
-        if not err and snaps:
-            with CACHE_LOCK:
-                HISTORY_CACHE[cache_key] = {"ts": time.time(), "snapshots": snaps, "sheet_used": used_sheet}
-    finally:
-        with CACHE_LOCK:
-            HISTORY_REFRESH_INFLIGHT.discard(cache_key)
-
 def fetch_history_from_gsheet(symbol="NIFTY", sheet_name=None, expected_kind="history", force_fresh=False):
     sym_clean = "BANKNIFTY" if "BANK" in symbol.upper() else "NIFTY"
     target_tab = (sheet_name or sym_clean).upper()
     cache_key = f"{sym_clean}|{target_tab}|{expected_kind}"
     now = time.time()
-    trigger_bg = False
 
     with CACHE_LOCK:
         cached = HISTORY_CACHE.get(cache_key)
-        if not force_fresh and cached and cached["snapshots"]:
-            age = now - cached["ts"]
-            if age < 10.0:
-                return cached["snapshots"], cached.get("sheet_used", target_tab), None
-            if age < 300.0:
-                if cache_key not in HISTORY_REFRESH_INFLIGHT:
-                    HISTORY_REFRESH_INFLIGHT.add(cache_key)
-                    trigger_bg = True
-                cached_snaps = cached["snapshots"]
-                cached_tab = cached.get("sheet_used", target_tab)
-            else:
-                cached_snaps = None
-                cached_tab = target_tab
-        else:
-            cached_snaps = None
-            cached_tab = target_tab
-
-    if trigger_bg and cached_snaps is not None:
-        threading.Thread(
-            target=_bg_refresh_history,
-            args=(cache_key, sym_clean, target_tab, expected_kind),
-            daemon=True
-        ).start()
-        return cached_snaps, cached_tab, None
+        # Only reuse memory cache when dropdown filters change within the same 10s Auto Sync window
+        if not force_fresh and cached and cached["snapshots"] and (now - cached["ts"]) < 9.0:
+            return cached["snapshots"], cached.get("sheet_used", target_tab), None
 
     ordered_snaps, used_sheet, err = _download_and_parse_gsheet(sym_clean, target_tab, expected_kind=expected_kind)
     if err or not ordered_snaps:
@@ -2014,7 +1982,7 @@ MAIN_HTML_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>"""
 
-# --- ANALYSIS DASHBOARD TEMPLATE (FAST SWR GOOGLE SHEET + INTERACTIVE AREA ZOOM & PAN) ---
+# --- ANALYSIS DASHBOARD TEMPLATE (LIVE AUTO-SYNC EVERY 10s + INTERACTIVE AREA ZOOM & PAN) ---
 ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
@@ -2056,7 +2024,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
     <h2>📊 {{ symbol }} Advanced Analytics & Google Sheet Memory Dashboard</h2>
-    <div class="subtitle">Ultra-fast SWR Google Sheet engine — Drag across any section on Chart 2 or 3 to zoom into specific dates/times</div>
+    <div class="subtitle">Live 10s Direct Google Sheet Sync — Drag across any section on Chart 2 or 3 to zoom into specific dates/times</div>
 
     <div class="nav-bar">
         <label style="color: #94a3b8; font-weight: bold;">Symbol:</label>
@@ -2551,7 +2519,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             });
         }
 
-        function loadSignalChart(isManualChange = false, forceFresh = false) {
+        function loadSignalChart(isManualChange = false, forceFresh = true) {
             if (sigAbortCtrl) sigAbortCtrl.abort();
             sigAbortCtrl = new AbortController();
             const dayRange = document.getElementById('signalDayRangeSelector').value;
@@ -2559,7 +2527,10 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             const metaBadge = document.getElementById('sigMetaBadge');
             if (forceFresh && metaBadge) metaBadge.innerText = "Syncing Sheet...";
 
-            return fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&day_range=${dayRange}&chart_type=signal&force=${forceFresh ? 1 : 0}`, { signal: sigAbortCtrl.signal })
+            return fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&day_range=${dayRange}&chart_type=signal&force=${forceFresh ? 1 : 0}&_t=${Date.now()}`, {
+                cache: 'no-store',
+                signal: sigAbortCtrl.signal
+            })
                 .then(res => res.json())
                 .then(data => {
                     if (isManualChange) {
@@ -2639,7 +2610,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             });
         }
 
-        function loadHistoricalChart(isManualChange = false, forceFresh = false) {
+        function loadHistoricalChart(isManualChange = false, forceFresh = true) {
             if (histAbortCtrl) histAbortCtrl.abort();
             histAbortCtrl = new AbortController();
 
@@ -2658,7 +2629,10 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             };
             const activeSigKey = tfSignalKeyMap[timeframe] || "signal_5m";
 
-            return fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&metric=${metric}&day_range=${dayRange}&chart_type=history&force=${forceFresh ? 1 : 0}`, { signal: histAbortCtrl.signal })
+            return fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&metric=${metric}&day_range=${dayRange}&chart_type=history&force=${forceFresh ? 1 : 0}&_t=${Date.now()}`, {
+                cache: 'no-store',
+                signal: histAbortCtrl.signal
+            })
                 .then(res => res.json())
                 .then(data => {
                     if (isManualChange) {
@@ -2877,7 +2851,10 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         function fetchOptionChainData() {
             if (dataAbortCtrl) dataAbortCtrl.abort();
             dataAbortCtrl = new AbortController();
-            return fetch(`/api/data?symbol=${currentSymbol}&expiry=${currentExpiry}`, { signal: dataAbortCtrl.signal })
+            return fetch(`/api/data?symbol=${currentSymbol}&expiry=${currentExpiry}&_t=${Date.now()}`, {
+                cache: 'no-store',
+                signal: dataAbortCtrl.signal
+            })
                 .then(r => r.json())
                 .then(data => renderPageData(data))
                 .catch(e => { if (e.name !== 'AbortError') console.error(e); });
@@ -2887,11 +2864,11 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         function fetchDataInBackground(isInitial = false) {
             if (isSyncing) return;
             isSyncing = true;
-            document.getElementById("syncBadge").innerText = "Syncing...";
+            document.getElementById("syncBadge").innerText = "Syncing Sheet...";
             Promise.allSettled([
                 fetchOptionChainData(),
-                loadHistoricalChart(isInitial, false),
-                loadSignalChart(isInitial, false)
+                loadHistoricalChart(isInitial, true),
+                loadSignalChart(isInitial, true)
             ]).finally(() => {
                 isSyncing = false;
                 timerSeconds = 10;
@@ -3797,11 +3774,13 @@ def api_data():
         symbol = "NIFTY"
     selected_expiry = request.args.get("expiry", "ALL")
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
-    return jsonify({
+    resp = jsonify({
         "symbol": symbol, "rows": rows, "spot_price": spot_price, "atm_strike": atm_strike,
         "expiry": expiry, "expiries": expiries, "updated": updated, "pcr": pcr,
         "total_ce_oi": total_ce_oi, "total_pe_oi": total_pe_oi, "error": error
     })
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
 
 @app.route("/api/history")
 def api_history():
@@ -3834,10 +3813,10 @@ def api_history():
         force_fresh=force_fresh
     )
     if error:
-        return jsonify({"symbol": symbol, "sheet_used": used_sheet, "history": [], "error": error})
+        resp = jsonify({"symbol": symbol, "sheet_used": used_sheet, "history": [], "error": error})
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
 
-    # Filter by exact distinct trading sessions for intraday day ranges (1day, 3day, 1week, 2week)
-    # so Monday morning never slices off Friday's morning session.
     session_count_map = {"1day": 1, "3day": 3, "1week": 5, "2week": 10}
     calendar_sec_map = {"1month": 30 * 86400, "3month": 90 * 86400}
 
@@ -3860,77 +3839,111 @@ def api_history():
                 cutoff = max_ts - calendar_sec_map[day_range]
                 snapshots = [s for s in snapshots if s["timestamp"] >= cutoff or s["timestamp"] == 0]
 
-    # For signal charts, each timeframe already has its dedicated tab (e.g., NIFTY_5_MIN, NIFTY_15_MIN).
-    # For history charts, aggregate 5-minute snapshots into higher timeframes when requested.
     if chart_type == "signal" or timeframe == "5minute" or not snapshots:
         sliced = snapshots[-1500:]
         for item in sliced:
             if not item.get("formatted_time"):
                 item["formatted_time"] = item.get("datetime", "")
-        return jsonify({"symbol": symbol, "sheet_used": used_sheet, "history": sliced, "error": None})
+        resp = jsonify({"symbol": symbol, "sheet_used": used_sheet, "history": sliced, "error": None})
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
 
-    tf_seconds = {"15minute": 900, "30minute": 1800, "60minute": 3600, "day": 86400}
-    interval_sec = tf_seconds.get(timeframe, 900)
+    tf_seconds_map = {"15minute": 900, "30minute": 1800, "60minute": 3600, "day": 86400}
+    bucket_sec = tf_seconds_map.get(timeframe, 300)
     buckets = {}
-    for idx, s in enumerate(snapshots):
-        ts = s.get("timestamp", 0)
-        b_key = (s.get("date_str") or str(idx)) if timeframe == "day" else ((ts // interval_sec) if ts > 0 else (idx // max(1, (interval_sec // 300))))
+
+    for s in snapshots:
+        ts = s["timestamp"]
+        if ts > 0:
+            b_key = (s.get("date_str", ""), ts // bucket_sec) if timeframe != "day" else s.get("date_str", str(ts // 86400))
+        else:
+            b_key = s.get("datetime", "")
+
         if b_key not in buckets:
             buckets[b_key] = dict(s)
+            buckets[b_key]["_sort_ts"] = ts
+            if timeframe == "day":
+                buckets[b_key]["formatted_time"] = s.get("date_str") or s.get("datetime", "")
+            else:
+                buckets[b_key]["formatted_time"] = s.get("formatted_time") or s.get("datetime", "")
         else:
-            b = buckets[b_key]
-            for k in ("spot_price", "atm_strike", "pcr", "ce_oi", "pe_oi", "ce_oi_chg", "pe_oi_chg", "ce_iv", "pe_iv", "ce_delta", "pe_delta", "ce_theta", "pe_theta", "ce_vega", "pe_vega", "ce_gamma", "pe_gamma", "ce_bid", "pe_bid", "ce_ask", "pe_ask", "ce_ltp", "pe_ltp", "min_roc", "max_roc", "cross_roc", "main_volatility"):
+            existing = buckets[b_key]
+            for k in (
+                "spot_price", "atm_strike", "pcr", "ce_oi", "pe_oi", "ce_oi_chg", "pe_oi_chg",
+                "ce_vol", "pe_vol", "ce_iv", "pe_iv", "ce_delta", "pe_delta", "ce_theta", "pe_theta",
+                "ce_vega", "pe_vega", "ce_gamma", "pe_gamma", "ce_bid", "pe_bid", "ce_ask", "pe_ask",
+                "ce_ltp", "pe_ltp", "min_roc", "max_roc", "cross_roc", "main_volatility"
+            ):
                 if k in s:
-                    b[k] = s[k]
-            for sk in ("new_signal", "signal_5m", "signal_15m", "signal_30m", "signal_1h"):
-                if s.get(sk):
-                    b[sk] = s[sk]
-            b["ce_vol"] = b.get("ce_vol", 0) + s.get("ce_vol", 0)
-            b["pe_vol"] = b.get("pe_vol", 0) + s.get("pe_vol", 0)
-            b["datetime"] = s.get("datetime", b.get("datetime", ""))
-            b["formatted_time"] = s.get("date_str", b["datetime"]) if timeframe == "day" else s.get("formatted_time", b["datetime"])
+                    existing[k] = s[k]
+            for sig_k in ("new_signal", "signal_5m", "signal_15m", "signal_30m", "signal_1h"):
+                if s.get(sig_k):
+                    existing[sig_k] = s[sig_k]
 
-    aggregated = [buckets[k] for k in sorted(buckets.keys())][-1500:]
-    return jsonify({"symbol": symbol, "sheet_used": used_sheet, "history": aggregated, "error": None})
+    aggregated = sorted(list(buckets.values()), key=lambda x: x.get("_sort_ts", 0))[-1500:]
+    resp = jsonify({"symbol": symbol, "sheet_used": used_sheet, "history": aggregated, "error": None})
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
 
 @app.route("/download_history")
 def download_history():
     symbol = request.args.get("symbol", "NIFTY").upper()
-    if symbol not in INSTRUMENT_KEYS:
-        symbol = "NIFTY"
-    snapshots, _, error = fetch_history_from_gsheet(symbol=symbol, sheet_name=symbol, expected_kind="history")
-    if error:
-        return f"Error: {error}", 500
+    snapshots, _, error = fetch_history_from_gsheet(symbol, force_fresh=True)
+    if error or not snapshots:
+        return Response(f"Error: {error}", status=400, mimetype="text/plain")
     si = io.StringIO()
     cw = csv.writer(si)
-    cw.writerow(["Time", "Symbol", "Price LTP", "ATM Strike", "PCR", "CE OI", "PE OI", "CE Chng OI", "PE Chng OI", "CE Vol", "PE Vol", "CE IV", "PE IV", "CE Delta", "PE Delta", "CE Theta", "PE Theta", "CE Vega", "PE Vega", "CE Gamma", "PE Gamma", "CE Bid", "PE Bid", "CE Ask", "PE Ask", "CE LTP", "PE LTP", "Min ROC (Buy)", "Max ROC (Sell)", "Cross ROC Sig", "Main Volatility", "5 Min Signal", "15 Min Signal", "30 Min Signal", "1 HR Signal"])
-    for s in snapshots:
+    cw.writerow([
+        "Time", "Symbol", "Price LTP", "ATM Strike", "PCR", "CE OI", "PE OI", "CE Chg in OI", "PE Chg in OI",
+        "CE Vol", "PE Vol", "CE IV", "PE IV", "CE Delta", "PE Delta", "CE Theta", "PE Theta",
+        "CE Vega", "PE Vega", "CE Gamma", "PE Gamma", "CE Bid", "PE Bid", "CE Ask", "PE Ask",
+        "CE LTP", "PE LTP", "5 Min Signal", "15 Min Signal", "30 Min Signal", "1 HR Signal"
+    ])
+    for r in snapshots:
         cw.writerow([
-            s.get("datetime", ""), s.get("symbol", symbol), s.get("spot_price", 0), s.get("atm_strike", 0), s.get("pcr", 0),
-            s.get("ce_oi", 0), s.get("pe_oi", 0), s.get("ce_oi_chg", 0), s.get("pe_oi_chg", 0), s.get("ce_vol", 0), s.get("pe_vol", 0),
-            s.get("ce_iv", 0), s.get("pe_iv", 0), s.get("ce_delta", 0), s.get("pe_delta", 0), s.get("ce_theta", 0), s.get("pe_theta", 0),
-            s.get("ce_vega", 0), s.get("pe_vega", 0), s.get("ce_gamma", 0), s.get("pe_gamma", 0), s.get("ce_bid", 0), s.get("pe_bid", 0),
-            s.get("ce_ask", 0), s.get("pe_ask", 0), s.get("ce_ltp", 0), s.get("pe_ltp", 0), s.get("min_roc", 0), s.get("max_roc", 0),
-            s.get("cross_roc", 0), s.get("main_volatility", 0), s.get("signal_5m", ""), s.get("signal_15m", ""),
-            s.get("signal_30m", ""), s.get("signal_1h", "")
+            r.get("datetime", ""), r.get("symbol", ""), r.get("spot_price", 0), r.get("atm_strike", 0), r.get("pcr", 0),
+            r.get("ce_oi", 0), r.get("pe_oi", 0), r.get("ce_oi_chg", 0), r.get("pe_oi_chg", 0),
+            r.get("ce_vol", 0), r.get("pe_vol", 0), r.get("ce_iv", 0), r.get("pe_iv", 0),
+            r.get("ce_delta", 0), r.get("pe_delta", 0), r.get("ce_theta", 0), r.get("pe_theta", 0),
+            r.get("ce_vega", 0), r.get("pe_vega", 0), r.get("ce_gamma", 0), r.get("pe_gamma", 0),
+            r.get("ce_bid", 0), r.get("pe_bid", 0), r.get("ce_ask", 0), r.get("pe_ask", 0),
+            r.get("ce_ltp", 0), r.get("pe_ltp", 0),
+            r.get("signal_5m", ""), r.get("signal_15m", ""), r.get("signal_30m", ""), r.get("signal_1h", "")
         ])
-    return Response(si.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename={symbol}_GoogleSheet_Memory.csv"})
+    return Response(
+        si.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment;filename={symbol}_GoogleSheet_History_{get_ist_now().strftime('%Y%m%d_%H%M%S')}.csv"}
+    )
 
 @app.route("/download")
-def download():
+def download_csv():
     symbol = request.args.get("symbol", "NIFTY").upper()
-    if symbol not in INSTRUMENT_KEYS:
-        symbol = "NIFTY"
     selected_expiry = request.args.get("expiry", "ALL")
     rows, spot_price, atm_strike, expiry, _, updated, pcr, _, _, error = process_option_data(symbol, selected_expiry)
     if error:
-        return f"Error: {error}", 500
+        return Response(f"Error: {error}", status=400, mimetype="text/plain")
     si = io.StringIO()
     cw = csv.writer(si)
-    cw.writerow(["Symbol", "Spot", "ATM", "Expiry", "PCR", "Updated", "CE_OI", "CE_Chg_OI", "CE_Vol", "CE_IV", "CE_Delta", "CE_Theta", "CE_Vega", "CE_Gamma", "CE_Bid", "CE_Ask", "CE_LTP", "Strike", "PE_LTP", "PE_Bid", "PE_Ask", "PE_Delta", "PE_Theta", "PE_Vega", "PE_Gamma", "PE_IV", "PE_Vol", "PE_Chg_OI", "PE_OI"])
+    cw.writerow(["Symbol", symbol, "Spot Price", spot_price, "ATM Strike", atm_strike, "Expiry", expiry, "PCR", pcr, "Updated (IST)", updated])
+    cw.writerow([])
+    cw.writerow([
+        "CE OI", "CE Chg OI", "CE Vol", "CE IV", "CE Delta", "CE Theta", "CE Vega", "CE Gamma", "CE Bid", "CE Ask", "CE LTP",
+        "STRIKE",
+        "PE LTP", "PE Bid", "PE Ask", "PE Delta", "PE Theta", "PE Vega", "PE Gamma", "PE IV", "PE Vol", "PE Chg OI", "PE OI"
+    ])
     for r in rows:
-        cw.writerow([symbol, spot_price, atm_strike, expiry, pcr, updated, r["ce_oi"], r["ce_oi_chg"], r["ce_vol"], r["ce_iv"], r["ce_delta"], r["ce_theta"], r["ce_vega"], r["ce_gamma"], r["ce_bid"], r["ce_ask"], r["ce_ltp"], r["strike"], r["pe_ltp"], r["pe_bid"], r["pe_ask"], r["pe_delta"], r["pe_theta"], r["pe_vega"], r["pe_gamma"], r["pe_iv"], r["pe_vol"], r["pe_oi_chg"], r["pe_oi"]])
-    return Response(si.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename={symbol}_option_chain.csv"})
+        cw.writerow([
+            r["ce_oi"], r["ce_oi_chg"], r["ce_vol"], r["ce_iv"], r["ce_delta"], r["ce_theta"], r["ce_vega"], r["ce_gamma"], r["ce_bid"], r["ce_ask"], r["ce_ltp"],
+            r["strike"],
+            r["pe_ltp"], r["pe_bid"], r["pe_ask"], r["pe_delta"], r["pe_theta"], r["pe_vega"], r["pe_gamma"], r["pe_iv"], r["pe_vol"], r["pe_oi_chg"], r["pe_oi"]
+        ])
+    return Response(
+        si.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment;filename={symbol}_Option_Chain_{get_ist_now().strftime('%Y%m%d_%H%M%S')}.csv"}
+    )
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
