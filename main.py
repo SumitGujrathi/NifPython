@@ -51,15 +51,15 @@ FAILED_ORDER_STATUSES = {
     "rejected", "cancelled", "canceled", "expired", "failed"
 }
 
-AUTH_COOLDOWN = {"last_failure_time": 0, "cooldown_duration": 1500}
+AUTH_COOLDOWN = {"last_failure_time": 0, "cooldown_duration": 60}
 
 # --- PERSISTENT HTTP CONNECTION POOL ---
 HTTP_SESSION = requests.Session()
-_http_adapter = HTTPAdapter(pool_connections=30, pool_maxsize=30, max_retries=0)
+_http_adapter = HTTPAdapter(pool_connections=40, pool_maxsize=40, max_retries=0)
 HTTP_SESSION.mount("https://", _http_adapter)
 HTTP_SESSION.mount("http://", _http_adapter)
 
-# --- IN-MEMORY CACHES ---
+# --- IN-MEMORY CACHES & SINGLE-FLIGHT LOCKS ---
 EXPIRY_CACHE = {}                 # symbol -> {"ts": float, "expiries": list}
 CHAIN_CACHE = {}                  # (instrument_key, expiry) -> {"ts": float, "data": list}
 CHAIN_REFRESH_INFLIGHT = set()
@@ -67,7 +67,9 @@ CHAIN_REFRESH_INFLIGHT = set()
 DASHBOARD_CFG_CACHE = {"ts": 0.0, "cfg": None, "latency_ms": 0}
 DASHBOARD_REFRESH_INFLIGHT = False
 
-HISTORY_CACHE = {}                # sheet_key -> {"ts": float, "snapshots": list, "sheet_used": str}
+HISTORY_CACHE = {}                # cache_key -> {"ts": float, "snapshots": list, "sheet_used": str}
+HISTORY_INFLIGHT_LOCKS = {}       # cache_key -> threading.Lock()
+ACTIVE_ANALYSIS_SYMBOLS = {"NIFTY": time.time()}
 
 LAST_DIAGNOSTICS = {
     "upstox_ms": 0,
@@ -137,7 +139,7 @@ def perform_single_auth(force_refresh=False):
                 json={"totp": totp_code, "pin": str(PIN).strip()},
                 headers={"accept": "application/json", "Content-Type": "application/json", "x-api-key": str(CLIENT_ID).strip()},
                 proxies=get_upstox_proxies(),
-                timeout=8
+                timeout=(2.5, 5.0)
             )
             if res.status_code == 200:
                 jd = res.json()
@@ -159,7 +161,7 @@ def get_current_outbound_ip():
     proxies = get_upstox_proxies()
     for url in ("https://api.ipify.org?format=json", "https://ifconfig.me/ip"):
         try:
-            res = HTTP_SESSION.get(url, proxies=proxies, timeout=5)
+            res = HTTP_SESSION.get(url, proxies=proxies, timeout=(2.0, 3.5))
             if res.status_code == 200:
                 return res.json().get("ip", "").strip() if "ipify" in url else res.text.strip()
         except Exception:
@@ -176,7 +178,7 @@ def fetch_upstox_static_ip_status():
             "https://api.upstox.com/v2/user/ip",
             headers={"Accept": "application/json", "Content-Type": "application/json", "Authorization": f"Bearer {token}"},
             proxies=get_upstox_proxies(),
-            timeout=6
+            timeout=(2.5, 4.5)
         )
         if res.status_code == 200:
             data = res.json().get("data", {}) or {}
@@ -205,7 +207,7 @@ def update_upstox_static_ip(primary_ip, secondary_ip=None):
             json=payload,
             headers={"Accept": "application/json", "Content-Type": "application/json", "Authorization": f"Bearer {token}"},
             proxies=get_upstox_proxies(),
-            timeout=8
+            timeout=(2.5, 5.0)
         )
         rj = res.json() if res.content else {}
         if res.status_code == 200 and rj.get("status") == "success":
@@ -372,7 +374,7 @@ def modify_upstox_gtt_sl_target(gtt_order, new_sl, new_target, new_entry=None, n
             json={"type": gtt_order.get("type", "MULTIPLE"), "quantity": qty_val, "gtt_order_id": gtt_order_id, "rules": updated_rules},
             headers={"Accept": "application/json", "Content-Type": "application/json", "Authorization": f"Bearer {token}"},
             proxies=get_upstox_proxies(),
-            timeout=8
+            timeout=(2.5, 5.0)
         )
         rj = res.json() if res.content else {}
         if res.status_code == 200 and rj.get("status") == "success":
@@ -421,7 +423,7 @@ def modify_upstox_regular_order(order_id, quantity, price, trigger_price=0.0, or
             json=payload,
             headers={"Accept": "application/json", "Content-Type": "application/json", "Authorization": f"Bearer {token}"},
             proxies=get_upstox_proxies(),
-            timeout=8
+            timeout=(2.5, 5.0)
         )
         rj = res.json() if res.content else {}
         if res.status_code == 200 and rj.get("status") == "success":
@@ -562,7 +564,7 @@ def cancel_upstox_regular_order(order_id, headers, proxies):
             f"https://api-hft.upstox.com/v3/order/cancel?order_id={urllib.parse.quote(str(order_id))}",
             headers=headers,
             proxies=proxies,
-            timeout=6
+            timeout=(2.5, 4.5)
         )
         rj = res.json() if res.content else {}
         if res.status_code == 200 and rj.get("status") == "success":
@@ -579,7 +581,7 @@ def cancel_upstox_gtt_order(gtt_order_id, headers, proxies):
             json={"gtt_order_id": str(gtt_order_id)},
             headers=headers,
             proxies=proxies,
-            timeout=6
+            timeout=(2.5, 4.5)
         )
         rj = res.json() if res.content else {}
         if res.status_code == 200 and rj.get("status") == "success":
@@ -621,7 +623,7 @@ def exit_position_at_market(pos, headers, proxies):
             json=payload,
             headers=headers,
             proxies=proxies,
-            timeout=8
+            timeout=(2.5, 5.0)
         )
         rj = res.json() if res.content else {}
         if res.status_code == 200 and rj.get("status") == "success":
@@ -718,7 +720,7 @@ def _download_dashboard_config():
 
     raw_csv, last_err = None, None
     try:
-        res = HTTP_SESSION.get(url, headers=headers, timeout=3.2)
+        res = HTTP_SESSION.get(url, headers=headers, timeout=(2.0, 3.0))
         if res.status_code == 200:
             text = res.text.lstrip('\ufeff')
             if text.strip().startswith("<!DOCTYPE") or "<html" in text.lower():
@@ -907,7 +909,7 @@ def get_cached_expiries(symbol, headers):
         res = HTTP_SESSION.get(
             f"https://api.upstox.com/v2/option/contract?instrument_key={urllib.parse.quote(instrument_key)}",
             headers=headers,
-            timeout=5
+            timeout=(2.5, 4.0)
         )
         if res.status_code == 401:
             invalidate_session()
@@ -917,7 +919,7 @@ def get_cached_expiries(symbol, headers):
                 res = HTTP_SESSION.get(
                     f"https://api.upstox.com/v2/option/contract?instrument_key={urllib.parse.quote(instrument_key)}",
                     headers=headers,
-                    timeout=5
+                    timeout=(2.5, 4.0)
                 )
         if res.status_code != 200:
             with CACHE_LOCK:
@@ -1090,7 +1092,7 @@ def submit_upstox_evaluated_order(evaluated_order):
                 json={"type": "MULTIPLE", "quantity": qty, "product": product, "rules": rules, "instrument_token": inst_token, "transaction_type": txn_type},
                 headers=headers,
                 proxies=proxies,
-                timeout=8
+                timeout=(2.5, 5.0)
             )
             rj = res.json() if res.content else {}
             if res.status_code == 200 and rj.get("status") == "success":
@@ -1113,7 +1115,7 @@ def submit_upstox_evaluated_order(evaluated_order):
                 json={"quantity": qty, "product": product, "validity": "DAY", "price": entry_price, "tag": "DASHBOARD_ORDER", "instrument_token": inst_token, "order_type": "LIMIT", "transaction_type": txn_type, "disclosed_quantity": 0, "trigger_price": 0, "is_amo": False},
                 headers=headers,
                 proxies=proxies,
-                timeout=8
+                timeout=(2.5, 5.0)
             )
             rj = res.json() if res.content else {}
             if res.status_code == 200 and rj.get("status") == "success":
@@ -1237,15 +1239,11 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
         "reason": f"Eligible ({active_count}/{max_active_trades} active trades)."
     }
 
-# --- ULTRA-FAST VECTORIZED GOOGLE SHEET PARSER & CACHE ---
+# --- ULTRA-FAST VECTORIZED GOOGLE SHEET PARSER & SINGLE-FLIGHT CACHE ---
 _DT_SPLIT_RE = re.compile(r'[\sT]+')
 _DATE_PART_RE = re.compile(r'^(\d{1,4})[/\-](\d{1,2})[/\-](\d{1,4})$')
 
 def _detect_date_order(sample_strings):
-    """
-    Auto-detects whether sheet timestamps use YMD, DMY (Indian standard), or MDY
-    so DD/MM vs MM/DD never mismatches mid-sheet.
-    """
     for raw in sample_strings:
         if not raw:
             continue
@@ -1263,10 +1261,6 @@ def _detect_date_order(sample_strings):
     return "DMY"
 
 def parse_ist_datetime_fast(dt_str, date_order="DMY"):
-    """
-    O(1) slice/regex parser in IST timezone — 50x faster than multi-format strptime
-    and handles '/', '-', 2-digit/4-digit years, and optional AM/PM cleanly.
-    """
     if not dt_str:
         return 0, "", ""
     s = dt_str.strip()
@@ -1340,15 +1334,15 @@ def _download_and_parse_gsheet(symbol, sheet_name, expected_kind="history"):
         cb = int(time.time() * 1000)
         url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={urllib.parse.quote(s_name)}&_cb={cb}"
         try:
-            res = HTTP_SESSION.get(url, headers=headers, timeout=4.5)
+            res = HTTP_SESSION.get(url, headers=headers, timeout=(2.5, 4.5))
             if res.status_code == 200:
                 text = res.text.strip().lstrip('\ufeff')
                 if text.startswith("<!DOCTYPE") or "<html" in text.lower():
                     last_err = "Google Sheet is private. Set sharing to 'Anyone with the link can view'."
                     continue
                 if len(text) > 30:
-                    # Guard against Google gviz silently falling back to DASHBOARD / wrong tab
-                    head_sample = "\n".join(text.splitlines()[:8]).lower()
+                    non_empty_head = [l for l in text.splitlines() if l.strip()][:15]
+                    head_sample = "\n".join(non_empty_head).lower()
                     if "want to trade" in head_sample or "manual order" in head_sample:
                         last_err = f"Tab '{s_name}' not found in Google Sheet (fell back to DASHBOARD)."
                         continue
@@ -1364,7 +1358,7 @@ def _download_and_parse_gsheet(symbol, sheet_name, expected_kind="history"):
             else:
                 last_err = f"Google Sheet HTTP status {res.status_code}"
         except Exception as e:
-            last_err = f"Network error connecting to Google Sheet: {e}"
+            last_err = f"Google Sheet timeout/error: {e}"
 
     if not raw_csv:
         LAST_DIAGNOSTICS["gsheet_ms"] = int((time.time() - t0) * 1000)
@@ -1376,7 +1370,7 @@ def _download_and_parse_gsheet(symbol, sheet_name, expected_kind="history"):
             return [], used_sheet, "Google Sheet CSV is empty."
 
         header_idx = 0
-        for i, l in enumerate(lines[:10]):
+        for i, l in enumerate(lines[:15]):
             ll = l.lower()
             if any(k in ll for k in ("time", "symbol", "pcr", "ltp", "min roc")):
                 header_idx = i
@@ -1492,7 +1486,6 @@ def _download_and_parse_gsheet(symbol, sheet_name, expected_kind="history"):
             idx_main_vol = find_col(["main volatility", "main_vol", "volatility"])
             idx_new_sig = find_col(["new signal", "signal", "sig"])
 
-            # Col AF (31) = 5 Min Signal, Col AG (32) = 15 Min Signal, Col AH (33) = 30 Min Signal, Col AI (34) = 1 HR Signal
             idx_sig_5m = find_col(["5 min signal", "5min signal", "5_min_signal", "5m signal", "5 min sig"], 31)
             idx_sig_15m = find_col(["15 min signal", "15min signal", "15_min_signal", "15m signal", "15 min sig"], 32)
             idx_sig_30m = find_col(["30 min signal", "30min signal", "30_min_signal", "30m signal", "30 min sig"], 33)
@@ -1566,7 +1559,6 @@ def _download_and_parse_gsheet(symbol, sheet_name, expected_kind="history"):
         if not snapshots:
             return [], used_sheet, f"Google Sheet connected ({used_sheet}) but no valid data rows were found."
 
-        # Guarantee true ascending chronological order (oldest -> newest) regardless of sheet row order
         if any(s["timestamp"] > 0 for s in snapshots):
             snapshots.sort(key=lambda x: (x["timestamp"], x["_row_idx"]))
 
@@ -1576,41 +1568,70 @@ def _download_and_parse_gsheet(symbol, sheet_name, expected_kind="history"):
         LAST_DIAGNOSTICS["gsheet_ms"] = int((time.time() - t0) * 1000)
         return [], used_sheet, f"Parsing error reading Google Sheet CSV: {e}"
 
+def _get_sheet_lock(cache_key):
+    with CACHE_LOCK:
+        lk = HISTORY_INFLIGHT_LOCKS.get(cache_key)
+        if lk is None:
+            lk = threading.Lock()
+            HISTORY_INFLIGHT_LOCKS[cache_key] = lk
+        return lk
+
 def fetch_history_from_gsheet(symbol="NIFTY", sheet_name=None, expected_kind="history", force_fresh=False):
     sym_clean = "BANKNIFTY" if "BANK" in symbol.upper() else "NIFTY"
     target_tab = (sheet_name or sym_clean).upper()
     cache_key = f"{sym_clean}|{target_tab}|{expected_kind}"
+    ACTIVE_ANALYSIS_SYMBOLS[sym_clean] = time.time()
+
+    # Coalescing threshold: 2.5s when force=1 (prevents duplicate downloads if background sync just fetched it), 8.5s for dropdown switches
+    fresh_ttl = 2.5 if force_fresh else 8.5
     now = time.time()
 
     with CACHE_LOCK:
         cached = HISTORY_CACHE.get(cache_key)
-        # Only reuse memory cache when dropdown filters change within the same 10s Auto Sync window
-        if not force_fresh and cached and cached["snapshots"] and (now - cached["ts"]) < 9.0:
+        if cached and cached["snapshots"] and (now - cached["ts"]) < fresh_ttl:
             return cached["snapshots"], cached.get("sheet_used", target_tab), None
 
-    ordered_snaps, used_sheet, err = _download_and_parse_gsheet(sym_clean, target_tab, expected_kind=expected_kind)
-    if err or not ordered_snaps:
+    sheet_lock = _get_sheet_lock(cache_key)
+    with sheet_lock:
+        # Re-check cache after acquiring single-flight lock (another thread may have just finished downloading)
+        now2 = time.time()
         with CACHE_LOCK:
-            if cache_key in HISTORY_CACHE and HISTORY_CACHE[cache_key]["snapshots"]:
-                c = HISTORY_CACHE[cache_key]
-                return c["snapshots"], c.get("sheet_used", target_tab), None
-        return [], used_sheet or target_tab, err or "Could not retrieve CSV from Google Sheet."
+            cached = HISTORY_CACHE.get(cache_key)
+            if cached and cached["snapshots"] and (now2 - cached["ts"]) < fresh_ttl:
+                return cached["snapshots"], cached.get("sheet_used", target_tab), None
 
-    with CACHE_LOCK:
-        HISTORY_CACHE[cache_key] = {"ts": time.time(), "snapshots": ordered_snaps, "sheet_used": used_sheet}
-    return ordered_snaps, used_sheet, None
+        ordered_snaps, used_sheet, err = _download_and_parse_gsheet(sym_clean, target_tab, expected_kind=expected_kind)
+        if err or not ordered_snaps:
+            with CACHE_LOCK:
+                if cache_key in HISTORY_CACHE and HISTORY_CACHE[cache_key]["snapshots"]:
+                    c = HISTORY_CACHE[cache_key]
+                    return c["snapshots"], c.get("sheet_used", target_tab), None
+            return [], used_sheet or target_tab, err or "Could not retrieve CSV from Google Sheet."
 
-def _prewarm_gsheet_caches():
-    """Pre-warms DASHBOARD, NIFTY, and NIFTY_5_MIN caches in the background at startup."""
-    try:
-        with ThreadPoolExecutor(max_workers=3) as ex:
-            ex.submit(fetch_dashboard_order_config, True)
-            ex.submit(fetch_history_from_gsheet, "NIFTY", "NIFTY", "history", True)
-            ex.submit(fetch_history_from_gsheet, "NIFTY", "NIFTY_5_MIN", "signal", True)
-    except Exception:
-        pass
+        with CACHE_LOCK:
+            HISTORY_CACHE[cache_key] = {"ts": time.time(), "snapshots": ordered_snaps, "sheet_used": used_sheet}
+        return ordered_snaps, used_sheet, None
 
-threading.Thread(target=_prewarm_gsheet_caches, daemon=True).start()
+def _background_sheet_keepalive_loop():
+    """Proactively refreshes active Google Sheet tabs every 8s so frontend 10s Auto Sync resolves in <10ms."""
+    while True:
+        try:
+            now = time.time()
+            active_syms = [s for s, ts in list(ACTIVE_ANALYSIS_SYMBOLS.items()) if (now - ts) < 180]
+            if not active_syms:
+                active_syms = ["NIFTY"]
+            tasks = []
+            for sym in active_syms[:2]:
+                tasks.append((sym, sym, "history"))
+                tasks.append((sym, f"{sym}_5_MIN", "signal"))
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                for sym, tab, kind in tasks:
+                    ex.submit(fetch_history_from_gsheet, sym, tab, kind, True)
+        except Exception:
+            pass
+        time.sleep(8.0)
+
+threading.Thread(target=_background_sheet_keepalive_loop, daemon=True).start()
 
 # --- PARALLEL UPSTOX POSITIONS, ORDERS & GTT FETCHER ---
 def fetch_upstox_positions():
@@ -1624,7 +1645,7 @@ def fetch_upstox_positions():
     proxies = get_upstox_proxies()
 
     def _get_endpoint(url):
-        return HTTP_SESSION.get(url, headers=headers, proxies=proxies, timeout=5)
+        return HTTP_SESSION.get(url, headers=headers, proxies=proxies, timeout=(2.5, 4.5))
 
     try:
         with ThreadPoolExecutor(max_workers=3) as ex:
@@ -1744,7 +1765,7 @@ def _bg_refresh_chain(cache_key, instrument_key, expiry_date, headers):
         res = HTTP_SESSION.get(
             f"https://api.upstox.com/v2/option/chain?instrument_key={urllib.parse.quote(instrument_key)}&expiry_date={expiry_date}",
             headers=headers,
-            timeout=5
+            timeout=(2.5, 4.0)
         )
         if res.status_code == 200:
             data = res.json().get("data", [])
@@ -1783,7 +1804,7 @@ def fetch_single_expiry_chain(instrument_key, expiry_date, headers, use_cache=Tr
         res = HTTP_SESSION.get(
             f"https://api.upstox.com/v2/option/chain?instrument_key={urllib.parse.quote(instrument_key)}&expiry_date={expiry_date}",
             headers=headers,
-            timeout=5
+            timeout=(2.5, 4.0)
         )
         if res.status_code == 200:
             data = res.json().get("data", [])
@@ -1801,7 +1822,7 @@ def fetch_single_expiry_chain(instrument_key, expiry_date, headers, use_cache=Tr
 def fetch_option_chain(symbol, selected_expiry="ALL"):
     token = get_valid_token()
     if not token:
-        return None, None, [], "Authentication paused to protect account from lockout."
+        return None, None, [], "Upstox token unavailable (authentication paused or missing)."
     instrument_key = INSTRUMENT_KEYS.get(symbol, "NSE_INDEX|Nifty 50")
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
     try:
@@ -1982,7 +2003,7 @@ MAIN_HTML_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>"""
 
-# --- ANALYSIS DASHBOARD TEMPLATE (LIVE AUTO-SYNC EVERY 10s + INTERACTIVE AREA ZOOM & PAN) ---
+# --- ANALYSIS DASHBOARD TEMPLATE (ULTRA-FAST 10s AUTO-SYNC WITH TIMEOUT GUARD + AREA ZOOM & PAN) ---
 ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
@@ -2018,13 +2039,13 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         .sheet-meta-badge { background: #0f172a; border: 1px solid #334155; color: #34d399; padding: 4px 10px; border-radius: 6px; font-size: 12px; font-family: monospace; }
         .zoom-hint { font-size: 12px; color: #94a3b8; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
         .timer-badge { background: #0284c7; color: #ffffff; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
-        .error-msg { color: #f87171; font-weight: bold; padding: 15px; background: #450a0a; border-radius: 8px; }
+        .error-msg { color: #f87171; font-weight: bold; padding: 15px; background: #450a0a; border-radius: 8px; margin-bottom: 16px; }
         .canvas-wrap { position: relative; height: 420px; width: 100%; }
     </style>
 </head>
 <body>
     <h2>📊 {{ symbol }} Advanced Analytics & Google Sheet Memory Dashboard</h2>
-    <div class="subtitle">Live 10s Direct Google Sheet Sync — Drag across any section on Chart 2 or 3 to zoom into specific dates/times</div>
+    <div class="subtitle">High-Speed 10s Direct Google Sheet Sync — Drag across any section on Chart 2 or 3 to zoom into specific dates/times</div>
 
     <div class="nav-bar">
         <label style="color: #94a3b8; font-weight: bold;">Symbol:</label>
@@ -2169,10 +2190,28 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         let rawRows = [];
         let currentAtmStrike = 0;
         let myChart = null, historyChartObj = null, signalChartObj = null;
-        let hasHistoryData = false, hasSignalData = false;
+        let hasHistoryData = false, hasSignalData = false, hasSpotData = false;
         let histAbortCtrl = null, sigAbortCtrl = null, dataAbortCtrl = null;
 
         const DATE_PALETTE = ['#38bdf8', '#facc15', '#4ade80', '#f472b6', '#a78bfa', '#fb923c', '#2dd4bf'];
+
+        function fetchWithTimeout(url, externalSignal, timeoutMs = 7500) {
+            const timeoutCtrl = new AbortController();
+            const timerId = setTimeout(() => timeoutCtrl.abort(), timeoutMs);
+            if (externalSignal) {
+                if (externalSignal.aborted) {
+                    clearTimeout(timerId);
+                    timeoutCtrl.abort();
+                } else {
+                    externalSignal.addEventListener('abort', () => {
+                        clearTimeout(timerId);
+                        timeoutCtrl.abort();
+                    }, { once: true });
+                }
+            }
+            return fetch(url, { cache: 'no-store', signal: timeoutCtrl.signal })
+                .finally(() => clearTimeout(timerId));
+        }
 
         function updateZoomBadge(chart) {
             if (!chart) return;
@@ -2525,14 +2564,17 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             const dayRange = document.getElementById('signalDayRangeSelector').value;
             const timeframe = document.getElementById('signalTimeframeSelector').value;
             const metaBadge = document.getElementById('sigMetaBadge');
-            if (forceFresh && metaBadge) metaBadge.innerText = "Syncing Sheet...";
+            const t0 = performance.now();
+            if (forceFresh && metaBadge && !hasSignalData) metaBadge.innerText = "Syncing Sheet...";
 
-            return fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&day_range=${dayRange}&chart_type=signal&force=${forceFresh ? 1 : 0}&_t=${Date.now()}`, {
-                cache: 'no-store',
-                signal: sigAbortCtrl.signal
-            })
+            return fetchWithTimeout(
+                `/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&day_range=${dayRange}&chart_type=signal&force=${forceFresh ? 1 : 0}&_t=${Date.now()}`,
+                sigAbortCtrl.signal,
+                7500
+            )
                 .then(res => res.json())
                 .then(data => {
+                    const ms = Math.round(performance.now() - t0);
                     if (isManualChange) {
                         resetChartZoom('signal');
                     }
@@ -2561,7 +2603,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     const lastSnap = snapshots[snapshots.length - 1];
                     if (metaBadge) {
                         metaBadge.style.color = "#34d399";
-                        metaBadge.innerText = `Tab: ${data.sheet_used || '-'} | ${snapshots.length} pts | Latest: ${lastSnap.datetime || '-'}`;
+                        metaBadge.innerText = `Tab: ${data.sheet_used || '-'} | ${snapshots.length} pts | Latest: ${lastSnap.datetime || '-'} (${ms}ms)`;
                     }
 
                     const times = snapshots.map(s => s.formatted_time || s.datetime);
@@ -2575,7 +2617,13 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     signalChartObj.update('none');
                     updateZoomBadge(signalChartObj);
                 })
-                .catch(err => { if (err.name !== 'AbortError') console.error("Signal chart error:", err); });
+                .catch(err => {
+                    if (err.name === 'AbortError') {
+                        if (metaBadge && !hasSignalData) metaBadge.innerText = "Sheet timeout — retrying next tick";
+                    } else {
+                        console.error("Signal chart error:", err);
+                    }
+                });
         }
 
         function initHistoryChart() {
@@ -2618,7 +2666,8 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             const dayRange = document.getElementById('historyDayRangeSelector').value;
             const timeframe = document.getElementById('historyTimeframeSelector').value;
             const metaBadge = document.getElementById('histMetaBadge');
-            if (forceFresh && metaBadge) metaBadge.innerText = "Syncing Sheet...";
+            const t0 = performance.now();
+            if (forceFresh && metaBadge && !hasHistoryData) metaBadge.innerText = "Syncing Sheet...";
 
             const tfSignalKeyMap = {
                 "5minute": "signal_5m",
@@ -2629,12 +2678,14 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             };
             const activeSigKey = tfSignalKeyMap[timeframe] || "signal_5m";
 
-            return fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&metric=${metric}&day_range=${dayRange}&chart_type=history&force=${forceFresh ? 1 : 0}&_t=${Date.now()}`, {
-                cache: 'no-store',
-                signal: histAbortCtrl.signal
-            })
+            return fetchWithTimeout(
+                `/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&metric=${metric}&day_range=${dayRange}&chart_type=history&force=${forceFresh ? 1 : 0}&_t=${Date.now()}`,
+                histAbortCtrl.signal,
+                7500
+            )
                 .then(res => res.json())
                 .then(data => {
+                    const ms = Math.round(performance.now() - t0);
                     if (isManualChange) {
                         resetChartZoom('history');
                     }
@@ -2663,7 +2714,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     const lastSnap = snapshots[snapshots.length - 1];
                     if (metaBadge) {
                         metaBadge.style.color = "#34d399";
-                        metaBadge.innerText = `Tab: ${data.sheet_used || '-'} | ${snapshots.length} pts | Latest: ${lastSnap.datetime || '-'}`;
+                        metaBadge.innerText = `Tab: ${data.sheet_used || '-'} | ${snapshots.length} pts | Latest: ${lastSnap.datetime || '-'} (${ms}ms)`;
                     }
 
                     const times = snapshots.map(s => s.formatted_time || s.datetime);
@@ -2709,7 +2760,13 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     historyChartObj.update('none');
                     updateZoomBadge(historyChartObj);
                 })
-                .catch(err => { if (err.name !== 'AbortError') console.error("Historical chart error:", err); });
+                .catch(err => {
+                    if (err.name === 'AbortError') {
+                        if (metaBadge && !hasHistoryData) metaBadge.innerText = "Sheet timeout — retrying next tick";
+                    } else {
+                        console.error("Historical chart error:", err);
+                    }
+                });
         }
 
         const spotLinePlugin = {
@@ -2740,10 +2797,6 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         };
 
         function renderPageData(data) {
-            const errEl = document.getElementById("errorContainer");
-            if (data.error) { errEl.style.display = "block"; errEl.innerText = "Error: " + data.error; return; }
-            errEl.style.display = "none";
-
             if (Array.isArray(data.expiries) && data.expiries.length > 0) {
                 const expSel = document.getElementById("expirySelector");
                 if (expSel && expSel.options.length <= 1) {
@@ -2756,6 +2809,19 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     });
                 }
             }
+
+            const errEl = document.getElementById("errorContainer");
+            if (data.error) {
+                errEl.style.display = "block";
+                errEl.innerText = "Option Chain Feed: " + data.error;
+                if (!hasSpotData) {
+                    document.getElementById("cardSpot").innerText = "Feed Offline";
+                    document.getElementById("cardUpdated").innerText = data.updated || new Date().toLocaleTimeString();
+                }
+                return;
+            }
+            errEl.style.display = "none";
+            hasSpotData = true;
 
             rawRows = data.rows || [];
             currentAtmStrike = data.atm_strike || 0;
@@ -2851,28 +2917,42 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         function fetchOptionChainData() {
             if (dataAbortCtrl) dataAbortCtrl.abort();
             dataAbortCtrl = new AbortController();
-            return fetch(`/api/data?symbol=${currentSymbol}&expiry=${currentExpiry}&_t=${Date.now()}`, {
-                cache: 'no-store',
-                signal: dataAbortCtrl.signal
-            })
+            return fetchWithTimeout(`/api/data?symbol=${currentSymbol}&expiry=${currentExpiry}&_t=${Date.now()}`, dataAbortCtrl.signal, 7500)
                 .then(r => r.json())
                 .then(data => renderPageData(data))
-                .catch(e => { if (e.name !== 'AbortError') console.error(e); });
+                .catch(e => {
+                    if (e.name !== 'AbortError') {
+                        console.error(e);
+                    } else if (!hasSpotData) {
+                        document.getElementById("cardSpot").innerText = "Retrying...";
+                    }
+                });
         }
 
         let timerSeconds = 10, isSyncing = false;
         function fetchDataInBackground(isInitial = false) {
             if (isSyncing) return;
             isSyncing = true;
-            document.getElementById("syncBadge").innerText = "Syncing Sheet...";
+            document.getElementById("syncBadge").innerText = "Syncing...";
+
+            // Hard 9-second watchdog guarantees the 10s Auto Sync loop can never get stuck
+            let finished = false;
+            const unlockSync = () => {
+                if (finished) return;
+                finished = true;
+                isSyncing = false;
+                timerSeconds = 10;
+                document.getElementById("syncBadge").innerHTML = 'Auto Sync: <span id="countdown">' + timerSeconds + '</span>s';
+            };
+            const watchdogId = setTimeout(unlockSync, 9000);
+
             Promise.allSettled([
                 fetchOptionChainData(),
                 loadHistoricalChart(isInitial, true),
                 loadSignalChart(isInitial, true)
             ]).finally(() => {
-                isSyncing = false;
-                timerSeconds = 10;
-                document.getElementById("syncBadge").innerHTML = 'Auto Sync: <span id="countdown">' + timerSeconds + '</span>s';
+                clearTimeout(watchdogId);
+                unlockSync();
             });
         }
 
@@ -2884,7 +2964,10 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         setInterval(() => {
             if (isSyncing) return;
             if (--timerSeconds <= 0) { fetchDataInBackground(false); }
-            else { document.getElementById("countdown").innerText = timerSeconds; }
+            else {
+                const cdEl = document.getElementById("countdown");
+                if (cdEl) cdEl.innerText = timerSeconds;
+            }
         }, 1000);
     </script>
 </body>
@@ -3606,10 +3689,10 @@ def api_positions():
         "manual_order": cfg["manual_order"] if cfg else "Manual",
         "want_to_trade": cfg["want_to_trade"] if cfg else "NO",
         "max_active_trades": cfg["max_active_trades"] if cfg else 1,
-        "exit_condition": (cfg["exit_condition"] or "NONE") if cfg else "NONE",
-        "active_trade_count": 0,
+        "exit_condition": cfg["exit_condition"] if cfg else "",
         "sheet_synced_at": ist_sync_label,
-        "status_message": cfg_err or "Ready",
+        "active_trade_count": 0,
+        "status_message": "",
         "show_manual_panel": False,
         "evaluated_order": None,
         "guard_blocked": False,
@@ -3619,116 +3702,117 @@ def api_positions():
         "auto_execution_ok": False,
         "exit_execution_notice": None,
         "exit_execution_ok": False,
-        "show_static_ip_bar": False,
-        "tsl_updates": []
+        "tsl_updates": [],
+        "show_static_ip_bar": False
     }
 
-    if not err:
+    if cfg_err or not cfg:
+        order_engine["status_message"] = cfg_err or "Unable to read DASHBOARD sheet."
+    else:
         with ORDER_EXECUTION_LOCK:
             state = load_auto_order_state()
             exit_cooldowns = state.setdefault("exit_cooldowns", {})
 
-            # 1) B8 == "YES": 3:20 PM IST Auto Square-Off
-            if cfg and cfg.get("auto_exit_320_b8") == "YES":
-                past_320_pm = (now_ist.hour > 15) or (now_ist.hour == 15 and now_ist.minute >= 20)
-                if past_320_pm:
-                    last_320_ts = float(exit_cooldowns.get("AUTO_320_PM", 0) or 0)
-                    if (now_ts - last_320_ts) >= 20:
-                        ex_ok, ex_msg = execute_targeted_or_full_exit(
-                            positions, orders, gtt_orders,
-                            target_underlying=None, target_opt_type=None, only_options=False
-                        )
-                        if ex_ok is not None:
-                            exit_cooldowns["AUTO_320_PM"] = now_ts
-                            save_auto_order_state(state)
-                            order_engine["exit_execution_ok"] = bool(ex_ok)
-                            order_engine["exit_execution_notice"] = f"⏰ 3:20 PM Auto Square-Off (B8=YES): {ex_msg}"
-                            order_engine["status_message"] = order_engine["exit_execution_notice"]
-                            if ex_ok:
-                                positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, _ = fetch_upstox_positions()
+            is_after_320 = (now_ist.hour > 15) or (now_ist.hour == 15 and now_ist.minute >= 20)
+            if cfg["auto_exit_320_b8"] == "YES" and is_after_320 and not err:
+                last_320_ts = float(exit_cooldowns.get("AUTO_EXIT_320", 0) or 0)
+                if (now_ts - last_320_ts) >= 20:
+                    ex_ok, ex_msg = execute_targeted_or_full_exit(
+                        positions, orders, gtt_orders,
+                        target_underlying=None, target_opt_type=None, only_options=True
+                    )
+                    if ex_msg:
+                        exit_cooldowns["AUTO_EXIT_320"] = now_ts
+                        save_auto_order_state(state)
+                        order_engine["exit_execution_ok"] = bool(ex_ok)
+                        order_engine["exit_execution_notice"] = f"⏰ 3:20 PM AUTO-EXIT (B8=YES): {ex_msg}"
+                        order_engine["status_message"] = order_engine["exit_execution_notice"]
+                        positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, err = fetch_upstox_positions()
 
-            # 2) B7 == "YES" & B29 == "BE" or "SE": Targeted Option Leg Exit
-            if cfg and cfg.get("signal_exit_b7") == "YES":
-                exit_cond = cfg.get("exit_condition", "")
-                if exit_cond in ("BE", "SE"):
-                    target_opt = "CE" if exit_cond == "BE" else "PE"
-                    target_sym = cfg["symbol"]
-                    exit_key = f"{target_sym}|{exit_cond}"
-                    last_exit_ts = float(exit_cooldowns.get(exit_key, 0) or 0)
+            exit_cond = cfg.get("exit_condition", "")
+            if cfg["signal_exit_b7"] == "YES" and exit_cond in ("BE", "SE") and not err:
+                target_opt = "CE" if exit_cond == "BE" else "PE"
+                target_sym = cfg["symbol"]
+                exit_key = f"EXIT_{target_sym}_{exit_cond}"
+                last_ex_ts = float(exit_cooldowns.get(exit_key, 0) or 0)
 
-                    if (now_ts - last_exit_ts) >= 15:
-                        ex_ok, ex_msg = execute_targeted_or_full_exit(
-                            positions, orders, gtt_orders,
-                            target_underlying=target_sym, target_opt_type=target_opt, only_options=True
-                        )
-                        if ex_ok is not None:
-                            exit_cooldowns[exit_key] = now_ts
-                            save_auto_order_state(state)
-                            order_engine["exit_execution_ok"] = bool(ex_ok)
-                            order_engine["exit_execution_notice"] = f"🚨 Signal Exit (B7=YES, B29={exit_cond} → {target_sym} {target_opt}): {ex_msg}"
-                            order_engine["status_message"] = order_engine["exit_execution_notice"]
-                            if ex_ok:
-                                positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, _ = fetch_upstox_positions()
+                if (now_ts - last_ex_ts) >= 15:
+                    ex_ok, ex_msg = execute_targeted_or_full_exit(
+                        positions, orders, gtt_orders,
+                        target_underlying=target_sym, target_opt_type=target_opt
+                    )
+                    if ex_msg:
+                        exit_cooldowns[exit_key] = now_ts
+                        save_auto_order_state(state)
+                        order_engine["exit_execution_ok"] = bool(ex_ok)
+                        order_engine["exit_execution_notice"] = f"🛑 SIGNAL EXIT ({exit_cond} -> {target_sym} {target_opt}): {ex_msg}"
+                        order_engine["status_message"] = order_engine["exit_execution_notice"]
+                        positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, err = fetch_upstox_positions()
+                    elif not order_engine["exit_execution_notice"]:
+                        order_engine["status_message"] = f"Exit Condition {exit_cond} active (B7=YES), no open {target_sym} {target_opt} position/order found."
+            elif exit_cond in ("BE", "SE") and cfg["signal_exit_b7"] != "YES":
+                order_engine["status_message"] = f"Exit Condition {exit_cond} in B29 ignored because Signal Exit (B7) is NO."
 
-            # 3) Dynamic Trailing SL & Target
-            tsl_logs = process_dynamic_sl_and_target(
-                positions, gtt_orders,
-                default_sl_pct=cfg["sl_percent"] if cfg else None,
-                default_target_pct=cfg["target_percent"] if cfg else None
+            if not err:
+                tsl_logs = process_dynamic_sl_and_target(positions, gtt_orders, cfg.get("sl_percent"), cfg.get("target_percent"))
+                if tsl_logs:
+                    order_engine["tsl_updates"] = tsl_logs
+
+            guard = evaluate_trade_guards(
+                cfg["symbol"], cfg["option_type"], cfg["max_active_trades"],
+                positions, orders, gtt_orders, state.get("recent_submissions", {})
             )
-            order_engine["tsl_updates"] = tsl_logs
+            order_engine["active_trade_count"] = guard["active_count"]
+            order_engine["guard_blocked"] = not guard["allowed"]
+            order_engine["guard_reason"] = guard["reason"]
 
-            # 4) Entry / Order Evaluation (B16:B28)
-            if cfg:
-                guard = evaluate_trade_guards(
-                    cfg["symbol"], cfg["option_type"], cfg["max_active_trades"],
-                    positions, orders, gtt_orders, state.get("recent_submissions", {})
-                )
-                order_engine["active_trade_count"] = guard["active_count"]
-
-                if cfg["want_to_trade"] != "YES":
-                    if not order_engine["exit_execution_notice"]:
-                        order_engine["status_message"] = f"Standby: Want_to_Trade (B17) is '{cfg['want_to_trade']}' ({guard['active_count']}/{cfg['max_active_trades']} active)."
-                elif not guard["allowed"]:
-                    order_engine["guard_blocked"] = True
-                    order_engine["guard_reason"] = guard["reason"]
-                    if not order_engine["exit_execution_notice"]:
-                        order_engine["status_message"] = guard["reason"]
-                    if cfg["manual_order"] == "Manual":
-                        ev_order, prep_err = prepare_evaluated_order(cfg)
-                        if ev_order and ev_order["signature"] not in state.get("cancelled_signatures", []):
-                            order_engine["show_manual_panel"] = True
-                            order_engine["evaluated_order"] = ev_order
+            if cfg["want_to_trade"] != "YES":
+                if not order_engine["status_message"]:
+                    order_engine["status_message"] = f"Want_to_Trade (B17) is '{cfg['want_to_trade']}' — Standing by ({guard['active_count']}/{cfg['max_active_trades']} active)."
+            elif cfg["auto_exit_320_b8"] == "YES" and is_after_320:
+                if not order_engine["status_message"]:
+                    order_engine["status_message"] = "3:20 PM Auto-Exit (B8=YES) active — New entries paused."
+            elif cfg["signal_exit_b7"] == "YES" and exit_cond in ("BE", "SE") and ((exit_cond == "BE" and cfg["option_type"] == "CE") or (exit_cond == "SE" and cfg["option_type"] == "PE")):
+                if not order_engine["status_message"]:
+                    order_engine["status_message"] = f"Entry paused for {cfg['symbol']} {cfg['option_type']} while B7=YES and Exit Condition (B29) = {exit_cond}."
+            else:
+                ev_order, prep_err = prepare_evaluated_order(cfg)
+                if prep_err or not ev_order:
+                    order_engine["status_message"] = f"⚠️ {prep_err}"
                 else:
-                    ev_order, prep_err = prepare_evaluated_order(cfg)
-                    if prep_err or not ev_order:
-                        if not order_engine["exit_execution_notice"]:
-                            order_engine["status_message"] = f"Order Skipped: {prep_err}"
-                    else:
-                        sig = ev_order["signature"]
-                        if cfg["manual_order"] == "Auto":
+                    sig, dup_key = ev_order["signature"], ev_order["duplicate_key"]
+                    order_engine["evaluated_order"] = ev_order
+                    if cfg["manual_order"] == "Auto":
+                        if not guard["allowed"]:
+                            order_engine["status_message"] = f"🛡️ AUTO GUARD: {guard['reason']}"
+                        else:
                             ok, msg, is_ip_err = submit_upstox_evaluated_order(ev_order)
                             if ok:
-                                state.setdefault("recent_submissions", {})[ev_order["duplicate_key"]] = now_ts
+                                state.setdefault("recent_submissions", {})[dup_key] = get_ist_now().timestamp()
                                 save_auto_order_state(state)
                                 order_engine["auto_execution_ok"] = True
-                                order_engine["auto_execution_notice"] = f"🤖 AUTO ORDER EXECUTED ({ev_order['symbol']} {ev_order['selected_strike']} {ev_order['option_type']}): {msg}"
+                                order_engine["auto_execution_notice"] = f"⚡ AUTO-EXECUTED ({ev_order['symbol']} {ev_order['selected_strike']} {ev_order['option_type']}): {msg}"
                                 order_engine["status_message"] = order_engine["auto_execution_notice"]
+                                positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, err = fetch_upstox_positions()
                             else:
+                                state.setdefault("recent_submissions", {})[dup_key] = get_ist_now().timestamp()
+                                save_auto_order_state(state)
                                 order_engine["auto_execution_ok"] = False
-                                order_engine["auto_execution_notice"] = f"🤖 AUTO ORDER FAILED: {msg}"
+                                order_engine["auto_execution_notice"] = f"❌ AUTO-ORDER FAILED: {msg}"
                                 order_engine["status_message"] = order_engine["auto_execution_notice"]
                                 if is_ip_err:
                                     order_engine["show_static_ip_bar"] = True
+                    else:
+                        if sig in state.get("cancelled_signatures", []):
+                            order_engine["is_cancelled"] = True
+                            order_engine["status_message"] = "Manual order preview cancelled."
                         else:
-                            if sig in state.get("cancelled_signatures", []):
-                                order_engine["is_cancelled"] = True
-                                order_engine["status_message"] = "Manual order preview cancelled by user."
-                            else:
-                                order_engine["show_manual_panel"] = True
-                                order_engine["evaluated_order"] = ev_order
-                                if not order_engine["exit_execution_notice"]:
-                                    order_engine["status_message"] = f"Manual Mode: Review {ev_order['symbol']} {ev_order['selected_strike']} {ev_order['option_type']} and click Place Order."
+                            order_engine["show_manual_panel"] = True
+                            order_engine["status_message"] = (
+                                f"🛡️ MANUAL GUARD: {guard['reason']}"
+                                if not guard["allowed"]
+                                else f"Ready for approval: {ev_order['transaction_type']} {ev_order['symbol']} {ev_order['selected_strike']} {ev_order['option_type']} @ ₹{ev_order['entry_price']}"
+                            )
 
     LAST_DIAGNOSTICS["total_cycle_ms"] = int((time.time() - cycle_t0) * 1000)
     LAST_DIAGNOSTICS["updated_at"] = ist_sync_label
@@ -3747,25 +3831,138 @@ def api_positions():
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return resp
 
-@app.route("/")
-def index():
+@app.route("/api/history")
+def api_history():
     symbol = request.args.get("symbol", "NIFTY").upper()
-    if symbol not in INSTRUMENT_KEYS:
-        symbol = "NIFTY"
-    selected_expiry = request.args.get("expiry", "ALL")
-    rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
-    return render_template_string(
-        MAIN_HTML_TEMPLATE, symbol=symbol, rows=rows, spot_price=spot_price, atm_strike=atm_strike,
-        expiry=expiry, expiries=expiries, updated=updated, pcr=pcr, total_ce_oi=total_ce_oi, total_pe_oi=total_pe_oi, error=error
-    )
+    timeframe = request.args.get("timeframe", "5minute")
+    day_range = request.args.get("day_range", "1day")
+    chart_type = request.args.get("chart_type", "history")
+    force_fresh = request.args.get("force", "0") == "1"
+    sym_clean = "BANKNIFTY" if "BANK" in symbol else "NIFTY"
 
-@app.route("/analysis")
-def analysis():
+    if chart_type == "signal":
+        tf_tab_map = {
+            "5minute": f"{sym_clean}_5_MIN",
+            "15minute": f"{sym_clean}_15_MIN",
+            "30minute": f"{sym_clean}_30_MIN",
+            "60minute": f"{sym_clean}_1_HR",
+            "day": f"{sym_clean}_1_HR"
+        }
+        target_sheet = tf_tab_map.get(timeframe, f"{sym_clean}_5_MIN")
+        snapshots, used_sheet, err = fetch_history_from_gsheet(
+            sym_clean, sheet_name=target_sheet, expected_kind="signal", force_fresh=force_fresh
+        )
+    else:
+        snapshots, used_sheet, err = fetch_history_from_gsheet(
+            sym_clean, sheet_name=sym_clean, expected_kind="history", force_fresh=force_fresh
+        )
+
+    if err or not snapshots:
+        return jsonify({"history": [], "sheet_used": used_sheet, "error": err or "No data found."})
+
+    range_days_map = {"1day": 1, "3day": 3, "1week": 7, "2week": 14, "1month": 30, "3month": 90}
+    target_days = range_days_map.get(day_range, 1)
+
+    unique_dates = []
+    seen_dates = set()
+    for s in snapshots:
+        d = s.get("date_str") or (s.get("datetime", "").split(" ")[0] if " " in s.get("datetime", "") else "")
+        if d and d not in seen_dates:
+            seen_dates.add(d)
+            unique_dates.append(d)
+
+    if unique_dates:
+        allowed_dates = set(unique_dates[-target_days:])
+        filtered = [
+            s for s in snapshots
+            if (s.get("date_str") or (s.get("datetime", "").split(" ")[0] if " " in s.get("datetime", "") else "")) in allowed_dates
+        ]
+    else:
+        filtered = snapshots
+
+    if chart_type == "signal":
+        res = filtered
+    else:
+        tf_minutes_map = {"5minute": 5, "15minute": 15, "30minute": 30, "60minute": 60, "day": 1440}
+        bucket_mins = tf_minutes_map.get(timeframe, 5)
+
+        if bucket_mins <= 5:
+            res = filtered
+        elif bucket_mins == 1440:
+            by_day = {}
+            day_order = []
+            for s in filtered:
+                d_key = s.get("date_str") or (s.get("datetime", "").split(" ")[0] if " " in s.get("datetime", "") else "day")
+                if d_key not in by_day:
+                    day_order.append(d_key)
+                by_day[d_key] = dict(s)
+                by_day[d_key]["formatted_time"] = d_key
+            res = [by_day[d] for d in day_order]
+        else:
+            bucket_sec = bucket_mins * 60
+            buckets = {}
+            bucket_keys = []
+            for idx, s in enumerate(filtered):
+                ts = s.get("timestamp", 0)
+                if ts > 0:
+                    ist_offset = 19800
+                    b_key = (ts + ist_offset) // bucket_sec
+                else:
+                    step = max(1, bucket_mins // 5)
+                    b_key = idx // step
+                if b_key not in buckets:
+                    bucket_keys.append(b_key)
+                buckets[b_key] = s
+            res = [buckets[k] for k in bucket_keys]
+
+    if len(res) > 1500:
+        res = res[-1500:]
+
+    resp = jsonify({
+        "history": res,
+        "sheet_used": used_sheet,
+        "total_sheet_rows": len(snapshots),
+        "error": None
+    })
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
+
+@app.route("/download_history")
+def download_history():
     symbol = request.args.get("symbol", "NIFTY").upper()
-    if symbol not in INSTRUMENT_KEYS:
-        symbol = "NIFTY"
-    selected_expiry = request.args.get("expiry", "ALL")
-    return render_template_string(ANALYSIS_HTML_TEMPLATE, symbol=symbol, expiry=selected_expiry, expiries=[])
+    snapshots, used_sheet, err = fetch_history_from_gsheet(symbol, expected_kind="history", force_fresh=True)
+    if err or not snapshots:
+        return Response(f"Error: {err or 'No history available'}", status=400, mimetype="text/plain")
+    si = io.StringIO()
+    cw = csv.writer(si)
+    headers = [
+        "Time", "Symbol", "Price LTP", "ATM Strike", "PCR",
+        "CE OI", "PE OI", "CE Chg in OI", "PE Chg in OI",
+        "CE Vol", "PE Vol", "CE IV", "PE IV",
+        "CE Delta", "PE Delta", "CE Theta", "PE Theta",
+        "CE Vega", "PE Vega", "CE Gamma", "PE Gamma",
+        "CE Bid", "PE Bid", "CE Ask", "PE Ask",
+        "CE LTP", "PE LTP", "Min ROC (Buy)", "Max ROC (Sell)",
+        "Cross ROC Sig", "Main Volatility", "5 Min Signal", "15 Min Signal", "30 Min Signal", "1 Hr Signal"
+    ]
+    cw.writerow(headers)
+    for s in snapshots:
+        cw.writerow([
+            s["datetime"], s["symbol"], s["spot_price"], s["atm_strike"], s["pcr"],
+            s["ce_oi"], s["pe_oi"], s["ce_oi_chg"], s["pe_oi_chg"],
+            s["ce_vol"], s["pe_vol"], s["ce_iv"], s["pe_iv"],
+            s["ce_delta"], s["pe_delta"], s["ce_theta"], s["pe_theta"],
+            s["ce_vega"], s["pe_vega"], s["ce_gamma"], s["pe_gamma"],
+            s["ce_bid"], s["pe_bid"], s["ce_ask"], s["pe_ask"],
+            s["ce_ltp"], s["pe_ltp"], s["min_roc"], s["max_roc"],
+            s["cross_roc"], s["main_volatility"], s.get("signal_5m", ""),
+            s.get("signal_15m", ""), s.get("signal_30m", ""), s.get("signal_1h", "")
+        ])
+    return Response(
+        si.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={symbol}_gsheet_history.csv"}
+    )
 
 @app.route("/api/data")
 def api_data():
@@ -3775,175 +3972,67 @@ def api_data():
     selected_expiry = request.args.get("expiry", "ALL")
     rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
     resp = jsonify({
-        "symbol": symbol, "rows": rows, "spot_price": spot_price, "atm_strike": atm_strike,
-        "expiry": expiry, "expiries": expiries, "updated": updated, "pcr": pcr,
-        "total_ce_oi": total_ce_oi, "total_pe_oi": total_pe_oi, "error": error
+        "symbol": symbol, "spot_price": spot_price, "atm_strike": atm_strike,
+        "expiry": expiry, "expiries": expiries, "updated": updated,
+        "pcr": pcr, "total_ce_oi": total_ce_oi, "total_pe_oi": total_pe_oi,
+        "rows": rows, "error": error
     })
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return resp
 
-@app.route("/api/history")
-def api_history():
+@app.route("/")
+def index():
     symbol = request.args.get("symbol", "NIFTY").upper()
     if symbol not in INSTRUMENT_KEYS:
         symbol = "NIFTY"
-    timeframe = request.args.get("timeframe", "5minute")
-    day_range = request.args.get("day_range", "1day")
-    chart_type = request.args.get("chart_type", "history")
-    force_fresh = request.args.get("force", "0") == "1"
-
-    target_sheet = None
-    expected_kind = "history"
-    if chart_type == "signal":
-        expected_kind = "signal"
-        tf_sheet_map = {
-            "5minute": f"{symbol}_5_MIN",
-            "15minute": f"{symbol}_15_MIN",
-            "30minute": f"{symbol}_30_MIN",
-            "60minute": f"{symbol}_1_HR"
-        }
-        target_sheet = tf_sheet_map.get(timeframe, f"{symbol}_5_MIN")
-    else:
-        target_sheet = symbol
-
-    snapshots, used_sheet, error = fetch_history_from_gsheet(
-        symbol=symbol,
-        sheet_name=target_sheet,
-        expected_kind=expected_kind,
-        force_fresh=force_fresh
+    selected_expiry = request.args.get("expiry", "ALL")
+    rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
+    return render_template_string(
+        MAIN_HTML_TEMPLATE, symbol=symbol, rows=rows, spot_price=spot_price,
+        atm_strike=atm_strike, expiry=expiry, expiries=expiries, updated=updated,
+        pcr=pcr, total_ce_oi=total_ce_oi, total_pe_oi=total_pe_oi, error=error
     )
-    if error:
-        resp = jsonify({"symbol": symbol, "sheet_used": used_sheet, "history": [], "error": error})
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        return resp
 
-    session_count_map = {"1day": 1, "3day": 3, "1week": 5, "2week": 10}
-    calendar_sec_map = {"1month": 30 * 86400, "3month": 90 * 86400}
-
-    if snapshots:
-        if day_range in session_count_map:
-            n_sessions = session_count_map[day_range]
-            ordered_dates = []
-            seen_dates = set()
-            for s in snapshots:
-                d = s.get("date_str") or ""
-                if d and d not in seen_dates:
-                    seen_dates.add(d)
-                    ordered_dates.append(d)
-            if ordered_dates:
-                allowed_dates = set(ordered_dates[-n_sessions:])
-                snapshots = [s for s in snapshots if s.get("date_str") in allowed_dates]
-        elif day_range in calendar_sec_map:
-            max_ts = max((s["timestamp"] for s in snapshots if s["timestamp"] > 0), default=0)
-            if max_ts > 0:
-                cutoff = max_ts - calendar_sec_map[day_range]
-                snapshots = [s for s in snapshots if s["timestamp"] >= cutoff or s["timestamp"] == 0]
-
-    if chart_type == "signal" or timeframe == "5minute" or not snapshots:
-        sliced = snapshots[-1500:]
-        for item in sliced:
-            if not item.get("formatted_time"):
-                item["formatted_time"] = item.get("datetime", "")
-        resp = jsonify({"symbol": symbol, "sheet_used": used_sheet, "history": sliced, "error": None})
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        return resp
-
-    tf_seconds_map = {"15minute": 900, "30minute": 1800, "60minute": 3600, "day": 86400}
-    bucket_sec = tf_seconds_map.get(timeframe, 300)
-    buckets = {}
-
-    for s in snapshots:
-        ts = s["timestamp"]
-        if ts > 0:
-            b_key = (s.get("date_str", ""), ts // bucket_sec) if timeframe != "day" else s.get("date_str", str(ts // 86400))
-        else:
-            b_key = s.get("datetime", "")
-
-        if b_key not in buckets:
-            buckets[b_key] = dict(s)
-            buckets[b_key]["_sort_ts"] = ts
-            if timeframe == "day":
-                buckets[b_key]["formatted_time"] = s.get("date_str") or s.get("datetime", "")
-            else:
-                buckets[b_key]["formatted_time"] = s.get("formatted_time") or s.get("datetime", "")
-        else:
-            existing = buckets[b_key]
-            for k in (
-                "spot_price", "atm_strike", "pcr", "ce_oi", "pe_oi", "ce_oi_chg", "pe_oi_chg",
-                "ce_vol", "pe_vol", "ce_iv", "pe_iv", "ce_delta", "pe_delta", "ce_theta", "pe_theta",
-                "ce_vega", "pe_vega", "ce_gamma", "pe_gamma", "ce_bid", "pe_bid", "ce_ask", "pe_ask",
-                "ce_ltp", "pe_ltp", "min_roc", "max_roc", "cross_roc", "main_volatility"
-            ):
-                if k in s:
-                    existing[k] = s[k]
-            for sig_k in ("new_signal", "signal_5m", "signal_15m", "signal_30m", "signal_1h"):
-                if s.get(sig_k):
-                    existing[sig_k] = s[sig_k]
-
-    aggregated = sorted(list(buckets.values()), key=lambda x: x.get("_sort_ts", 0))[-1500:]
-    resp = jsonify({"symbol": symbol, "sheet_used": used_sheet, "history": aggregated, "error": None})
-    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    return resp
-
-@app.route("/download_history")
-def download_history():
+@app.route("/analysis")
+def analysis():
     symbol = request.args.get("symbol", "NIFTY").upper()
-    snapshots, _, error = fetch_history_from_gsheet(symbol, force_fresh=True)
-    if error or not snapshots:
-        return Response(f"Error: {error}", status=400, mimetype="text/plain")
-    si = io.StringIO()
-    cw = csv.writer(si)
-    cw.writerow([
-        "Time", "Symbol", "Price LTP", "ATM Strike", "PCR", "CE OI", "PE OI", "CE Chg in OI", "PE Chg in OI",
-        "CE Vol", "PE Vol", "CE IV", "PE IV", "CE Delta", "PE Delta", "CE Theta", "PE Theta",
-        "CE Vega", "PE Vega", "CE Gamma", "PE Gamma", "CE Bid", "PE Bid", "CE Ask", "PE Ask",
-        "CE LTP", "PE LTP", "5 Min Signal", "15 Min Signal", "30 Min Signal", "1 HR Signal"
-    ])
-    for r in snapshots:
-        cw.writerow([
-            r.get("datetime", ""), r.get("symbol", ""), r.get("spot_price", 0), r.get("atm_strike", 0), r.get("pcr", 0),
-            r.get("ce_oi", 0), r.get("pe_oi", 0), r.get("ce_oi_chg", 0), r.get("pe_oi_chg", 0),
-            r.get("ce_vol", 0), r.get("pe_vol", 0), r.get("ce_iv", 0), r.get("pe_iv", 0),
-            r.get("ce_delta", 0), r.get("pe_delta", 0), r.get("ce_theta", 0), r.get("pe_theta", 0),
-            r.get("ce_vega", 0), r.get("pe_vega", 0), r.get("ce_gamma", 0), r.get("pe_gamma", 0),
-            r.get("ce_bid", 0), r.get("pe_bid", 0), r.get("ce_ask", 0), r.get("pe_ask", 0),
-            r.get("ce_ltp", 0), r.get("pe_ltp", 0),
-            r.get("signal_5m", ""), r.get("signal_15m", ""), r.get("signal_30m", ""), r.get("signal_1h", "")
-        ])
-    return Response(
-        si.getvalue(),
-        mimetype="text/csv",
-        headers={"Content-Disposition": f"attachment;filename={symbol}_GoogleSheet_History_{get_ist_now().strftime('%Y%m%d_%H%M%S')}.csv"}
-    )
+    if symbol not in INSTRUMENT_KEYS:
+        symbol = "NIFTY"
+    selected_expiry = request.args.get("expiry", "ALL")
+    ACTIVE_ANALYSIS_SYMBOLS[symbol] = time.time()
+    return render_template_string(ANALYSIS_HTML_TEMPLATE, symbol=symbol, expiry=selected_expiry, expiries=[])
 
 @app.route("/download")
 def download_csv():
     symbol = request.args.get("symbol", "NIFTY").upper()
+    if symbol not in INSTRUMENT_KEYS:
+        symbol = "NIFTY"
     selected_expiry = request.args.get("expiry", "ALL")
     rows, spot_price, atm_strike, expiry, _, updated, pcr, _, _, error = process_option_data(symbol, selected_expiry)
     if error:
         return Response(f"Error: {error}", status=400, mimetype="text/plain")
     si = io.StringIO()
     cw = csv.writer(si)
-    cw.writerow(["Symbol", symbol, "Spot Price", spot_price, "ATM Strike", atm_strike, "Expiry", expiry, "PCR", pcr, "Updated (IST)", updated])
+    cw.writerow(["Symbol", "Expiry", "Spot Price", "ATM Strike", "PCR", "Updated (IST)"])
+    cw.writerow([symbol, expiry, spot_price, atm_strike, pcr, updated])
     cw.writerow([])
     cw.writerow([
-        "CE OI", "CE Chg OI", "CE Vol", "CE IV", "CE Delta", "CE Theta", "CE Vega", "CE Gamma", "CE Bid", "CE Ask", "CE LTP",
-        "STRIKE",
-        "PE LTP", "PE Bid", "PE Ask", "PE Delta", "PE Theta", "PE Vega", "PE Gamma", "PE IV", "PE Vol", "PE Chg OI", "PE OI"
+        "CE_OI", "CE_OI_Chg", "CE_Vol", "CE_IV", "CE_Delta", "CE_Theta", "CE_Vega", "CE_Gamma",
+        "CE_Bid", "CE_Ask", "CE_LTP", "Strike_Price", "PE_LTP", "PE_Bid", "PE_Ask",
+        "PE_Delta", "PE_Theta", "PE_Vega", "PE_Gamma", "PE_IV", "PE_Vol", "PE_OI_Chg", "PE_OI"
     ])
     for r in rows:
         cw.writerow([
-            r["ce_oi"], r["ce_oi_chg"], r["ce_vol"], r["ce_iv"], r["ce_delta"], r["ce_theta"], r["ce_vega"], r["ce_gamma"], r["ce_bid"], r["ce_ask"], r["ce_ltp"],
-            r["strike"],
-            r["pe_ltp"], r["pe_bid"], r["pe_ask"], r["pe_delta"], r["pe_theta"], r["pe_vega"], r["pe_gamma"], r["pe_iv"], r["pe_vol"], r["pe_oi_chg"], r["pe_oi"]
+            r["ce_oi"], r["ce_oi_chg"], r["ce_vol"], r["ce_iv"], r["ce_delta"], r["ce_theta"],
+            r["ce_vega"], r["ce_gamma"], r["ce_bid"], r["ce_ask"], r["ce_ltp"], r["strike"],
+            r["pe_ltp"], r["pe_bid"], r["pe_ask"], r["pe_delta"], r["pe_theta"], r["pe_vega"],
+            r["pe_gamma"], r["pe_iv"], r["pe_vol"], r["pe_oi_chg"], r["pe_oi"]
         ])
     return Response(
         si.getvalue(),
         mimetype="text/csv",
-        headers={"Content-Disposition": f"attachment;filename={symbol}_Option_Chain_{get_ist_now().strftime('%Y%m%d_%H%M%S')}.csv"}
+        headers={"Content-Disposition": f"attachment; filename={symbol}_{expiry}_option_chain.csv"}
     )
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), threaded=True)
