@@ -4,17 +4,19 @@ import io
 import csv
 import json
 import re
+import hmac
+import hashlib
 import threading
 import urllib.parse
+from functools import wraps
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from requests.adapters import HTTPAdapter
 import pyotp
-from flask import Flask, render_template_string, request, Response, jsonify, redirect
+from flask import Flask, render_template_string, request, Response, jsonify, session, redirect
 
 app = Flask(__name__)
-app.url_map.strict_slashes = False
 
 # --- ENVIRONMENT CONFIGURATION ---
 CLIENT_ID = os.getenv("UPSTOX_CLIENT_ID")
@@ -26,16 +28,30 @@ TOTP_KEY = os.getenv("UPSTOX_TOTP_KEY")
 ENV_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1fpXdodshvwHcduwffOhEK54K-a7a4TmOZF2Q-EgVRzM")
 
+# Render.com Environment Variable for /positions page password
+POSITION_PAGE_PASSWORD = (
+    os.getenv("POSITOIN_PAGE_PASSWORD")
+    or os.getenv("POSITION_PAGE_PASSWORD")
+    or ""
+).strip()
+
+# Deterministic secret key so sessions stay valid across Gunicorn workers on Render
+_SECRET_SEED = (
+    os.getenv("FLASK_SECRET_KEY")
+    or f"upstox-positions-auth-{POSITION_PAGE_PASSWORD}-{CLIENT_SECRET or 'default-key'}"
+)
+app.secret_key = hashlib.sha256(_SECRET_SEED.encode("utf-8")).hexdigest()
+app.permanent_session_lifetime = timedelta(hours=12)
+
 SESSION_FILE_PATH = "/tmp/upstox_session.json"
 AUTO_ORDER_STATE_PATH = "/tmp/upstox_auto_order_state.json"
 DYNAMIC_TSL_STATE_PATH = "/tmp/upstox_dynamic_tsl_state.json"
 AUTH_THREAD_LOCK = threading.Lock()
 ORDER_EXECUTION_LOCK = threading.Lock()
 CACHE_LOCK = threading.Lock()
-HISTORY_FETCH_LOCK = threading.Lock()
 
 IST = timezone(timedelta(hours=5, minutes=30))
-DUPLICATE_COOLDOWN_SECONDS = 420  # Hard 7-minute (420s) cooldown per Symbol + CE/PE from completed exit time
+DUPLICATE_COOLDOWN_SECONDS = 450
 
 INSTRUMENT_KEYS = {
     "NIFTY": "NSE_INDEX|Nifty 50",
@@ -47,10 +63,6 @@ OPEN_ORDER_STATUSES = {
     "validation pending", "modify pending", "modify validation pending",
     "after market order req received", "put order req received",
     "scheduled", "active"
-}
-
-COMPLETED_ORDER_STATUSES = {
-    "complete", "completed", "filled", "executed", "traded"
 }
 
 FAILED_ORDER_STATUSES = {
@@ -82,6 +94,24 @@ LAST_DIAGNOSTICS = {
     "updated_at": "-"
 }
 
+# --- POSITIONS PAGE AUTH HELPERS ---
+def is_positions_authenticated():
+    if not POSITION_PAGE_PASSWORD:
+        return False
+    return bool(session.get("positions_authenticated") is True)
+
+def require_positions_auth(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not is_positions_authenticated():
+            return jsonify({
+                "success": False,
+                "error": "Unauthorized. Please unlock /positions with your password first.",
+                "message": "Unauthorized. Please unlock /positions first."
+            }), 401
+        return fn(*args, **kwargs)
+    return wrapper
+
 def get_upstox_proxies():
     proxy_url = (
         os.getenv("STATIC_IP_PROXY_URL")
@@ -94,7 +124,7 @@ def get_upstox_proxies():
         return {"http": clean, "https": clean}
     return None
 
-# --- SESSION & OAUTH MANAGEMENT ---
+# --- SESSION MANAGEMENT ---
 def load_session_token():
     try:
         if os.path.exists(SESSION_FILE_PATH):
@@ -121,37 +151,6 @@ def invalidate_session():
             os.remove(SESSION_FILE_PATH)
         except Exception:
             pass
-
-def exchange_oauth_code(auth_code):
-    if not auth_code or not CLIENT_ID or not CLIENT_SECRET:
-        return None
-    try:
-        res = HTTP_SESSION.post(
-            "https://api.upstox.com/v2/login/authorization/token",
-            data={
-                "code": str(auth_code).strip(),
-                "client_id": str(CLIENT_ID).strip(),
-                "client_secret": str(CLIENT_SECRET).strip(),
-                "redirect_uri": str(REDIRECT_URI).strip(),
-                "grant_type": "authorization_code"
-            },
-            headers={
-                "accept": "application/json",
-                "Content-Type": "application/x-www-form-urlencoded"
-            },
-            proxies=get_upstox_proxies(),
-            timeout=10
-        )
-        if res.status_code == 200:
-            jd = res.json()
-            token = jd.get("access_token") or jd.get("data", {}).get("access_token")
-            if token:
-                save_session_token(token)
-                AUTH_COOLDOWN["last_failure_time"] = 0
-                return token
-    except Exception:
-        pass
-    return None
 
 def perform_single_auth(force_refresh=False):
     with AUTH_THREAD_LOCK:
@@ -300,22 +299,10 @@ def load_auto_order_state():
             with open(AUTO_ORDER_STATE_PATH, "r") as f:
                 data = json.load(f)
                 if data.get("date") == today:
-                    data.setdefault("recent_submissions", {})
-                    data.setdefault("cancelled_signatures", [])
-                    data.setdefault("exit_cooldowns", {})
-                    data.setdefault("locked_exit_cooldowns", {})
-                    data.setdefault("processed_exit_order_ids", [])
                     return data
     except Exception:
         pass
-    return {
-        "date": today,
-        "recent_submissions": {},
-        "cancelled_signatures": [],
-        "exit_cooldowns": {},
-        "locked_exit_cooldowns": {},
-        "processed_exit_order_ids": []
-    }
+    return {"date": today, "recent_submissions": {}, "cancelled_signatures": [], "exit_cooldowns": {}}
 
 def save_auto_order_state(state):
     try:
@@ -349,7 +336,7 @@ def round_tick(price, tick=0.05):
     return round(round(price / tick) * tick, 2)
 
 # --- DYNAMIC TRAILING SL & TARGET ENGINE ---
-TRAILING_SL_PERCENT = 5.0  # Initial SL comes from B26 (sl_percent); Trailing SL always steps every 5% positive move
+TRAILING_SL_PERCENT = 5.0
 
 def compute_dynamic_sl_target(side, entry_price, current_ltp, prev_best_price, sl_percent, target_percent, prev_sl=None, prev_target=None, trail_percent=TRAILING_SL_PERCENT):
     side = str(side).upper()
@@ -753,30 +740,12 @@ def execute_targeted_or_full_exit(positions, orders, gtt_orders, target_underlyi
                 all_ok = False
 
     if matching_positions:
-        now_exit_ts = get_ist_now().timestamp()
         with ThreadPoolExecutor(max_workers=4) as ex:
-            exit_futs = {ex.submit(exit_position_at_market, p, headers, proxies): p for p in matching_positions}
+            exit_futs = [ex.submit(exit_position_at_market, p, headers, proxies) for p in matching_positions]
             for fut in as_completed(exit_futs):
-                pos_item = exit_futs[fut]
                 ok, msg = fut.result()
                 logs.append(msg)
-                if ok:
-                    u, opt = extract_symbol_and_opt_type(pos_item.get("trading_symbol", ""))
-                    if u and opt:
-                        st = load_auto_order_state()
-                        locks = st.setdefault("locked_exit_cooldowns", {})
-                        lock_key = f"{u}|{opt}"
-                        existing_lock = locks.get(lock_key)
-                        if not existing_lock or now_exit_ts > float(existing_lock.get("exit_ts", 0)):
-                            locks[lock_key] = {
-                                "exit_order_id": f"AUTO_EXIT_{int(now_exit_ts)}",
-                                "exit_ts": now_exit_ts,
-                                "unlock_ts": now_exit_ts + DUPLICATE_COOLDOWN_SECONDS,
-                                "trading_symbol": str(pos_item.get("trading_symbol", "")).strip().upper(),
-                                "provisional": True
-                            }
-                            save_auto_order_state(st)
-                else:
+                if not ok:
                     all_ok = False
 
     return all_ok, " | ".join(logs)
@@ -1186,95 +1155,14 @@ def extract_symbol_and_opt_type(trading_symbol):
     ts = str(trading_symbol or "").strip().upper()
     if not ts:
         return None, None
-    if "BANKNIFTY" in ts or re.search(r'\bBANK\s*NIFTY\b', ts):
-        underlying = "BANKNIFTY"
-    elif ts.startswith("NIFTY") or re.search(r'\bNIFTY\b', ts):
-        underlying = "NIFTY"
-    else:
-        underlying = None
+    underlying = "BANKNIFTY" if "BANKNIFTY" in ts else ("NIFTY" if (ts.startswith("NIFTY") or re.search(r'\bNIFTY\b', ts)) else None)
     opt_match = re.search(r'(?:^|\s|\d)(CE|PE)(?:\s|$|\d)', ts)
     return underlying, (opt_match.group(1) if opt_match else None)
 
-def sync_completed_exit_cooldowns(orders, state):
-    """
-    Scans today's COMPLETED orders chronologically per contract to detect true position EXITS.
-    - Strictly ignores CANCELLED, REJECTED, FAILED, OPEN, and PENDING orders.
-    - Strictly ignores ENTRY orders (only orders that close/reduce a position trigger cooldown).
-    - Locks a fixed 7-minute (420s) expiry per isolated key ('NIFTY|PE', 'NIFTY|CE', 'BANKNIFTY|PE', etc.)
-      and records the exit order_id so the polling loop NEVER resets or extends the clock.
-    """
-    locked_cooldowns = state.setdefault("locked_exit_cooldowns", {})
-    processed_ids = set(state.get("processed_exit_order_ids", []))
-    state_dirty = False
-
-    completed_orders = []
-    for idx, o in enumerate(orders):
-        st = str(o.get("status", "")).strip().lower()
-        if st not in COMPLETED_ORDER_STATUSES:
-            continue
-        ts = str(o.get("trading_symbol", "")).strip().upper()
-        txn = str(o.get("transaction_type", "")).strip().upper()
-        if not ts or txn not in ("BUY", "SELL"):
-            continue
-        exec_ts = parse_upstox_order_timestamp(o.get("exchange_timestamp") or o.get("order_timestamp", ""))
-        completed_orders.append((exec_ts, idx, o))
-
-    completed_orders.sort(key=lambda item: (item[0], item[1]))
-
-    net_qty_by_symbol = {}
-    for exec_ts, idx, o in completed_orders:
-        ts = str(o.get("trading_symbol", "")).strip().upper()
-        txn = str(o.get("transaction_type", "")).strip().upper()
-        qty = int(o.get("quantity", 0) or 0)
-        oid = str(o.get("order_id", "")).strip() or f"{ts}|{txn}|{exec_ts}|{idx}"
-
-        prev_qty = net_qty_by_symbol.get(ts, 0)
-        if txn == "BUY":
-            is_exit = prev_qty < 0
-            new_qty = prev_qty + qty
-        else:  # SELL
-            is_exit = prev_qty >= 0
-            new_qty = prev_qty - qty
-        net_qty_by_symbol[ts] = new_qty
-
-        if not is_exit or oid in processed_ids:
-            continue
-
-        u, opt = extract_symbol_and_opt_type(ts)
-        if u and opt and exec_ts > 0:
-            lock_key = f"{u}|{opt}"
-            existing_lock = locked_cooldowns.get(lock_key)
-            if (
-                existing_lock is None
-                or existing_lock.get("provisional")
-                or exec_ts > float(existing_lock.get("exit_ts", 0))
-            ):
-                locked_cooldowns[lock_key] = {
-                    "exit_order_id": oid,
-                    "exit_ts": exec_ts,
-                    "unlock_ts": exec_ts + DUPLICATE_COOLDOWN_SECONDS,
-                    "trading_symbol": ts,
-                    "provisional": False
-                }
-        processed_ids.add(oid)
-        state_dirty = True
-
-    if state_dirty:
-        state["processed_exit_order_ids"] = list(processed_ids)
-    return state_dirty
-
-def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, positions, orders, gtt_orders=None, recent_submissions=None, state=None):
+def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, positions, orders, gtt_orders=None, recent_submissions=None):
     gtt_orders = gtt_orders or []
+    recent_submissions = recent_submissions or {}
     now_ts = get_ist_now().timestamp()
-
-    own_state = False
-    if state is None:
-        state = load_auto_order_state()
-        own_state = True
-    if recent_submissions is None:
-        recent_submissions = state.get("recent_submissions", {})
-
-    state_dirty = sync_completed_exit_cooldowns(orders, state)
 
     t_sym = str(target_symbol or "").strip().upper()
     t_opt = str(target_opt_type or "").strip().upper()
@@ -1307,11 +1195,8 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
 
     active_count = len(active_items)
 
-    # 1. Prevent duplicate active position / open order on the exact same Index + Option Side
     dups = [i for i in active_items if i["underlying"] == t_sym and i["option_type"] == t_opt]
     if dups:
-        if own_state and state_dirty:
-            save_auto_order_state(state)
         m = dups[0]
         return {
             "allowed": False,
@@ -1320,52 +1205,47 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
             "reason": f"Duplicate Blocked: {t_sym} {t_opt} already active/open ({m['trading_symbol']} - {m['source']})."
         }
 
-    # 2. Short 15-second in-flight submission guard (prevents double-click / double-poll race before orderbook updates)
-    for k, sub_ts in list(recent_submissions.items()):
+    latest_order_ts = 0.0
+    latest_order_label = ""
+    has_executed_history = False
+
+    for o in orders:
+        st = str(o.get("status", "")).strip().lower()
+        ts = str(o.get("trading_symbol", "")).strip().upper()
+        if not ts or st in FAILED_ORDER_STATUSES:
+            continue
+        u, opt = extract_symbol_and_opt_type(ts)
+        if u == t_sym and opt == t_opt:
+            has_executed_history = True
+            ots = parse_upstox_order_timestamp(o.get("order_timestamp", ""))
+            if ots > latest_order_ts:
+                latest_order_ts = ots
+                latest_order_label = f"{ts} ({o.get('transaction_type', '')} - {o.get('status', '')})"
+
+    for k, sub_ts in recent_submissions.items():
         parts = str(k).split("|")
         if len(parts) >= 2 and parts[0].upper() == t_sym and parts[1].upper() == t_opt:
             sub_f = float(sub_ts or 0)
-            if 0 <= (now_ts - sub_f) < 15:
-                if own_state and state_dirty:
-                    save_auto_order_state(state)
-                return {
-                    "allowed": False,
-                    "active_count": active_count,
-                    "max_active_trades": max_active_trades,
-                    "reason": f"Order In-Flight: {t_sym} {t_opt} submitted {int(now_ts - sub_f)}s ago. Waiting for broker confirmation."
-                }
+            effective_window = DUPLICATE_COOLDOWN_SECONDS if has_executed_history else 30
+            if (now_ts - sub_f) < effective_window and sub_f > latest_order_ts:
+                latest_order_ts = sub_f
+                latest_order_label = f"{t_sym} {t_opt} (Recent Order)"
 
-    # 3. Hard 7-minute fixed cooldown ONLY for the exited Index + Option Side (ignores cancelled orders, never extends)
-    lock_key = f"{t_sym}|{t_opt}"
-    locked_cooldowns = state.get("locked_exit_cooldowns", {})
-    lock_info = locked_cooldowns.get(lock_key)
-    if lock_info:
-        exit_ts = float(lock_info.get("exit_ts", 0) or 0)
-        unlock_ts = float(lock_info.get("unlock_ts", 0) or (exit_ts + DUPLICATE_COOLDOWN_SECONDS))
-        if now_ts < unlock_ts:
-            if own_state and state_dirty:
-                save_auto_order_state(state)
-            remaining = unlock_ts - now_ts
-            exit_ist_str = datetime.fromtimestamp(exit_ts, tz=IST).strftime("%H:%M:%S IST")
-            unlock_ist_str = datetime.fromtimestamp(unlock_ts, tz=IST).strftime("%H:%M:%S IST")
-            exited_sym = lock_info.get("trading_symbol") or f"{t_sym} {t_opt}"
+    if latest_order_ts > 0:
+        elapsed = now_ts - latest_order_ts
+        if 0 <= elapsed < DUPLICATE_COOLDOWN_SECONDS:
+            remaining = DUPLICATE_COOLDOWN_SECONDS - elapsed
+            last_ist_str = datetime.fromtimestamp(latest_order_ts, tz=IST).strftime("%H:%M:%S IST")
             return {
                 "allowed": False,
                 "active_count": active_count,
                 "max_active_trades": max_active_trades,
                 "reason": (
-                    f"7-Min Cooldown Active: {t_sym} {t_opt} exited at {exit_ist_str} "
-                    f"({exited_sym}, unlocks at {unlock_ist_str}). Wait {format_duration_hm(remaining)} for 7m gap."
+                    f"1-Hr Cooldown Active: {t_sym} {t_opt} last traded at {last_ist_str} "
+                    f"({latest_order_label}). Wait {format_duration_hm(remaining)} for 1h gap."
                 )
             }
-        else:
-            del locked_cooldowns[lock_key]
-            state_dirty = True
 
-    if own_state and state_dirty:
-        save_auto_order_state(state)
-
-    # 4. Enforce Max Active Trades limit (B28)
     if max_active_trades is not None and active_count >= max_active_trades:
         return {
             "allowed": False,
@@ -1435,17 +1315,13 @@ def _download_and_parse_gsheet(symbol, sheet_name):
         default_tab = "BANKNIFTY" if "BANK" in symbol.upper() else "NIFTY"
         candidate_sheets = list(dict.fromkeys([default_tab, symbol.upper(), "Sheet1"]))
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Cache-Control": "no-cache"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     raw_csv, last_err = None, None
-    cb = int(time.time() * 1000)
 
     for s_name in candidate_sheets:
-        url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={urllib.parse.quote(s_name)}&_cb={cb}"
+        url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={urllib.parse.quote(s_name)}"
         try:
-            res = HTTP_SESSION.get(url, headers=headers, timeout=7.5)
+            res = HTTP_SESSION.get(url, headers=headers, timeout=4.5)
             if res.status_code == 200:
                 text = res.text.strip().lstrip('\ufeff')
                 if text.startswith("<!DOCTYPE") or "<html" in text.lower():
@@ -1470,7 +1346,7 @@ def _download_and_parse_gsheet(symbol, sheet_name):
         header_idx = 0
         for i, l in enumerate(lines[:10]):
             ll = l.lower()
-            if any(k in ll for k in ("time", "symbol", "pcr", "ltp", "min roc", "volatility")):
+            if any(k in ll for k in ("time", "symbol", "pcr", "ltp", "min roc")):
                 header_idx = i
                 break
 
@@ -1479,10 +1355,7 @@ def _download_and_parse_gsheet(symbol, sheet_name):
             return [], f"Google Sheet connected ({sheet_name or symbol}) but no data rows found."
 
         header_cells = parsed_rows[0]
-        norm_headers = [
-            re.sub(r'\s+', ' ', re.sub(r'^[^\w]+', '', str(h))).strip().lower()
-            for h in header_cells
-        ]
+        norm_headers = [re.sub(r'^[^\w]+', '', str(h)).strip().lower() for h in header_cells]
         exact_map = {}
         nospace_map = {}
         for idx, h in enumerate(norm_headers):
@@ -1495,7 +1368,7 @@ def _download_and_parse_gsheet(symbol, sheet_name):
 
         def find_col(names, fallback_idx=None):
             for n in names:
-                nl = re.sub(r'\s+', ' ', n).strip().lower()
+                nl = n.lower()
                 if nl in exact_map:
                     return exact_map[nl]
                 ns = nl.replace(" ", "")
@@ -1505,66 +1378,63 @@ def _download_and_parse_gsheet(symbol, sheet_name):
 
         idx_time = find_col(["time", "datetime", "timestamp", "date & time", "date and time"], 0)
         idx_sym = find_col(["symbol"], 1)
-        idx_spot = find_col(["price ltp", "spot_price", "ltp"], 2)
-        idx_atm = find_col(["atm strike", "atm_strike"], 3)
-        idx_pcr = find_col(["pcr"], 4)
-        idx_ce_oi = find_col(["ce oi"], 5)
-        idx_pe_oi = find_col(["pe oi"], 6)
-        idx_ce_oi_chg = find_col(["ce chg in oi", "ce chng oi", "ce chg oi"], 7)
-        idx_pe_oi_chg = find_col(["pe chg in oi", "pe chng oi", "pe chg oi"], 8)
-        idx_ce_vol = find_col(["ce vol"], 9)
-        idx_pe_vol = find_col(["pe vol"], 10)
-        idx_ce_iv = find_col(["ce iv"], 11)
-        idx_pe_iv = find_col(["pe iv"], 12)
-        idx_ce_delta = find_col(["ce delta"], 13)
-        idx_pe_delta = find_col(["pe delta"], 14)
-        idx_ce_theta = find_col(["ce theta"], 15)
-        idx_pe_theta = find_col(["pe theta"], 16)
-        idx_ce_vega = find_col(["ce vega"], 17)
-        idx_pe_vega = find_col(["pe vega"], 18)
-        idx_ce_gamma = find_col(["ce gamma"], 19)
-        idx_pe_gamma = find_col(["pe gamma"], 20)
-        idx_ce_bid = find_col(["ce bid"], 21)
-        idx_pe_bid = find_col(["pe bid"], 22)
-        idx_ce_ask = find_col(["ce ask"], 23)
-        idx_pe_ask = find_col(["pe ask"], 24)
-        idx_ce_ltp = find_col(["ce ltp"], 25)
-        idx_pe_ltp = find_col(["pe ltp"], 26)
+        idx_spot = find_col(["price ltp", "spot_price", "ltp"])
+        idx_atm = find_col(["atm strike", "atm_strike"])
+        idx_pcr = find_col(["pcr"])
+        idx_ce_oi = find_col(["ce oi"])
+        idx_pe_oi = find_col(["pe oi"])
+        idx_ce_oi_chg = find_col(["ce chg in oi", "ce chng oi", "ce chg oi"])
+        idx_pe_oi_chg = find_col(["pe chg in oi", "pe chng oi", "pe chg oi"])
+        idx_ce_vol = find_col(["ce vol"])
+        idx_pe_vol = find_col(["pe vol"])
+        idx_ce_iv = find_col(["ce iv"])
+        idx_pe_iv = find_col(["pe iv"])
+        idx_ce_delta = find_col(["ce delta"])
+        idx_pe_delta = find_col(["pe delta"])
+        idx_ce_theta = find_col(["ce theta"])
+        idx_pe_theta = find_col(["pe theta"])
+        idx_ce_vega = find_col(["ce vega"])
+        idx_pe_vega = find_col(["pe vega"])
+        idx_ce_gamma = find_col(["ce gamma"])
+        idx_pe_gamma = find_col(["pe gamma"])
+        idx_ce_bid = find_col(["ce bid"])
+        idx_pe_bid = find_col(["pe bid"])
+        idx_ce_ask = find_col(["ce ask"])
+        idx_pe_ask = find_col(["pe ask"])
+        idx_ce_ltp = find_col(["ce ltp"])
+        idx_pe_ltp = find_col(["pe ltp"])
+        idx_min_roc = find_col(["min roc (buy)", "min_roc", "min roc"])
+        idx_max_roc = find_col(["max roc (sell)", "max_roc", "max roc"])
+        idx_cross_roc = find_col(["cross roc sig", "cross_roc_sig", "cross roc"])
+        idx_main_vol = find_col(["main volatility", "main_vol", "volatility"])
+        idx_new_sig = find_col(["new signal", "signal", "sig"])
 
-        # Chart 3 (Main Signal): AB (27) = Min ROC (Buy), AC (28) = Max ROC (Sell), AD (29) = Cross ROC Sig, AE (30) = Main Volatility
-        idx_min_roc = find_col(["min roc (buy)", "min roc(buy)", "min_roc", "min roc", "min roc buy", "roc buy", "minroc"], 27)
-        idx_max_roc = find_col(["max roc (sell)", "max roc(sell)", "max_roc", "max roc", "max roc sell", "roc sell", "maxroc"], 28)
-        idx_cross_roc = find_col(["cross roc sig", "cross_roc_sig", "cross roc", "cross roc signal", "crossroc"], 29)
-        idx_main_vol = find_col(["main volatility", "main_vol", "volatility", "main vol", "mainvolatility"], 30)
-        idx_new_sig = find_col(["new signal", "main signal", "signal", "sig", "new_signal", "main_signal"], 31)
-
-        # Col AF (31) = 5 Min Signal, Col AG (32) = 15 Min Signal, Col AH (33) = 30 Min Signal, Col AI (34) = 1 HR Signal, Col AJ (35) = New Signal (alt)
+        # Col AF (31) = 5 Min Signal, Col AG (32) = 15 Min Signal, Col AH (33) = 30 Min Signal, Col AI (34) = 1 HR Signal
         idx_sig_5m = find_col(["5 min signal", "5min signal", "5_min_signal", "5m signal", "5 min sig"], 31)
         idx_sig_15m = find_col(["15 min signal", "15min signal", "15_min_signal", "15m signal", "15 min sig"], 32)
         idx_sig_30m = find_col(["30 min signal", "30min signal", "30_min_signal", "30m signal", "30 min sig"], 33)
         idx_sig_1h = find_col(["1 hr signal", "1hr signal", "1_hr_signal", "1 hour signal", "1h signal", "60 min signal", "1 hr sig"], 34)
-        idx_sig_aj = find_col(["new signal", "main signal", "final signal"], 35)
 
         def col_num(row, idx):
             if idx is None or idx >= len(row):
                 return 0.0
-            v = row[idx].replace(",", "").replace("%", "").replace("₹", "").strip()
-            if not v or v.lower() in ("nan", "none", "-", "#n/a", "#value!", "#ref!", "#div/0!"):
+            v = row[idx].strip()
+            if not v:
                 return 0.0
             try:
-                return float(v)
+                return float(v.replace(",", "")) if "," in v else float(v)
             except ValueError:
                 return 0.0
 
         def col_sig(row, primary_idx, pos_idx):
+            if pos_idx < len(row):
+                pv = row[pos_idx].strip().upper()
+                if pv in ("B", "BE", "S", "SE"):
+                    return pv
             if primary_idx is not None and primary_idx < len(row):
                 nv = row[primary_idx].strip().upper()
                 if nv in ("B", "BE", "S", "SE"):
                     return nv
-            if pos_idx is not None and pos_idx < len(row):
-                pv = row[pos_idx].strip().upper()
-                if pv in ("B", "BE", "S", "SE"):
-                    return pv
             return ""
 
         sym_default = symbol.upper()
@@ -1580,11 +1450,7 @@ def _download_and_parse_gsheet(symbol, sheet_name):
 
             date_str, formatted_time = extract_date_and_time_parts(time_val)
             sym_val = row_cells[idx_sym].strip() if (idx_sym is not None and idx_sym < len(row_cells) and row_cells[idx_sym].strip()) else sym_default
-
-            sig_5m_val = col_sig(row_cells, idx_sig_5m, 31)
-            new_sig_val = col_sig(row_cells, idx_new_sig, 31)
-            if not new_sig_val:
-                new_sig_val = col_sig(row_cells, idx_sig_aj, 35) or sig_5m_val
+            new_sig_val = row_cells[idx_new_sig].strip().upper() if (idx_new_sig is not None and idx_new_sig < len(row_cells)) else ""
 
             snapshots.append({
                 "timestamp": parse_timestamp_fast(time_val, fmt_holder),
@@ -1622,7 +1488,7 @@ def _download_and_parse_gsheet(symbol, sheet_name):
                 "cross_roc": col_num(row_cells, idx_cross_roc),
                 "main_volatility": col_num(row_cells, idx_main_vol),
                 "new_signal": new_sig_val,
-                "signal_5m": sig_5m_val,
+                "signal_5m": col_sig(row_cells, idx_sig_5m, 31),
                 "signal_15m": col_sig(row_cells, idx_sig_15m, 32),
                 "signal_30m": col_sig(row_cells, idx_sig_30m, 33),
                 "signal_1h": col_sig(row_cells, idx_sig_1h, 34)
@@ -1636,11 +1502,10 @@ def _download_and_parse_gsheet(symbol, sheet_name):
 
 def _bg_refresh_history(cache_key, symbol, sheet_name):
     try:
-        with HISTORY_FETCH_LOCK:
-            snaps, err = _download_and_parse_gsheet(symbol, sheet_name)
-            if not err and snaps:
-                with CACHE_LOCK:
-                    HISTORY_CACHE[cache_key] = {"ts": time.time(), "snapshots": snaps}
+        snaps, err = _download_and_parse_gsheet(symbol, sheet_name)
+        if not err and snaps:
+            with CACHE_LOCK:
+                HISTORY_CACHE[cache_key] = {"ts": time.time(), "snapshots": snaps}
     finally:
         with CACHE_LOCK:
             HISTORY_REFRESH_INFLIGHT.discard(cache_key)
@@ -1670,22 +1535,16 @@ def fetch_history_from_gsheet(symbol="NIFTY", sheet_name=None):
         threading.Thread(target=_bg_refresh_history, args=(cache_key, symbol, sheet_name), daemon=True).start()
         return cached_snaps, None
 
-    with HISTORY_FETCH_LOCK:
+    ordered_snaps, err = _download_and_parse_gsheet(symbol, sheet_name)
+    if err or not ordered_snaps:
         with CACHE_LOCK:
-            cached_after_wait = HISTORY_CACHE.get(cache_key)
-            if cached_after_wait and cached_after_wait["snapshots"] and (time.time() - cached_after_wait["ts"]) < 12.0:
-                return cached_after_wait["snapshots"], None
+            if cache_key in HISTORY_CACHE and HISTORY_CACHE[cache_key]["snapshots"]:
+                return HISTORY_CACHE[cache_key]["snapshots"], None
+        return [], err or "Could not retrieve CSV from Google Sheet."
 
-        ordered_snaps, err = _download_and_parse_gsheet(symbol, sheet_name)
-        if err or not ordered_snaps:
-            with CACHE_LOCK:
-                if cache_key in HISTORY_CACHE and HISTORY_CACHE[cache_key]["snapshots"]:
-                    return HISTORY_CACHE[cache_key]["snapshots"], None
-            return [], err or "Could not retrieve CSV from Google Sheet."
-
-        with CACHE_LOCK:
-            HISTORY_CACHE[cache_key] = {"ts": time.time(), "snapshots": ordered_snaps}
-        return ordered_snaps, None
+    with CACHE_LOCK:
+        HISTORY_CACHE[cache_key] = {"ts": time.time(), "snapshots": ordered_snaps}
+    return ordered_snaps, None
 
 # --- PARALLEL UPSTOX POSITIONS, ORDERS & GTT FETCHER ---
 def fetch_upstox_positions():
@@ -1778,8 +1637,7 @@ def fetch_upstox_positions():
                 "average_price": o.get("average_price", 0.0),
                 "status": st_raw,
                 "is_open": st_raw.lower() in OPEN_ORDER_STATUSES,
-                "order_timestamp": o.get("order_timestamp", ""),
-                "exchange_timestamp": o.get("exchange_timestamp", "")
+                "order_timestamp": o.get("order_timestamp", "")
             })
 
         gtt_orders = []
@@ -1984,10 +1842,9 @@ MAIN_HTML_TEMPLATE = """<!DOCTYPE html>
         .metric-card { background: #f8f9fa; padding: 10px 16px; border-radius: 6px; border-left: 4px solid #007bff; }
         .pcr-bullish { border-left-color: #28a745; color: #1e7e34; }
         .pcr-bearish { border-left-color: #dc3545; color: #bd2130; }
-        .btn { display: inline-block; padding: 8px 16px; color: #fff; background-color: #007bff; text-decoration: none; border-radius: 4px; margin-right: 6px; font-weight: 600; }
+        .btn { display: inline-block; padding: 8px 16px; color: #fff; background-color: #007bff; text-decoration: none; border-radius: 4px; margin-right: 10px; font-weight: 500; }
         .btn-success { background-color: #28a745; }
         .btn-purple { background-color: #6f42c1; }
-        .btn-dark { background-color: #0f172a; }
         select { padding: 8px 12px; font-size: 14px; border-radius: 4px; border: 1px solid #ced4da; outline: none; font-weight: 600; }
         .table-container { overflow-x: auto; background: #fff; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.06); }
         table { width: 100%; border-collapse: collapse; min-width: 1300px; }
@@ -2018,7 +1875,7 @@ MAIN_HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="metric-card"><strong>Total Put OI:</strong> {{ "{:,}".format(total_pe_oi) }}</div>
             <div class="metric-card"><strong>Last Updated (IST):</strong> {{ updated }}</div>
         </div>
-        <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
             <a href="/?symbol=NIFTY&expiry={{ expiry }}" class="btn">View NIFTY</a>
             <a href="/?symbol=BANKNIFTY&expiry={{ expiry }}" class="btn">View BANKNIFTY</a>
             <form method="GET" action="/" style="display: inline-flex; align-items: center; gap: 6px; margin: 0;">
@@ -2029,9 +1886,8 @@ MAIN_HTML_TEMPLATE = """<!DOCTYPE html>
                     {% for exp in expiries %}<option value="{{ exp }}" {% if exp == expiry %}selected{% endif %}>{{ exp }}</option>{% endfor %}
                 </select>
             </form>
-            <a href="/analysis?symbol={{ symbol }}&expiry={{ expiry }}" class="btn btn-purple">📊 Analysis Dashboard</a>
-            <a href="/positions" class="btn btn-dark">🔐 Live Positions & Auto-Trade</a>
-            <a href="/download?symbol={{ symbol }}&expiry={{ expiry }}" class="btn btn-success">Download CSV</a>
+            <a href="/analysis?symbol={{ symbol }}&expiry={{ expiry }}" class="btn btn-purple">📊 Open Analysis Dashboard</a>
+            <a href="/download?symbol={{ symbol }}&expiry={{ expiry }}" class="btn btn-success">Download Full CSV</a>
         </div>
     </div>
     {% if error %}<div class="error-msg">Error: {{ error }}</div>{% else %}
@@ -2060,7 +1916,7 @@ MAIN_HTML_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>"""
 
-# --- ANALYSIS DASHBOARD TEMPLATE (DEFAULT DRAG: PAN & LIVE GOOGLE SHEET SIGNAL CHART) ---
+# --- ANALYSIS DASHBOARD TEMPLATE (FREEZABLE ZOOM + / - ON CHART 2 & 3) ---
 ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
@@ -2073,14 +1929,15 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         h2 { color: #38bdf8; margin-bottom: 5px; }
         .subtitle { color: #94a3b8; font-size: 14px; margin-bottom: 20px; }
         .nav-bar { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; align-items: center; background: #1e293b; padding: 15px; border-radius: 10px; }
-        .btn { padding: 9px 16px; color: #fff; background-color: #3b82f6; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 13px; border: none; cursor: pointer; }
+        .btn { padding: 9px 18px; color: #fff; background-color: #3b82f6; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 14px; border: none; cursor: pointer; }
         .btn-table { background-color: #64748b; }
-        .btn-live { background-color: #10b981; color: #052e16; font-weight: 800; }
         .btn-dl { background-color: #10b981; font-size: 12px; padding: 6px 12px; text-decoration: none; color: #fff; border-radius: 6px; font-weight: bold; }
         .zoom-toolbar { display: inline-flex; align-items: center; gap: 6px; background: #0f172a; padding: 4px 8px; border-radius: 8px; border: 1px solid #334155; }
-        .btn-zoom { background-color: #334155; color: #f8fafc; border: 1px solid #475569; padding: 5px 10px; border-radius: 5px; font-size: 12px; font-weight: 700; cursor: pointer; transition: background-color 0.15s; }
-        .btn-zoom:hover { background-color: #475569; }
-        .btn-zoom-pan-active { background-color: #0284c7; color: #ffffff; border: 1px solid #38bdf8; }
+        .btn-zoom { background-color: #334155; color: #f8fafc; border: 1px solid #475569; padding: 5px 10px; border-radius: 5px; font-size: 12px; font-weight: 700; cursor: pointer; transition: background-color 0.15s, opacity 0.15s; }
+        .btn-zoom:hover:not(:disabled) { background-color: #475569; }
+        .btn-zoom:disabled { opacity: 0.38; cursor: not-allowed; background-color: #1e293b; color: #64748b; border-color: #334155; }
+        .btn-zoom-lock { background-color: #78350f; color: #fbbf24; border: 1px solid #f59e0b; padding: 5px 11px; border-radius: 5px; font-size: 12px; font-weight: 700; cursor: pointer; transition: all 0.15s; }
+        .btn-zoom-lock.unlocked { background-color: #065f46; color: #34d399; border-color: #10b981; }
         .btn-zoom-reset { background-color: #1e293b; color: #94a3b8; border: 1px solid #475569; padding: 5px 10px; border-radius: 5px; font-size: 12px; font-weight: 700; cursor: pointer; }
         .btn-zoom-reset.active-zoom { background-color: #f59e0b; color: #0f172a; border-color: #fbbf24; }
         select { padding: 9px 14px; background: #0f172a; color: #38bdf8; border: 1px solid #334155; border-radius: 6px; font-weight: 600; font-size: 14px; outline: none; }
@@ -2097,14 +1954,13 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         .chart-title { font-size: 18px; font-weight: bold; color: #f8fafc; }
         .zoom-hint { font-size: 12px; color: #94a3b8; margin-bottom: 10px; }
         .timer-badge { background: #0284c7; color: #ffffff; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
-        .status-pill { background: #0f172a; border: 1px solid #334155; color: #38bdf8; padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 700; }
         .error-msg { color: #f87171; font-weight: bold; padding: 15px; background: #450a0a; border-radius: 8px; }
         .canvas-wrap { position: relative; height: 420px; width: 100%; }
     </style>
 </head>
 <body>
     <h2>📊 {{ symbol }} Advanced Analytics & Google Sheet Memory Dashboard</h2>
-    <div class="subtitle">High-speed parallel auto-sync — Drag left/right on Chart 2 or 3 to pan across timestamps (or toggle to Area Zoom)</div>
+    <div class="subtitle">High-speed parallel auto-sync — Click "🔒 Zoom: Frozen" to unrelease Zoom + / − controls on Chart 2 or Chart 3</div>
 
     <div class="nav-bar">
         <label style="color: #94a3b8; font-weight: bold;">Symbol:</label>
@@ -2113,13 +1969,13 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             <option value="BANKNIFTY" {% if symbol == 'BANKNIFTY' %}selected{% endif %}>BANK NIFTY</option>
         </select>
 
-        <label style="color: #94a3b8; font-weight: bold; margin-left: 6px;">Expiry:</label>
+        <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Expiry:</label>
         <select id="expirySelector" onchange="switchExpiry(this.value)">
             <option value="ALL" {% if expiry == 'ALL EXPIRIES (CONSOLIDATED)' or expiry == 'ALL' or not expiry %}selected{% endif %}>★ ALL EXPIRIES (CONSOLIDATED)</option>
             {% for exp in expiries %}<option value="{{ exp }}" {% if exp == expiry %}selected{% endif %}>{{ exp }}</option>{% endfor %}
         </select>
 
-        <label style="color: #94a3b8; font-weight: bold; margin-left: 6px;">Bar Chart Metric:</label>
+        <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Bar Chart Metric:</label>
         <select id="metricSelector" onchange="updateChartMetric()">
             <option value="oi_chg" selected>Change in Open Interest (Chg in OI)</option>
             <option value="depth_qty">1 - Order Book Depth Quantity (Put Bid Qty vs Call Ask Qty)</option>
@@ -2129,10 +1985,9 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             <option value="theta">Theta Time Decay</option>
         </select>
 
-        <div style="margin-left: auto; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+        <div style="margin-left: auto; display: flex; align-items: center; gap: 12px;">
             <span class="timer-badge" id="syncBadge">Auto Sync: <span id="countdown">10</span>s</span>
-            <a href="/?symbol={{ symbol }}&expiry={{ expiry }}" class="btn btn-table">📋 Option Chain</a>
-            <a href="/positions" class="btn btn-live">🔐 Live Positions</a>
+            <a href="/?symbol={{ symbol }}&expiry={{ expiry }}" class="btn btn-table">📋 Back to Table View</a>
         </div>
     </div>
 
@@ -2168,16 +2023,14 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 
     <div class="chart-box">
         <div class="chart-header">
-            <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
-                <span class="chart-title">2 - 📈 Historical Snapshot Trend (Google Sheet Memory — B / BE / S / SE Signals)</span>
-                <span id="histStatusBadge" class="status-pill">Loading...</span>
-            </div>
+            <span class="chart-title">2 - 📈 Historical Snapshot Trend (Google Sheet Memory — B / BE / S / SE Signals)</span>
             <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
                 <div class="zoom-toolbar">
-                    <button type="button" id="histDragModeBtn" class="btn-zoom btn-zoom-pan-active" onclick="toggleChartDragMode('history')" title="Switch between Drag-to-Pan and Drag-to-Zoom Area">✋ Drag: Pan</button>
-                    <button type="button" class="btn-zoom" onclick="stepChartZoom('history', 1.35)" title="Zoom In">+</button>
-                    <button type="button" class="btn-zoom" onclick="stepChartZoom('history', 0.74)" title="Zoom Out">−</button>
-                    <button type="button" id="histResetZoomBtn" class="btn-zoom-reset" onclick="resetChartZoom('history')" title="Reset Zoom (or Double-Click Chart)">🔄 Reset Zoom</button>
+                    <button type="button" id="histZoomLockBtn" class="btn-zoom-lock" onclick="toggleZoomFreeze('history')" title="Click to Unrelease or Freeze Zoom Controls">🔒 Zoom: Frozen</button>
+                    <button type="button" id="histDragModeBtn" class="btn-zoom" onclick="toggleChartDragMode('history')" title="Switch between Drag-to-Zoom Area and Drag-to-Pan" disabled>🔍 Drag: Zoom</button>
+                    <button type="button" id="histZoomInBtn" class="btn-zoom" onclick="stepChartZoom('history', 1.35)" title="Zoom In (Unrelease Zoom first)" disabled>+</button>
+                    <button type="button" id="histZoomOutBtn" class="btn-zoom" onclick="stepChartZoom('history', 0.74)" title="Zoom Out (Unrelease Zoom first)" disabled>−</button>
+                    <button type="button" id="histResetZoomBtn" class="btn-zoom-reset" onclick="resetChartZoom('history')" title="Reset Zoom">🔄 Reset Zoom</button>
                 </div>
                 <label style="color: #94a3b8; font-weight: bold;">Head of Dropdown:</label>
                 <select id="historyMetricSelector" onchange="loadHistoricalChart(true)">
@@ -2206,7 +2059,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                 <a id="downloadHistoryBtn" href="/download_history?symbol={{ symbol }}" class="btn-dl">📥 CSV</a>
             </div>
         </div>
-        <div class="zoom-hint">💡 <strong>Pan & Zoom Controls:</strong> Drag left/right to pan across dates/times • Scroll wheel (or + / −) to zoom in/out • Click <strong>"✋ Drag: Pan"</strong> to switch to Area-Zoom • Double-click chart to reset</div>
+        <div class="zoom-hint" id="histZoomHint">🔒 <strong>Zoom is Frozen:</strong> Click <strong>"🔒 Zoom: Frozen"</strong> to unrelease <strong>+</strong> / <strong>−</strong>, drag-to-zoom, and scroll-wheel zoom.</div>
         <div class="canvas-wrap">
             <canvas id="historyChart" ondblclick="resetChartZoom('history')"></canvas>
         </div>
@@ -2214,16 +2067,14 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 
     <div class="chart-box">
         <div class="chart-header">
-            <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
-                <span class="chart-title">3 - 🚀 Main Signal (B / BE / S / SE)</span>
-                <span id="sigStatusBadge" class="status-pill">Loading...</span>
-            </div>
+            <span class="chart-title">3 - 🚀 Main Signal (B / BE / S / SE)</span>
             <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
                 <div class="zoom-toolbar">
-                    <button type="button" id="sigDragModeBtn" class="btn-zoom btn-zoom-pan-active" onclick="toggleChartDragMode('signal')" title="Switch between Drag-to-Pan and Drag-to-Zoom Area">✋ Drag: Pan</button>
-                    <button type="button" class="btn-zoom" onclick="stepChartZoom('signal', 1.35)" title="Zoom In">+</button>
-                    <button type="button" class="btn-zoom" onclick="stepChartZoom('signal', 0.74)" title="Zoom Out">−</button>
-                    <button type="button" id="sigResetZoomBtn" class="btn-zoom-reset" onclick="resetChartZoom('signal')" title="Reset Zoom (or Double-Click Chart)">🔄 Reset Zoom</button>
+                    <button type="button" id="sigZoomLockBtn" class="btn-zoom-lock" onclick="toggleZoomFreeze('signal')" title="Click to Unrelease or Freeze Zoom Controls">🔒 Zoom: Frozen</button>
+                    <button type="button" id="sigDragModeBtn" class="btn-zoom" onclick="toggleChartDragMode('signal')" title="Switch between Drag-to-Zoom Area and Drag-to-Pan" disabled>🔍 Drag: Zoom</button>
+                    <button type="button" id="sigZoomInBtn" class="btn-zoom" onclick="stepChartZoom('signal', 1.35)" title="Zoom In (Unrelease Zoom first)" disabled>+</button>
+                    <button type="button" id="sigZoomOutBtn" class="btn-zoom" onclick="stepChartZoom('signal', 0.74)" title="Zoom Out (Unrelease Zoom first)" disabled>−</button>
+                    <button type="button" id="sigResetZoomBtn" class="btn-zoom-reset" onclick="resetChartZoom('signal')" title="Reset Zoom">🔄 Reset Zoom</button>
                 </div>
                 <label style="color: #94a3b8; font-weight: bold;">Data Day Range:</label>
                 <select id="signalDayRangeSelector" onchange="loadSignalChart(true)">
@@ -2236,17 +2087,13 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                 </select>
             </div>
         </div>
-        <div class="zoom-hint">💡 <strong>Pan & Zoom Controls:</strong> Drag left/right to pan across dates/times • Scroll wheel (or + / −) to zoom in/out • Click <strong>"✋ Drag: Pan"</strong> to switch to Area-Zoom • Double-click chart to reset</div>
+        <div class="zoom-hint" id="sigZoomHint">🔒 <strong>Zoom is Frozen:</strong> Click <strong>"🔒 Zoom: Frozen"</strong> to unrelease <strong>+</strong> / <strong>−</strong>, drag-to-zoom, and scroll-wheel zoom.</div>
         <div class="canvas-wrap">
             <canvas id="signalChart" ondblclick="resetChartZoom('signal')"></canvas>
         </div>
     </div>
 
     <script>
-        if (typeof ChartZoom !== 'undefined' && typeof Chart !== 'undefined') {
-            try { Chart.register(ChartZoom); } catch (e) {}
-        }
-
         let currentSymbol = "{{ symbol }}";
         let currentExpiry = "{{ expiry }}";
         let rawRows = [];
@@ -2254,6 +2101,10 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         let myChart = null, historyChartObj = null, signalChartObj = null;
         let hasHistoryData = false, hasSignalData = false;
         let histAbortCtrl = null, sigAbortCtrl = null, dataAbortCtrl = null;
+
+        // Zoom starts FROZEN (true) until user clicks "Zoom: Frozen" to unrelease it
+        const zoomFrozenState = { history: true, signal: true };
+        const dragPanState = { history: false, signal: false };
 
         const DATE_PALETTE = ['#38bdf8', '#facc15', '#4ade80', '#f472b6', '#a78bfa', '#fb923c', '#2dd4bf'];
 
@@ -2271,27 +2122,27 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        function buildInteractiveZoomOptions() {
+        function buildInteractiveZoomOptions(isFrozen = true) {
             return {
                 limits: {
                     x: { min: 'original', max: 'original', minRange: 4 }
                 },
                 pan: {
-                    enabled: true,
+                    enabled: !isFrozen,
                     mode: 'x',
-                    modifierKey: null,
+                    modifierKey: 'shift',
                     onPanComplete: ({ chart }) => updateZoomBadge(chart)
                 },
                 zoom: {
                     wheel: {
-                        enabled: true,
+                        enabled: !isFrozen,
                         speed: 0.12
                     },
                     pinch: {
-                        enabled: true
+                        enabled: !isFrozen
                     },
                     drag: {
-                        enabled: false,
+                        enabled: !isFrozen,
                         backgroundColor: 'rgba(56, 189, 248, 0.24)',
                         borderColor: '#38bdf8',
                         borderWidth: 1.5,
@@ -2303,29 +2154,72 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             };
         }
 
+        function toggleZoomFreeze(chartKey) {
+            const isHist = chartKey === 'history';
+            const chart = isHist ? historyChartObj : signalChartObj;
+            const lockBtn = document.getElementById(isHist ? 'histZoomLockBtn' : 'sigZoomLockBtn');
+            const dragBtn = document.getElementById(isHist ? 'histDragModeBtn' : 'sigDragModeBtn');
+            const zoomInBtn = document.getElementById(isHist ? 'histZoomInBtn' : 'sigZoomInBtn');
+            const zoomOutBtn = document.getElementById(isHist ? 'histZoomOutBtn' : 'sigZoomOutBtn');
+            const hintEl = document.getElementById(isHist ? 'histZoomHint' : 'sigZoomHint');
+
+            zoomFrozenState[chartKey] = !zoomFrozenState[chartKey];
+            const frozen = zoomFrozenState[chartKey];
+
+            zoomInBtn.disabled = frozen;
+            zoomOutBtn.disabled = frozen;
+            dragBtn.disabled = frozen;
+
+            if (frozen) {
+                lockBtn.innerText = '🔒 Zoom: Frozen';
+                lockBtn.classList.remove('unlocked');
+                hintEl.innerHTML = '🔒 <strong>Zoom is Frozen:</strong> Click <strong>"🔒 Zoom: Frozen"</strong> to unrelease <strong>+</strong> / <strong>−</strong>, drag-to-zoom, and scroll-wheel zoom.';
+            } else {
+                lockBtn.innerText = '🔓 Zoom: Released';
+                lockBtn.classList.add('unlocked');
+                hintEl.innerHTML = '🔓 <strong>Zoom Released:</strong> Use <strong>+</strong> / <strong>−</strong>, drag across any region to zoom, or scroll wheel • Click <strong>"🔓 Zoom: Released"</strong> to freeze again.';
+            }
+
+            if (chart && chart.options && chart.options.plugins && chart.options.plugins.zoom) {
+                const z = chart.options.plugins.zoom;
+                z.zoom.wheel.enabled = !frozen;
+                z.zoom.pinch.enabled = !frozen;
+                z.pan.enabled = !frozen;
+                if (frozen) {
+                    z.zoom.drag.enabled = false;
+                } else {
+                    const isPanMode = dragPanState[chartKey];
+                    z.zoom.drag.enabled = !isPanMode;
+                    z.pan.modifierKey = isPanMode ? null : 'shift';
+                }
+                chart.update('none');
+            }
+        }
+
         function toggleChartDragMode(chartKey) {
+            if (zoomFrozenState[chartKey]) return;
             const chart = chartKey === 'history' ? historyChartObj : signalChartObj;
             const btn = document.getElementById(chartKey === 'history' ? 'histDragModeBtn' : 'sigDragModeBtn');
             if (!chart || !chart.options.plugins.zoom) return;
 
-            const isCurrentlyZoom = chart.options.plugins.zoom.zoom.drag.enabled;
-            if (isCurrentlyZoom) {
+            dragPanState[chartKey] = !dragPanState[chartKey];
+            const isPanMode = dragPanState[chartKey];
+            if (isPanMode) {
                 chart.options.plugins.zoom.zoom.drag.enabled = false;
                 chart.options.plugins.zoom.pan.modifierKey = null;
                 btn.innerText = '✋ Drag: Pan';
-                btn.classList.add('btn-zoom-pan-active');
                 btn.style.backgroundColor = '#0284c7';
             } else {
                 chart.options.plugins.zoom.zoom.drag.enabled = true;
                 chart.options.plugins.zoom.pan.modifierKey = 'shift';
                 btn.innerText = '🔍 Drag: Zoom';
-                btn.classList.remove('btn-zoom-pan-active');
                 btn.style.backgroundColor = '#334155';
             }
             chart.update('none');
         }
 
         function stepChartZoom(chartKey, factor) {
+            if (zoomFrozenState[chartKey]) return;
             const chart = chartKey === 'history' ? historyChartObj : signalChartObj;
             if (!chart || typeof chart.zoom !== 'function') return;
             chart.zoom(factor, 'none');
@@ -2597,7 +2491,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     plugins: {
                         legend: { labels: { color: '#f8fafc', font: { size: 13 } } },
                         tooltip: buildTimeOnlyTooltipConfig('Time'),
-                        zoom: buildInteractiveZoomOptions()
+                        zoom: buildInteractiveZoomOptions(zoomFrozenState.signal)
                     }
                 },
                 plugins: [dateBandPlugin, zeroLinePlugin, signalLabelPlugin, hoverCrosshairPlugin]
@@ -2605,33 +2499,23 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         }
 
         function loadSignalChart(isManualChange = false) {
-            if (!signalChartObj) {
-                try { initSignalChart(); } catch (e) { console.error("initSignalChart failed:", e); return Promise.resolve(); }
-            }
             if (sigAbortCtrl) sigAbortCtrl.abort();
             sigAbortCtrl = new AbortController();
             const dayRange = document.getElementById('signalDayRangeSelector').value;
             const timeframe = document.getElementById('signalTimeframeSelector').value;
-            const statusBadge = document.getElementById('sigStatusBadge');
-            if (statusBadge) statusBadge.innerText = "Fetching Google Sheet...";
 
-            return fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&day_range=${dayRange}&chart_type=signal&_t=${Date.now()}`, { signal: sigAbortCtrl.signal })
+            return fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&day_range=${dayRange}&chart_type=signal`, { signal: sigAbortCtrl.signal })
                 .then(res => res.json())
                 .then(data => {
                     if (isManualChange) {
                         resetChartZoom('signal');
                     }
                     if (data.error || !(data.history && data.history.length)) {
-                        const errTxt = data.error || "No data found for Main Signal.";
-                        if (statusBadge) {
-                            statusBadge.innerText = "⚠️ " + errTxt;
-                            statusBadge.style.color = "#f87171";
-                        }
                         if (isManualChange || !hasSignalData) {
                             signalChartObj._dateColors = [];
                             signalChartObj._dateGroups = [];
                             signalChartObj._hoverTimes = [];
-                            signalChartObj.data.labels = [errTxt];
+                            signalChartObj.data.labels = [data.error || "No data found for Main Signal."];
                             signalChartObj.data.datasets = [{ label: 'Status', data: [0], borderColor: '#ef4444' }];
                             signalChartObj.update('none');
                         }
@@ -2644,35 +2528,18 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     signalChartObj._dateGroups = meta.groups;
                     signalChartObj._hoverTimes = meta.hoverTimes;
 
-                    const sigLabels = snapshots.map(s => (s.new_signal || s.signal_5m || "").trim().toUpperCase());
-                    const sigCount = sigLabels.filter(v => ['B', 'BE', 'S', 'SE'].includes(v)).length;
-                    const sigPointRadii = sigLabels.map(sig => ['B', 'BE', 'S', 'SE'].includes(sig) ? 5 : 2.5);
-
-                    if (statusBadge) {
-                        statusBadge.innerText = `✅ ${snapshots.length} pts | ${sigCount} Signals`;
-                        statusBadge.style.color = "#34d399";
-                    }
-
                     const times = snapshots.map(s => s.formatted_time || s.datetime);
                     signalChartObj.data.labels = times;
                     signalChartObj.data.datasets = [
-                        { label: 'Min ROC (Buy)', data: snapshots.map(s => Number(s.min_roc) || 0), borderColor: '#22c55e', borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: 0.2 },
-                        { label: 'Max ROC (Sell)', data: snapshots.map(s => Number(s.max_roc) || 0), borderColor: '#ef4444', borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: 0.2 },
-                        { label: 'Cross ROC Sig', data: snapshots.map(s => Number(s.cross_roc) || 0), borderColor: '#facc15', borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: 0.2 },
-                        { label: 'Main Volatility', data: snapshots.map(s => Number(s.main_volatility) || 0), signalLabels: sigLabels, borderColor: '#38bdf8', borderWidth: 3, pointRadius: sigPointRadii, pointHoverRadius: 5, tension: 0.2 }
+                        { label: 'Min ROC (Buy)', data: snapshots.map(s => s.min_roc || 0), borderColor: '#22c55e', borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: 0.2 },
+                        { label: 'Max ROC (Sell)', data: snapshots.map(s => s.max_roc || 0), borderColor: '#ef4444', borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: 0.2 },
+                        { label: 'Cross ROC Sig', data: snapshots.map(s => s.cross_roc || 0), borderColor: '#facc15', borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: 0.2 },
+                        { label: 'Main Volatility', data: snapshots.map(s => s.main_volatility || 0), signalLabels: snapshots.map(s => s.new_signal || ""), borderColor: '#38bdf8', borderWidth: 3, pointRadius: 3, pointHoverRadius: 4, tension: 0.2 }
                     ];
                     signalChartObj.update('none');
                     updateZoomBadge(signalChartObj);
                 })
-                .catch(err => {
-                    if (err.name !== 'AbortError') {
-                        console.error("Signal chart error:", err);
-                        if (statusBadge) {
-                            statusBadge.innerText = "⚠️ Fetch Error — Retrying...";
-                            statusBadge.style.color = "#fbbf24";
-                        }
-                    }
-                });
+                .catch(err => { if (err.name !== 'AbortError') console.error("Signal chart error:", err); });
         }
 
         function initHistoryChart() {
@@ -2700,7 +2567,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     plugins: {
                         legend: { labels: { color: '#f8fafc', font: { size: 13 } } },
                         tooltip: buildTimeOnlyTooltipConfig('Time'),
-                        zoom: buildInteractiveZoomOptions()
+                        zoom: buildInteractiveZoomOptions(zoomFrozenState.history)
                     }
                 },
                 plugins: [dateBandPlugin, signalLabelPlugin, hoverCrosshairPlugin]
@@ -2708,17 +2575,12 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         }
 
         function loadHistoricalChart(isManualChange = false) {
-            if (!historyChartObj) {
-                try { initHistoryChart(); } catch (e) { console.error("initHistoryChart failed:", e); return Promise.resolve(); }
-            }
             if (histAbortCtrl) histAbortCtrl.abort();
             histAbortCtrl = new AbortController();
 
             const metric = document.getElementById('historyMetricSelector').value;
             const dayRange = document.getElementById('historyDayRangeSelector').value;
             const timeframe = document.getElementById('historyTimeframeSelector').value;
-            const statusBadge = document.getElementById('histStatusBadge');
-            if (statusBadge) statusBadge.innerText = "Fetching Google Sheet...";
 
             const tfSignalKeyMap = {
                 "5minute": "signal_5m",
@@ -2729,23 +2591,18 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             };
             const activeSigKey = tfSignalKeyMap[timeframe] || "signal_5m";
 
-            return fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&metric=${metric}&day_range=${dayRange}&chart_type=history&_t=${Date.now()}`, { signal: histAbortCtrl.signal })
+            return fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&metric=${metric}&day_range=${dayRange}&chart_type=history`, { signal: histAbortCtrl.signal })
                 .then(res => res.json())
                 .then(data => {
                     if (isManualChange) {
                         resetChartZoom('history');
                     }
                     if (data.error || !(data.history && data.history.length)) {
-                        const errTxt = data.error || "No data found in Google Sheet.";
-                        if (statusBadge) {
-                            statusBadge.innerText = "⚠️ " + errTxt;
-                            statusBadge.style.color = "#f87171";
-                        }
                         if (isManualChange || !hasHistoryData) {
                             historyChartObj._dateColors = [];
                             historyChartObj._dateGroups = [];
                             historyChartObj._hoverTimes = [];
-                            historyChartObj.data.labels = [errTxt];
+                            historyChartObj.data.labels = [data.error || "No data found in Google Sheet."];
                             historyChartObj.data.datasets = [{ label: 'Status', data: [0], borderColor: '#ef4444' }];
                             historyChartObj.update('none');
                         }
@@ -2757,11 +2614,6 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     historyChartObj._dateColors = meta.colors;
                     historyChartObj._dateGroups = meta.groups;
                     historyChartObj._hoverTimes = meta.hoverTimes;
-
-                    if (statusBadge) {
-                        statusBadge.innerText = `✅ ${snapshots.length} pts`;
-                        statusBadge.style.color = "#34d399";
-                    }
 
                     const times = snapshots.map(s => s.formatted_time || s.datetime);
                     const chart2Signals = snapshots.map(s => (s[activeSigKey] || s.sig || "").trim().toUpperCase());
@@ -2806,15 +2658,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     historyChartObj.update('none');
                     updateZoomBadge(historyChartObj);
                 })
-                .catch(err => {
-                    if (err.name !== 'AbortError') {
-                        console.error("Historical chart error:", err);
-                        if (statusBadge) {
-                            statusBadge.innerText = "⚠️ Fetch Error — Retrying...";
-                            statusBadge.style.color = "#fbbf24";
-                        }
-                    }
-                });
+                .catch(err => { if (err.name !== 'AbortError') console.error("Historical chart error:", err); });
         }
 
         const spotLinePlugin = {
@@ -2978,9 +2822,9 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             });
         }
 
-        try { initChart(); } catch(e) { console.error(e); }
-        try { initHistoryChart(); } catch(e) { console.error(e); }
-        try { initSignalChart(); } catch(e) { console.error(e); }
+        try { initChart(); } catch(e) {}
+        try { initHistoryChart(); } catch(e) {}
+        try { initSignalChart(); } catch(e) {}
         fetchDataInBackground(true);
 
         setInterval(() => {
@@ -2988,6 +2832,152 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             if (--timerSeconds <= 0) { fetchDataInBackground(false); }
             else { document.getElementById("countdown").innerText = timerSeconds; }
         }, 1000);
+    </script>
+</body>
+</html>"""
+
+# --- PASSWORD LOGIN TEMPLATE FOR /positions ---
+POSITIONS_LOGIN_HTML_TEMPLATE = """<!DOCTYPE html>
+<html>
+<head>
+    <title>Locked — Private Positions Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #0b1329;
+            color: #f8fafc;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 16px;
+        }
+        .login-card {
+            background: linear-gradient(145deg, #1e293b 0%, #0f172a 100%);
+            border: 1px solid #334155;
+            border-top: 4px solid #38bdf8;
+            border-radius: 14px;
+            padding: 32px 28px;
+            width: 100%;
+            max-width: 390px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.55);
+        }
+        .lock-icon {
+            font-size: 36px;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+        h2 {
+            color: #38bdf8;
+            text-align: center;
+            margin: 0 0 6px 0;
+            font-size: 20px;
+        }
+        .sub {
+            color: #94a3b8;
+            text-align: center;
+            font-size: 13px;
+            margin-bottom: 22px;
+        }
+        .error-box {
+            background: #450a0a;
+            border: 1px solid #ef4444;
+            color: #fca5a5;
+            padding: 10px 12px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            text-align: center;
+        }
+        label {
+            display: block;
+            font-size: 12px;
+            color: #cbd5e1;
+            font-weight: 700;
+            text-transform: uppercase;
+            margin-bottom: 6px;
+        }
+        .pw-wrap {
+            position: relative;
+            margin-bottom: 18px;
+        }
+        input[type="password"], input[type="text"] {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 11px 40px 11px 12px;
+            background: #0f172a;
+            border: 1px solid #475569;
+            border-radius: 8px;
+            color: #f8fafc;
+            font-size: 15px;
+            outline: none;
+        }
+        input:focus {
+            border-color: #38bdf8;
+        }
+        .toggle-eye {
+            position: absolute;
+            right: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: none;
+            border: none;
+            color: #94a3b8;
+            cursor: pointer;
+            font-size: 15px;
+        }
+        .btn-unlock {
+            width: 100%;
+            padding: 12px;
+            background-color: #22c55e;
+            color: #052e16;
+            border: none;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 800;
+            cursor: pointer;
+            transition: background-color 0.15s;
+        }
+        .btn-unlock:hover {
+            background-color: #16a34a;
+        }
+        .back-link {
+            display: block;
+            text-align: center;
+            margin-top: 16px;
+            color: #94a3b8;
+            font-size: 12px;
+            text-decoration: none;
+        }
+        .back-link:hover {
+            color: #38bdf8;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <div class="lock-icon">🔐</div>
+        <h2>Protected Positions Page</h2>
+        <div class="sub">Enter your Render environment password to access Live Trades & Positions</div>
+        {% if error %}<div class="error-box">{{ error }}</div>{% endif %}
+        <form method="POST">
+            <label for="pwInput">Access Password</label>
+            <div class="pw-wrap">
+                <input type="password" id="pwInput" name="password" placeholder="Enter password..." required autofocus>
+                <button type="button" class="toggle-eye" onclick="togglePw()" title="Show/Hide Password">👁️</button>
+            </div>
+            <button type="submit" class="btn-unlock">🔓 Unlock Positions Dashboard</button>
+        </form>
+        <a href="/" class="back-link">← Back to Option Chain</a>
+    </div>
+    <script>
+        function togglePw() {
+            const inp = document.getElementById('pwInput');
+            inp.type = inp.type === 'password' ? 'text' : 'password';
+        }
     </script>
 </body>
 </html>"""
@@ -3001,10 +2991,10 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #0b1329; color: #f8fafc; }
         h2 { color: #38bdf8; margin-bottom: 5px; }
         .subtitle { color: #94a3b8; font-size: 13px; margin-bottom: 18px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
-        .nav-link-btn { background: #1e293b; border: 1px solid #334155; color: #38bdf8; padding: 5px 12px; border-radius: 6px; font-size: 12px; font-weight: 700; text-decoration: none; }
-        .nav-link-btn:hover { background: #334155; }
         .timer-badge { background: #0284c7; color: #ffffff; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
         .latency-badge { background: #0f172a; border: 1px solid #334155; color: #34d399; padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: 700; font-family: monospace; }
+        .btn-lock-page { background: #334155; color: #f8fafc; border: 1px solid #475569; padding: 4px 11px; border-radius: 12px; font-size: 11px; font-weight: 700; cursor: pointer; }
+        .btn-lock-page:hover { background: #dc2626; border-color: #ef4444; }
         .static-ip-bar { background: #131c31; border: 1px solid #334155; border-radius: 10px; padding: 12px 18px; margin-bottom: 14px; display: none; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
         .ip-chip { background: #0f172a; border: 1px solid #334155; padding: 4px 10px; border-radius: 6px; font-family: monospace; font-size: 13px; color: #38bdf8; }
         .ip-ok { color: #34d399; font-weight: bold; font-size: 12px; }
@@ -3066,11 +3056,13 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
     <h2>🔐 Private Live Trade & Positions Dashboard</h2>
     <div class="subtitle">
         <span>High-Speed Parallel Upstox Engine (B7 Signal Exit, B8 3:20 PM Exit, Edit Open Orders & Dynamic SL/Target)</span>
-        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-            <a href="/" class="nav-link-btn">📋 Option Chain</a>
-            <a href="/analysis" class="nav-link-btn">📊 Analytics</a>
+        <div style="display: flex; align-items: center; gap: 8px;">
             <span class="latency-badge" id="latencyBadge">Upstox: -ms | Sheet: -ms</span>
             <span class="timer-badge" id="syncBadge">Fast Sync: <span id="countdown">3</span>s</span>
+            <form method="POST" style="margin: 0;">
+                <input type="hidden" name="action" value="logout">
+                <button type="submit" class="btn-lock-page" title="Lock Positions Page">🔒 Lock Page</button>
+            </form>
         </div>
     </div>
 
@@ -3249,8 +3241,12 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
 
         function checkStaticIpStatus() {
             fetch('/api/static_ip?_t=' + Date.now(), { cache: 'no-store' })
-                .then(r => r.json())
+                .then(r => {
+                    if (r.status === 401) { window.location.reload(); return null; }
+                    return r.json();
+                })
                 .then(data => {
+                    if (!data) return;
                     detectedOutboundIp = data.outbound_ip || "";
                     document.getElementById("txtOutboundIp").innerText = detectedOutboundIp || "Unknown";
                     document.getElementById("txtRegisteredIp").innerText = data.primary_ip ? (data.secondary_ip ? `${data.primary_ip} / ${data.secondary_ip}` : data.primary_ip) : "Not Configured";
@@ -3265,8 +3261,16 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
             const btn = document.getElementById("btnRegisterServerIp");
             btn.disabled = true; btn.innerText = "Registering...";
             fetch('/api/static_ip', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ primary_ip: detectedOutboundIp }) })
-                .then(r => r.json())
-                .then(d => { showToast((d.success ? "✅ " : "❌ ") + d.message, d.success ? "success" : "error"); checkStaticIpStatus(); fetchPositionsInBackground(); })
+                .then(r => {
+                    if (r.status === 401) { window.location.reload(); return null; }
+                    return r.json();
+                })
+                .then(d => {
+                    if (!d) return;
+                    showToast((d.success ? "✅ " : "❌ ") + d.message, d.success ? "success" : "error");
+                    checkStaticIpStatus();
+                    fetchPositionsInBackground();
+                })
                 .finally(() => { btn.disabled = false; btn.innerText = "⚡ Register Server IP with Upstox"; });
         }
 
@@ -3400,11 +3404,14 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
                 validity: document.getElementById("editRegValidity").value
             };
             fetch('/api/modify_order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
-                .then(r => r.json())
+                .then(r => {
+                    if (r.status === 401) { window.location.reload(); return null; }
+                    return r.json();
+                })
                 .then(d => {
+                    if (!d) return;
                     showToast((d.success ? "✅ " : "❌ ") + d.message, d.success ? "success" : "error");
-                    if (d.success) closeEditModals();
-                    fetchPositionsInBackground();
+                    if (d.success) { closeEditModals(); fetchPositionsInBackground(); }
                 })
                 .finally(() => { btn.disabled = false; btn.innerText = "💾 Update Order"; });
         }
@@ -3412,390 +3419,359 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
         function submitGttOrderModify() {
             const btn = document.getElementById("btnSaveGttOrder");
             btn.disabled = true; btn.innerText = "Updating...";
-            const tVal = document.getElementById("editGttTarget").value.trim();
-            const sVal = document.getElementById("editGttSl").value.trim();
+            const tgtRaw = document.getElementById("editGttTarget").value.trim();
+            const slRaw = document.getElementById("editGttSl").value.trim();
             const payload = {
                 kind: "GTT",
                 gtt_order_id: document.getElementById("editGttOrderId").value,
                 quantity: parseInt(document.getElementById("editGttQty").value, 10),
                 entry_price: parseFloat(document.getElementById("editGttEntry").value || 0),
-                target_price: tVal !== "" ? parseFloat(tVal) : null,
-                sl_price: sVal !== "" ? parseFloat(sVal) : null
+                target_price: tgtRaw !== "" ? parseFloat(tgtRaw) : 0,
+                sl_price: slRaw !== "" ? parseFloat(slRaw) : 0
             };
             fetch('/api/modify_order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
-                .then(r => r.json())
+                .then(r => {
+                    if (r.status === 401) { window.location.reload(); return null; }
+                    return r.json();
+                })
                 .then(d => {
+                    if (!d) return;
                     showToast((d.success ? "✅ " : "❌ ") + d.message, d.success ? "success" : "error");
-                    if (d.success) closeEditModals();
-                    fetchPositionsInBackground();
+                    if (d.success) { closeEditModals(); fetchPositionsInBackground(); }
                 })
                 .finally(() => { btn.disabled = false; btn.innerText = "💾 Update GTT"; });
         }
 
-        function cancelOpenBrokerOrder(kind, id) {
-            if (!confirm(`Cancel ${kind} order ${id} on Upstox?`)) return;
-            fetch('/api/cancel_broker_order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind, id }) })
-                .then(r => r.json())
+        function cancelSingleOpenOrder(kind, id) {
+            if (!confirm(`Cancel ${kind} order '${id}'?`)) return;
+            fetch('/api/cancel_open_order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind, id }) })
+                .then(r => {
+                    if (r.status === 401) { window.location.reload(); return null; }
+                    return r.json();
+                })
                 .then(d => {
+                    if (!d) return;
                     showToast((d.success ? "✅ " : "❌ ") + d.message, d.success ? "success" : "error");
                     fetchPositionsInBackground();
                 });
         }
 
         function executeManualOrder() {
-            if (!latestEvaluatedOrder || !confirm(`Place ${latestEvaluatedOrder.transaction_type} ${latestEvaluatedOrder.quantity} Qty of ${latestEvaluatedOrder.symbol} ${latestEvaluatedOrder.selected_strike} ${latestEvaluatedOrder.option_type} @ ₹${latestEvaluatedOrder.entry_price}?`)) return;
             const btn = document.getElementById("btnPlaceOrder");
-            btn.disabled = true; btn.innerText = "Placing...";
-            fetch('/api/execute_order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'place', signature: latestEvaluatedOrder.signature }) })
-                .then(r => r.json())
-                .then(d => { if (d.show_static_ip_bar) revealStaticIpBarIfNeeded(true); showToast((d.success ? "✅ " : "❌ ") + d.message, d.success ? "success" : "error"); fetchPositionsInBackground(); })
+            btn.disabled = true; btn.innerText = "Placing Order...";
+            fetch('/api/manual_order_action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'PLACE', evaluated_order: latestEvaluatedOrder }) })
+                .then(r => {
+                    if (r.status === 401) { window.location.reload(); return null; }
+                    return r.json();
+                })
+                .then(d => {
+                    if (!d) return;
+                    if (d.show_static_ip_bar) revealStaticIpBarIfNeeded(true);
+                    showToast((d.success ? "✅ " : "❌ ") + d.message, d.success ? "success" : "error");
+                    fetchPositionsInBackground();
+                })
                 .finally(() => { btn.disabled = false; btn.innerText = "✅ Place Order"; });
         }
 
         function cancelManualOrder() {
-            if (!latestEvaluatedOrder) return;
-            fetch('/api/execute_order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'cancel', signature: latestEvaluatedOrder.signature }) })
-                .then(r => r.json()).then(d => { showToast("ℹ️ " + d.message, "info"); fetchPositionsInBackground(); });
+            fetch('/api/manual_order_action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'CANCEL', signature: latestEvaluatedOrder ? latestEvaluatedOrder.signature : "" }) })
+                .then(r => {
+                    if (r.status === 401) { window.location.reload(); return null; }
+                    return r.json();
+                })
+                .then(d => {
+                    if (!d) return;
+                    showToast("🚫 " + d.message, "info");
+                    document.getElementById("manualOrderPanel").style.display = "none";
+                    fetchPositionsInBackground();
+                });
         }
 
         function resetCancelledPreview() {
-            fetch('/api/execute_order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'reset' }) })
-                .then(r => r.json()).then(d => { showToast("🔄 " + d.message, "info"); fetchPositionsInBackground(); });
-        }
-
-        function renderPositions(data) {
-            const errEl = document.getElementById("errorContainer");
-            if (data.error) { errEl.style.display = "block"; errEl.innerText = "Error: " + data.error; } else { errEl.style.display = "none"; }
-
-            updateCardPnl("valTotalPnl", "cardTotalPnlBox", data.total_pnl);
-            updateCardPnl("valUnrealisedPnl", "cardUnrealisedPnlBox", data.unrealised_pnl);
-            updateCardPnl("valRealisedPnl", "cardRealisedPnlBox", data.realised_pnl);
-            renderOrderEngineState(data.order_engine, data.diagnostics);
-
-            const posBody = document.getElementById("positionsBody");
-            if (!data.positions || data.positions.length === 0) {
-                posBody.innerHTML = '<tr><td colspan="11" style="color: #94a3b8; padding: 20px;">No active or closed positions for today.</td></tr>';
-            } else {
-                posBody.innerHTML = data.positions.map(p => {
-                    const st = p.status === 'OPEN' ? '<span class="status-open">OPEN</span>' : '<span class="status-closed">CLOSED</span>';
-                    const pCls = p.pnl >= 0 ? 'color: #22c55e; font-weight: bold;' : 'color: #ef4444; font-weight: bold;';
-                    const peakTxt = p.best_price != null ? `₹ ${p.best_price}` : '-';
-                    const slTxt = p.dynamic_sl != null ? `<span style="color:#f87171; font-weight:bold;">₹ ${p.dynamic_sl}</span>` : '-';
-                    const tgtTxt = p.dynamic_target != null ? `<span style="color:#4ade80; font-weight:bold;">₹ ${p.dynamic_target}</span>` : '-';
-                    return `<tr><td>${st}</td><td style="font-weight:bold; color:#38bdf8;">${p.trading_symbol}</td><td>${p.product}</td><td style="font-weight:bold;">${p.quantity}</td><td>${p.buy_price}</td><td>${p.sell_price}</td><td><strong>${p.ltp}</strong></td><td>${peakTxt}</td><td>${slTxt}</td><td>${tgtTxt}</td><td style="${pCls}">${p.pnl}</td></tr>`;
-                }).join("");
-            }
-
-            latestGttList = data.gtt_orders || [];
-            const gttBody = document.getElementById("gttOrdersBody");
-            if (latestGttList.length === 0) {
-                gttBody.innerHTML = '<tr><td colspan="9" style="color: #94a3b8; padding: 16px;">No GTT orders found for today.</td></tr>';
-            } else {
-                gttBody.innerHTML = latestGttList.map(g => {
-                    const tc = g.transaction_type === 'BUY' ? 'color: #22c55e; font-weight: bold;' : 'color: #ef4444; font-weight: bold;';
-                    const actionBtns = g.is_open
-                        ? `<button class="btn-sm-edit" onclick="openEditGttModal('${g.gtt_order_id}')">✏️ Edit</button><button class="btn-sm-cancel" onclick="cancelOpenBrokerOrder('GTT', '${g.gtt_order_id}')">✖ Cancel</button>`
-                        : `<span style="color:#64748b; font-size:11px;">Locked</span>`;
-                    return `<tr><td style="font-size:11px; color:#94a3b8;">${g.gtt_order_id}</td><td style="font-weight:bold;">${g.trading_symbol || g.instrument_token}</td><td style="${tc}">${g.transaction_type}</td><td>${g.quantity}</td><td style="color:#38bdf8; font-weight:bold;">₹ ${g.entry_price}</td><td style="color:#4ade80; font-weight:bold;">${g.target_price != null ? '₹ ' + g.target_price : '-'}</td><td style="color:#f87171; font-weight:bold;">${g.sl_price != null ? '₹ ' + g.sl_price : '-'}</td><td>${g.status}</td><td>${actionBtns}</td></tr>`;
-                }).join("");
-            }
-
-            latestOrdersList = data.orders || [];
-            const ordBody = document.getElementById("ordersBody");
-            if (latestOrdersList.length === 0) {
-                ordBody.innerHTML = '<tr><td colspan="10" style="color: #94a3b8; padding: 20px;">No trades or orders executed today.</td></tr>';
-            } else {
-                ordBody.innerHTML = latestOrdersList.map(o => {
-                    const tc = o.transaction_type === 'BUY' ? 'color: #22c55e; font-weight: bold;' : 'color: #ef4444; font-weight: bold;';
-                    const pVal = o.average_price > 0 ? o.average_price : o.price;
-                    const trigVal = o.trigger_price > 0 ? o.trigger_price : '-';
-                    const actionBtns = o.is_open
-                        ? `<button class="btn-sm-edit" onclick="openEditRegularModal('${o.order_id}')">✏️ Edit</button><button class="btn-sm-cancel" onclick="cancelOpenBrokerOrder('REGULAR', '${o.order_id}')">✖ Cancel</button>`
-                        : `<span style="color:#64748b; font-size:11px;">-</span>`;
-                    return `<tr><td>${o.order_timestamp}</td><td style="font-weight:bold;">${o.trading_symbol}</td><td style="${tc}">${o.transaction_type}</td><td>${o.order_type || 'LIMIT'}</td><td>${o.quantity}</td><td>${pVal}</td><td>${trigVal}</td><td>${o.status}</td><td style="font-size:11px; color:#94a3b8;">${o.order_id}</td><td>${actionBtns}</td></tr>`;
-                }).join("");
-            }
+            fetch('/api/manual_order_action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'RESET' }) })
+                .then(r => {
+                    if (r.status === 401) { window.location.reload(); return; }
+                    fetchPositionsInBackground();
+                });
         }
 
         function fetchPositionsInBackground() {
             if (isSyncing) return;
             isSyncing = true;
             document.getElementById("syncBadge").innerText = "Syncing...";
-            fetch('/api/positions?_t=' + Date.now(), { cache: 'no-store' })
-                .then(r => r.json())
-                .then(data => renderPositions(data))
-                .catch(e => console.error(e))
-                .finally(() => { isSyncing = false; timerSeconds = POLL_INTERVAL_SEC; document.getElementById("syncBadge").innerHTML = 'Fast Sync: <span id="countdown">' + timerSeconds + '</span>s'; });
+
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 7000);
+
+            fetch('/api/positions?_t=' + Date.now(), { cache: 'no-store', signal: controller.signal })
+                .then(r => {
+                    if (r.status === 401) {
+                        window.location.reload();
+                        return null;
+                    }
+                    return r.json();
+                })
+                .then(data => {
+                    if (!data) return;
+                    const errEl = document.getElementById("errorContainer");
+                    if (data.error) { errEl.style.display = "block"; errEl.innerText = "Error Fetching Positions: " + data.error; }
+                    else { errEl.style.display = "none"; }
+
+                    latestOrdersList = data.orders || [];
+                    latestGttList = data.gtt_orders || [];
+
+                    renderOrderEngineState(data.order_engine, data.diagnostics);
+                    updateCardPnl("valTotalPnl", "cardTotalPnlBox", data.total_pnl);
+                    updateCardPnl("valUnrealisedPnl", "cardUnrealisedPnlBox", data.unrealised_pnl);
+                    updateCardPnl("valRealisedPnl", "cardRealisedPnlBox", data.realised_pnl);
+
+                    const posBody = document.getElementById("positionsBody");
+                    if (data.positions && data.positions.length > 0) {
+                        posBody.innerHTML = data.positions.map(p => {
+                            const pnlNum = parseFloat(p.pnl) || 0;
+                            const badge = p.status === 'OPEN' ? '<span class="status-open">OPEN</span>' : '<span class="status-closed">CLOSED</span>';
+                            const peak = p.best_price != null ? `₹ ${p.best_price}` : '-';
+                            const dSl = p.dynamic_sl != null ? `<span style="color:#f87171; font-weight:bold;">₹ ${p.dynamic_sl}</span>` : '-';
+                            const dTgt = p.dynamic_target != null ? `<span style="color:#4ade80; font-weight:bold;">₹ ${p.dynamic_target}</span>` : '-';
+                            return `<tr><td>${badge}</td><td><strong>${p.trading_symbol}</strong></td><td>${p.product}</td><td><strong>${p.quantity}</strong></td><td>₹ ${p.buy_price}</td><td>₹ ${p.sell_price}</td><td>₹ ${p.ltp}</td><td style="color:#facc15;">${peak}</td><td>${dSl}</td><td>${dTgt}</td><td style="font-weight:bold; color:${pnlNum >= 0 ? '#22c55e' : '#ef4444'};">₹ ${pnlNum.toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2})}</td></tr>`;
+                        }).join("");
+                    } else {
+                        posBody.innerHTML = `<tr><td colspan="11" style="color: #94a3b8;">No open or closed positions found for today.</td></tr>`;
+                    }
+
+                    const gttBody = document.getElementById("gttOrdersBody");
+                    if (latestGttList.length > 0) {
+                        gttBody.innerHTML = latestGttList.map(g => {
+                            const actions = g.is_open
+                                ? `<button class="btn-sm-edit" onclick="openEditGttModal('${g.gtt_order_id}')">✏️ Edit</button><button class="btn-sm-cancel" onclick="cancelSingleOpenOrder('GTT','${g.gtt_order_id}')">❌</button>`
+                                : `<span style="color:#64748b; font-size:11px;">Locked</span>`;
+                            return `<tr><td style="font-size:11px; color:#94a3b8;">${g.gtt_order_id}</td><td><strong>${g.trading_symbol || g.instrument_token}</strong></td><td style="font-weight:bold; color:${g.transaction_type === 'BUY' ? '#38bdf8' : '#f43f5e'};">${g.transaction_type}</td><td>${g.quantity}</td><td>₹ ${g.entry_price || '-'}</td><td style="color:#4ade80;">${g.target_price != null ? '₹ ' + g.target_price : '-'}</td><td style="color:#f87171;">${g.sl_price != null ? '₹ ' + g.sl_price : '-'}</td><td><strong>${g.status}</strong></td><td>${actions}</td></tr>`;
+                        }).join("");
+                    } else {
+                        gttBody.innerHTML = `<tr><td colspan="9" style="color: #94a3b8;">No active GTT orders found.</td></tr>`;
+                    }
+
+                    const ordBody = document.getElementById("ordersBody");
+                    if (latestOrdersList.length > 0) {
+                        ordBody.innerHTML = latestOrdersList.map(o => {
+                            const actions = o.is_open
+                                ? `<button class="btn-sm-edit" onclick="openEditRegularModal('${o.order_id}')">✏️ Edit</button><button class="btn-sm-cancel" onclick="cancelSingleOpenOrder('REGULAR','${o.order_id}')">❌</button>`
+                                : `<span style="color:#64748b; font-size:11px;">-</span>`;
+                            return `<tr><td style="font-size:12px; color:#94a3b8;">${o.order_timestamp}</td><td><strong>${o.trading_symbol}</strong></td><td style="font-weight:bold; color:${o.transaction_type === 'BUY' ? '#38bdf8' : '#f43f5e'};">${o.transaction_type}</td><td>${o.order_type || 'LIMIT'}</td><td>${o.quantity}</td><td>₹ ${o.average_price || o.price}</td><td>₹ ${o.trigger_price || 0}</td><td><strong>${o.status}</strong></td><td style="font-size:11px; color:#64748b;">${o.order_id}</td><td>${actions}</td></tr>`;
+                        }).join("");
+                    } else {
+                        ordBody.innerHTML = `<tr><td colspan="10" style="color: #94a3b8;">No trades executed today.</td></tr>`;
+                    }
+                })
+                .catch(e => {
+                    if (e.name !== 'AbortError') console.error(e);
+                })
+                .finally(() => {
+                    clearTimeout(timeoutId);
+                    isSyncing = false;
+                    timerSeconds = POLL_INTERVAL_SEC;
+                    document.getElementById("syncBadge").innerHTML = 'Fast Sync: <span id="countdown">' + timerSeconds + '</span>s';
+                });
         }
 
         revealStaticIpBarIfNeeded(false);
         fetchPositionsInBackground();
-        setInterval(() => { if (isSyncing) return; if (--timerSeconds <= 0) fetchPositionsInBackground(); else document.getElementById("countdown").innerText = timerSeconds; }, 1000);
+        setInterval(() => {
+            if (isSyncing) return;
+            if (--timerSeconds <= 0) { fetchPositionsInBackground(); }
+            else { document.getElementById("countdown").innerText = timerSeconds; }
+        }, 1000);
     </script>
 </body>
 </html>"""
 
-# --- CORE ORDER ENGINE EVALUATION ---
-def evaluate_order_engine_cycle(positions, orders, gtt_orders):
-    ist_now = get_ist_now()
-    sync_time_str = ist_now.strftime("%H:%M:%S IST")
+# --- ROUTES ---
+@app.route("/health")
+def health():
+    return "OK", 200
 
-    cfg, cfg_err = fetch_dashboard_order_config(force_fresh=True)
-    if cfg_err or not cfg:
-        return {
-            "manual_order": "Manual",
-            "want_to_trade": "NO",
-            "signal_exit_b7": "NO",
-            "auto_exit_320_b8": "NO",
-            "active_trade_count": 0,
-            "max_active_trades": 1,
-            "exit_condition": "NONE",
-            "sheet_synced_at": sync_time_str,
-            "status_message": f"Sheet Error: {cfg_err}",
-            "show_manual_panel": False,
-            "evaluated_order": None,
-            "is_cancelled": False,
-            "guard_blocked": False,
-            "guard_reason": "",
-            "auto_execution_notice": None,
-            "auto_execution_ok": False,
-            "exit_execution_notice": None,
-            "exit_execution_ok": False,
-            "tsl_updates": [],
-            "show_static_ip_bar": False
-        }
-
-    tsl_updates = process_dynamic_sl_and_target(positions, gtt_orders, cfg.get("sl_percent"), cfg.get("target_percent"))
-
-    exit_execution_notice, exit_execution_ok = None, False
-    signal_exit_b7 = cfg.get("signal_exit_b7", "NO")
-    auto_exit_320_b8 = cfg.get("auto_exit_320_b8", "NO")
-    exit_cond = cfg.get("exit_condition", "")
-    is_after_320_pm = (ist_now.hour > 15) or (ist_now.hour == 15 and ist_now.minute >= 20)
-
-    # 1. 3:20 PM Auto Square-Off when B8 == YES
-    if auto_exit_320_b8 == "YES" and is_after_320_pm:
-        with ORDER_EXECUTION_LOCK:
-            ex_ok, ex_msg = execute_targeted_or_full_exit(
-                positions, orders, gtt_orders,
-                target_underlying=None, target_opt_type=None, only_options=False
-            )
-            if ex_ok is not None and ex_msg:
-                exit_execution_ok = ex_ok
-                exit_execution_notice = f"⏰ 3:20 PM Auto Square-Off (B8=YES): {ex_msg}"
-
-    # 2. Signal Exit (BE / SE in B29) ONLY when B7 == YES
-    if signal_exit_b7 == "YES" and exit_cond in ("BE", "SE"):
-        target_sym = cfg["symbol"]
-        target_opt = "CE" if exit_cond == "BE" else "PE"
-        with ORDER_EXECUTION_LOCK:
-            ex_ok, ex_msg = execute_targeted_or_full_exit(
-                positions, orders, gtt_orders,
-                target_underlying=target_sym, target_opt_type=target_opt, only_options=True
-            )
-            if ex_ok is not None and ex_msg:
-                exit_execution_ok = ex_ok
-                prefix = f"🚨 Signal Exit (B7=YES, B29={exit_cond} → Exit {target_sym} {target_opt}): "
-                exit_execution_notice = f"{exit_execution_notice} | {prefix}{ex_msg}" if exit_execution_notice else f"{prefix}{ex_msg}"
-
-    state = load_auto_order_state()
-    guard_info = evaluate_trade_guards(
-        cfg["symbol"],
-        cfg["option_type"],
-        cfg["max_active_trades"],
-        positions,
-        orders,
-        gtt_orders,
-        state.get("recent_submissions", {}),
-        state=state
-    )
-
-    base_state = {
-        "manual_order": cfg["manual_order"],
-        "want_to_trade": cfg["want_to_trade"],
-        "signal_exit_b7": signal_exit_b7,
-        "auto_exit_320_b8": auto_exit_320_b8,
-        "active_trade_count": guard_info["active_count"],
-        "max_active_trades": cfg["max_active_trades"],
-        "exit_condition": exit_cond or "NONE",
-        "sheet_synced_at": sync_time_str,
-        "status_message": "",
-        "show_manual_panel": False,
-        "evaluated_order": None,
-        "is_cancelled": False,
-        "guard_blocked": not guard_info["allowed"],
-        "guard_reason": guard_info["reason"],
-        "auto_execution_notice": None,
-        "auto_execution_ok": False,
-        "exit_execution_notice": exit_execution_notice,
-        "exit_execution_ok": exit_execution_ok,
-        "tsl_updates": tsl_updates,
-        "show_static_ip_bar": False
-    }
-
-    if cfg["want_to_trade"] != "YES":
-        base_state["status_message"] = "Waiting: 'Want to Trade' (B17) is NO."
-        return base_state
-
-    evaluated_order, eval_err = prepare_evaluated_order(cfg)
-    if eval_err or not evaluated_order:
-        base_state["status_message"] = f"Order Validation: {eval_err}"
-        return base_state
-
-    sig = evaluated_order["signature"]
-    dup_key = evaluated_order["duplicate_key"]
-    cancelled_sigs = set(state.get("cancelled_signatures", []))
-
-    if cfg["manual_order"] == "Manual":
-        if sig in cancelled_sigs:
-            base_state["is_cancelled"] = True
-            base_state["status_message"] = "Manual order preview was cancelled by user."
-            return base_state
-        base_state["show_manual_panel"] = True
-        base_state["evaluated_order"] = evaluated_order
-        base_state["status_message"] = (
-            f"Manual Approval Required ({evaluated_order['symbol']} {evaluated_order['selected_strike']} {evaluated_order['option_type']} @ ₹{evaluated_order['entry_price']})."
-            if guard_info["allowed"] else f"Manual Panel Visible — Blocked: {guard_info['reason']}"
-        )
-        return base_state
-
-    with ORDER_EXECUTION_LOCK:
-        state = load_auto_order_state()
-        recent_subs = state.setdefault("recent_submissions", {})
-        fresh_guard = evaluate_trade_guards(
-            evaluated_order["symbol"],
-            evaluated_order["option_type"],
-            cfg["max_active_trades"],
-            positions,
-            orders,
-            gtt_orders,
-            recent_subs,
-            state=state
-        )
-
-        if not fresh_guard["allowed"]:
-            base_state["guard_blocked"] = True
-            base_state["guard_reason"] = fresh_guard["reason"]
-            base_state["status_message"] = f"Auto Mode Guard: {fresh_guard['reason']}"
-            return base_state
-
-        now_ts = get_ist_now().timestamp()
-        recent_subs[dup_key] = now_ts
-        recent_subs[sig] = now_ts
-        save_auto_order_state(state)
-
-        ok, msg, is_ip_err = submit_upstox_evaluated_order(evaluated_order)
-        if not ok:
-            state = load_auto_order_state()
-            state.get("recent_submissions", {}).pop(dup_key, None)
-            state.get("recent_submissions", {}).pop(sig, None)
-            save_auto_order_state(state)
-
-        base_state["auto_execution_ok"] = ok
-        base_state["auto_execution_notice"] = f"🤖 AUTO ORDER ({evaluated_order['symbol']} {evaluated_order['selected_strike']} {evaluated_order['option_type']}): {msg}"
-        base_state["status_message"] = "Auto order executed!" if ok else f"Auto order failed: {msg}"
-        if is_ip_err:
-            base_state["show_static_ip_bar"] = True
-        return base_state
-
-# --- FLASK ROUTES (INCLUDING FULL ROUTE ALIASES) ---
-@app.route("/")
-@app.route("/option-chain")
-@app.route("/option_chain")
-def index():
-    auth_code = request.args.get("code")
-    if auth_code:
-        exchange_oauth_code(auth_code)
-        return redirect("/positions")
-    symbol = request.args.get("symbol", "NIFTY").upper()
-    if symbol not in INSTRUMENT_KEYS:
-        symbol = "NIFTY"
-    selected_expiry = request.args.get("expiry", "ALL")
-    rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
-    return render_template_string(
-        MAIN_HTML_TEMPLATE,
-        symbol=symbol, rows=rows, spot_price=spot_price, atm_strike=atm_strike,
-        expiry=expiry, expiries=expiries, updated=updated, pcr=pcr,
-        total_ce_oi=total_ce_oi, total_pe_oi=total_pe_oi, error=error
-    )
-
-@app.route("/callback")
-def oauth_callback():
-    auth_code = request.args.get("code")
-    if auth_code:
-        exchange_oauth_code(auth_code)
-    return redirect("/positions")
-
-@app.route("/analysis")
-@app.route("/analytics")
-@app.route("/chart")
-@app.route("/charts")
-def analysis():
-    symbol = request.args.get("symbol", "NIFTY").upper()
-    if symbol not in INSTRUMENT_KEYS:
-        symbol = "NIFTY"
-    selected_expiry = request.args.get("expiry", "ALL")
-    token = get_valid_token()
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"} if token else {}
-    expiries, _ = get_cached_expiries(symbol, headers) if token else ([], None)
-    return render_template_string(ANALYSIS_HTML_TEMPLATE, symbol=symbol, expiry=selected_expiry, expiries=expiries)
-
-@app.route("/positions")
-@app.route("/position")
-@app.route("/dashboard")
-@app.route("/live")
-@app.route("/trades")
-@app.route("/orders")
-def positions_page():
-    return render_template_string(POSITIONS_HTML_TEMPLATE)
+@app.route("/api/diagnostics")
+def api_diagnostics():
+    return jsonify({
+        "diagnostics": LAST_DIAGNOSTICS,
+        "cache_sizes": {
+            "expiry_entries": len(EXPIRY_CACHE),
+            "chain_entries": len(CHAIN_CACHE),
+            "history_entries": len(HISTORY_CACHE)
+        },
+        "ist_time": get_ist_now().strftime("%Y-%m-%d %H:%M:%S IST")
+    })
 
 @app.route("/api/static_ip", methods=["GET", "POST"])
+@require_positions_auth
 def api_static_ip():
     if request.method == "GET":
         return jsonify(fetch_upstox_static_ip_status())
     body = request.get_json(silent=True) or {}
-    ok, msg = update_upstox_static_ip(body.get("primary_ip"), body.get("secondary_ip"))
+    ok, msg = update_upstox_static_ip(body.get("primary_ip") or get_current_outbound_ip(), body.get("secondary_ip"))
     return jsonify({"success": ok, "message": msg})
 
+@app.route("/", methods=["GET"])
+def index():
+    code = request.args.get("code")
+    if code:
+        try:
+            res = HTTP_SESSION.post(
+                "https://api.upstox.com/v2/login/authorization/token",
+                data={"code": code, "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "redirect_uri": REDIRECT_URI, "grant_type": "authorization_code"},
+                headers={"accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+                timeout=8
+            )
+            if res.status_code == 200:
+                save_session_token(res.json().get("access_token"))
+        except Exception:
+            pass
+    symbol = request.args.get("symbol", "NIFTY").upper()
+    selected_expiry = request.args.get("expiry", "ALL")
+    rows, spot_price, atm_strike, expiry, expiries, updated, pcr, t_ce, t_pe, error = process_option_data(symbol, selected_expiry)
+    return render_template_string(MAIN_HTML_TEMPLATE, symbol=symbol, rows=rows, spot_price=spot_price, atm_strike=atm_strike, expiry=expiry, expiries=expiries, updated=updated, pcr=pcr, total_ce_oi=t_ce, total_pe_oi=t_pe, error=error)
+
+@app.route("/analysis", methods=["GET"])
+def analysis():
+    symbol = request.args.get("symbol", "NIFTY").upper()
+    selected_expiry = request.args.get("expiry", "ALL")
+    token = get_valid_token()
+    expiries = []
+    if token:
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+        expiries, _ = get_cached_expiries(symbol, headers)
+    return render_template_string(ANALYSIS_HTML_TEMPLATE, symbol=symbol, expiry=selected_expiry, expiries=expiries or [])
+
+def _handle_protected_positions_page():
+    if request.method == "POST":
+        action = (request.form.get("action") or "").strip().lower()
+        if action == "logout":
+            session.pop("positions_authenticated", None)
+            return redirect(request.path)
+
+        entered_pw = request.form.get("password", "")
+        if not POSITION_PAGE_PASSWORD:
+            return render_template_string(
+                POSITIONS_LOGIN_HTML_TEMPLATE,
+                error="POSITOIN_PAGE_PASSWORD is not configured in Render Environment Variables."
+            ), 403
+
+        if hmac.compare_digest(entered_pw, POSITION_PAGE_PASSWORD):
+            session.permanent = True
+            session["positions_authenticated"] = True
+            return redirect(request.path)
+
+        return render_template_string(
+            POSITIONS_LOGIN_HTML_TEMPLATE,
+            error="Incorrect password. Access denied."
+        ), 401
+
+    if not is_positions_authenticated():
+        init_err = None if POSITION_PAGE_PASSWORD else "POSITOIN_PAGE_PASSWORD is not configured in Render Environment Variables."
+        return render_template_string(POSITIONS_LOGIN_HTML_TEMPLATE, error=init_err)
+
+    return render_template_string(POSITIONS_HTML_TEMPLATE)
+
+@app.route("/positions", methods=["GET", "POST"])
+def positions_page():
+    return _handle_protected_positions_page()
+
+@app.route("/Live_Trade_Position", methods=["GET", "POST"])
+def live_trade_position():
+    return _handle_protected_positions_page()
+
+@app.route("/api/history", methods=["GET"])
+def api_history():
+    symbol = request.args.get("symbol", "NIFTY").upper()
+    timeframe = request.args.get("timeframe", "5minute")
+    day_range = request.args.get("day_range", "1day").lower()
+    chart_type = request.args.get("chart_type", "history").lower()
+    sym_clean = "BANKNIFTY" if "BANK" in symbol else "NIFTY"
+
+    if chart_type == "signal":
+        tf = timeframe.lower()
+        tf_str = "15_MIN" if "15" in tf else ("30_MIN" if "30" in tf else ("1_HR" if any(k in tf for k in ("60", "1h", "hour", "hr", "day")) else "5_MIN"))
+        target_sheet = f"{sym_clean}_{tf_str}"
+    else:
+        target_sheet = sym_clean
+
+    snapshots, error = fetch_history_from_gsheet(sym_clean, sheet_name=target_sheet)
+    if error:
+        return jsonify({"error": error, "history": []})
+
+    range_days_map = {"1day": 1, "3day": 3, "1week": 7, "2week": 14, "1month": 30, "3month": 90}
+    days_count = range_days_map.get(day_range, 1)
+
+    unique_dates = []
+    seen_dates = set()
+    for s in snapshots:
+        d = s.get("date_str", "").strip()
+        if d and d not in seen_dates:
+            seen_dates.add(d)
+            unique_dates.append(d)
+
+    if unique_dates:
+        allowed_dates = set(unique_dates[-days_count:])
+        filtered = [s for s in snapshots if s.get("date_str", "").strip() in allowed_dates]
+    else:
+        max_pts = {"1day": 80, "3day": 240, "1week": 560, "2week": 1120, "1month": 2400, "3month": 7200}.get(day_range, 80)
+        filtered = snapshots[-max_pts:]
+
+    if len(filtered) > 1500:
+        step = max(1, len(filtered) // 1500)
+        filtered = filtered[::step]
+
+    return jsonify({"history": filtered, "count": len(filtered), "day_range": day_range, "timeframe": timeframe, "sheet": target_sheet})
+
+@app.route("/api/data", methods=["GET"])
+def api_data():
+    symbol = request.args.get("symbol", "NIFTY").upper()
+    selected_expiry = request.args.get("expiry", "ALL")
+    rows, spot_price, atm_strike, expiry, expiries, updated, pcr, t_ce, t_pe, error = process_option_data(symbol, selected_expiry)
+    return jsonify({"symbol": symbol, "rows": rows, "spot_price": spot_price, "atm_strike": atm_strike, "expiry": expiry, "expiries": expiries, "updated": updated, "pcr": pcr, "total_ce_oi": t_ce, "total_pe_oi": t_pe, "error": error})
+
 @app.route("/api/modify_order", methods=["POST"])
+@require_positions_auth
 def api_modify_order():
     body = request.get_json(silent=True) or {}
-    kind = str(body.get("kind", "REGULAR")).strip().upper()
-    if kind == "GTT":
+    kind = str(body.get("kind", "")).strip().upper()
+    if kind == "REGULAR":
+        ok, msg = modify_upstox_regular_order(
+            order_id=body.get("order_id"),
+            quantity=body.get("quantity", 1),
+            price=body.get("price", 0),
+            trigger_price=body.get("trigger_price", 0),
+            order_type=body.get("order_type", "LIMIT"),
+            validity=body.get("validity", "DAY")
+        )
+        return jsonify({"success": ok, "message": msg})
+    elif kind == "GTT":
         gtt_id = str(body.get("gtt_order_id", "")).strip()
         _, _, gtt_orders, _, _, _, err = fetch_upstox_positions()
         if err:
-            return jsonify({"success": False, "message": err})
-        target_gtt = next((g for g in gtt_orders if str(g.get("gtt_order_id", "")).strip() == gtt_id), None)
+            return jsonify({"success": False, "message": f"Failed to fetch GTT details: {err}"})
+        target_gtt = next((g for g in gtt_orders if str(g.get("gtt_order_id")) == gtt_id), None)
         if not target_gtt:
-            return jsonify({"success": False, "message": f"GTT order {gtt_id} not found."})
+            return jsonify({"success": False, "message": f"GTT Order '{gtt_id}' not found."})
         ok, msg = modify_upstox_gtt_sl_target(
-            target_gtt,
-            body.get("sl_price"),
-            body.get("target_price"),
+            gtt_order=target_gtt,
+            new_sl=body.get("sl_price"),
+            new_target=body.get("target_price"),
             new_entry=body.get("entry_price"),
             new_qty=body.get("quantity")
         )
         return jsonify({"success": ok, "message": msg})
+    return jsonify({"success": False, "message": "Invalid modification type."})
 
-    ok, msg = modify_upstox_regular_order(
-        order_id=body.get("order_id"),
-        quantity=body.get("quantity"),
-        price=body.get("price"),
-        trigger_price=body.get("trigger_price", 0),
-        order_type=body.get("order_type", "LIMIT"),
-        validity=body.get("validity", "DAY")
-    )
-    return jsonify({"success": ok, "message": msg})
-
-@app.route("/api/cancel_broker_order", methods=["POST"])
-def api_cancel_broker_order():
+@app.route("/api/cancel_open_order", methods=["POST"])
+@require_positions_auth
+def api_cancel_open_order():
     body = request.get_json(silent=True) or {}
-    kind = str(body.get("kind", "REGULAR")).strip().upper()
+    kind = str(body.get("kind", "")).strip().upper()
     oid = str(body.get("id", "")).strip()
     token = get_valid_token()
-    if not token:
-        return jsonify({"success": False, "message": "Upstox token unavailable."})
+    if not token or not oid:
+        return jsonify({"success": False, "message": "Token or Order ID missing."})
     headers = {"Accept": "application/json", "Content-Type": "application/json", "Authorization": f"Bearer {token}"}
     proxies = get_upstox_proxies()
     if kind == "GTT":
@@ -3804,13 +3780,215 @@ def api_cancel_broker_order():
         ok, msg = cancel_upstox_regular_order(oid, headers, proxies)
     return jsonify({"success": ok, "message": msg})
 
-@app.route("/api/positions")
+@app.route("/api/manual_order_action", methods=["POST"])
+@require_positions_auth
+def api_manual_order_action():
+    body = request.get_json(silent=True) or {}
+    action = str(body.get("action", "")).upper()
+    with ORDER_EXECUTION_LOCK:
+        state = load_auto_order_state()
+        if action == "CANCEL":
+            sig = body.get("signature", "")
+            if sig and sig not in state["cancelled_signatures"]:
+                state["cancelled_signatures"].append(sig)
+                save_auto_order_state(state)
+            return jsonify({"success": True, "message": "Order preview cancelled. Will stay hidden until DASHBOARD parameters change."})
+        elif action == "RESET":
+            state["cancelled_signatures"] = []
+            save_auto_order_state(state)
+            return jsonify({"success": True, "message": "Cancelled order preview reset."})
+        elif action == "PLACE":
+            cfg, cfg_err = fetch_dashboard_order_config(force_fresh=True)
+            if cfg_err or not cfg:
+                return jsonify({"success": False, "message": f"Cannot verify DASHBOARD sheet: {cfg_err}"})
+            evaluated, eval_err = prepare_evaluated_order(cfg)
+            if eval_err or not evaluated:
+                return jsonify({"success": False, "message": eval_err or "Order evaluation failed."})
+            positions, orders, gtt_orders, _, _, _, pos_err = fetch_upstox_positions()
+            if pos_err:
+                return jsonify({"success": False, "message": f"Cannot verify active positions/orders: {pos_err}"})
+            guard = evaluate_trade_guards(
+                evaluated["symbol"],
+                evaluated["option_type"],
+                cfg["max_active_trades"],
+                positions,
+                orders,
+                gtt_orders,
+                state.get("recent_submissions", {})
+            )
+            if not guard["allowed"]:
+                return jsonify({"success": False, "message": guard["reason"]})
+            ok, msg, is_ip_err = submit_upstox_evaluated_order(evaluated)
+            if ok:
+                state.setdefault("recent_submissions", {})[evaluated["duplicate_key"]] = get_ist_now().timestamp()
+                save_auto_order_state(state)
+            return jsonify({"success": ok, "message": msg, "show_static_ip_bar": is_ip_err})
+    return jsonify({"success": False, "message": "Invalid action."})
+
+@app.route("/api/positions", methods=["GET"])
+@require_positions_auth
 def api_positions():
-    t_start = time.time()
-    positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, err = fetch_upstox_positions()
-    order_engine = evaluate_order_engine_cycle(positions, orders, gtt_orders)
-    LAST_DIAGNOSTICS["total_cycle_ms"] = int((time.time() - t_start) * 1000)
-    LAST_DIAGNOSTICS["updated_at"] = get_ist_now().strftime("%H:%M:%S IST")
+    cycle_t0 = time.time()
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fut_upstox = ex.submit(fetch_upstox_positions)
+        fut_cfg = ex.submit(fetch_dashboard_order_config, False)
+        positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, error = fut_upstox.result()
+        cfg, cfg_err = fut_cfg.result()
+
+    ist_now = get_ist_now()
+    now_ts = ist_now.timestamp()
+    sheet_sync_str = ist_now.strftime("%H:%M:%S IST")
+    is_after_320_pm = (ist_now.hour > 15) or (ist_now.hour == 15 and ist_now.minute >= 20)
+
+    order_engine = {
+        "manual_order": "Manual",
+        "want_to_trade": "NO",
+        "active_trade_count": 0,
+        "max_active_trades": 1,
+        "exit_condition": "NONE",
+        "signal_exit_b7": "NO",
+        "auto_exit_320_b8": "NO",
+        "sheet_synced_at": sheet_sync_str,
+        "guard_blocked": False,
+        "guard_reason": "",
+        "show_manual_panel": False,
+        "evaluated_order": None,
+        "auto_execution_notice": None,
+        "auto_execution_ok": False,
+        "exit_execution_notice": None,
+        "exit_execution_ok": False,
+        "show_static_ip_bar": False,
+        "tsl_updates": [],
+        "is_cancelled": False,
+        "status_message": ""
+    }
+
+    if not error and cfg and not cfg_err:
+        order_engine["signal_exit_b7"] = cfg.get("signal_exit_b7", "NO")
+        order_engine["auto_exit_320_b8"] = cfg.get("auto_exit_320_b8", "NO")
+
+        if cfg.get("auto_exit_320_b8") == "YES" and is_after_320_pm:
+            with ORDER_EXECUTION_LOCK:
+                state = load_auto_order_state()
+                exit_cooldowns = state.setdefault("exit_cooldowns", {})
+                last_320_ts = float(exit_cooldowns.get("320_PM_EXIT", 0.0) or 0.0)
+                if (now_ts - last_320_ts) >= 12.0:
+                    ex_ok, ex_msg = execute_targeted_or_full_exit(
+                        positions, orders, gtt_orders,
+                        target_underlying=None,
+                        target_opt_type=None,
+                        only_options=False
+                    )
+                    if ex_ok is not None:
+                        exit_cooldowns["320_PM_EXIT"] = now_ts
+                        save_auto_order_state(state)
+                        order_engine["exit_execution_notice"] = f"⏰ 3:20 PM AUTO EXIT (B8=YES): {ex_msg}"
+                        order_engine["exit_execution_ok"] = bool(ex_ok)
+                        positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, _ = fetch_upstox_positions()
+
+        exit_cond = cfg.get("exit_condition", "")
+        if cfg.get("signal_exit_b7") == "YES" and exit_cond in ("BE", "SE"):
+            target_opt = "CE" if exit_cond == "BE" else "PE"
+            cooldown_key = f"B7_{exit_cond}"
+            with ORDER_EXECUTION_LOCK:
+                state = load_auto_order_state()
+                exit_cooldowns = state.setdefault("exit_cooldowns", {})
+                last_exit_ts = float(exit_cooldowns.get(cooldown_key, 0.0) or 0.0)
+                if (now_ts - last_exit_ts) >= 8.0:
+                    ex_ok, ex_msg = execute_targeted_or_full_exit(
+                        positions, orders, gtt_orders,
+                        target_underlying=None,
+                        target_opt_type=target_opt,
+                        only_options=True
+                    )
+                    if ex_ok is not None:
+                        exit_cooldowns[cooldown_key] = now_ts
+                        save_auto_order_state(state)
+                        order_engine["exit_execution_notice"] = f"🛑 SIGNAL EXIT (B7=YES | B29={exit_cond} → ALL {target_opt}): {ex_msg}"
+                        order_engine["exit_execution_ok"] = bool(ex_ok)
+                        positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, _ = fetch_upstox_positions()
+
+    if not error:
+        order_engine["tsl_updates"] = process_dynamic_sl_and_target(
+            positions, gtt_orders,
+            cfg.get("sl_percent") if cfg else None,
+            cfg.get("target_percent") if cfg else None
+        )
+
+    if cfg_err or not cfg:
+        order_engine["status_message"] = f"DASHBOARD Sheet Alert: {cfg_err}"
+    else:
+        order_engine["manual_order"] = cfg["manual_order"]
+        order_engine["want_to_trade"] = cfg["want_to_trade"]
+        order_engine["max_active_trades"] = cfg["max_active_trades"]
+        order_engine["exit_condition"] = cfg.get("exit_condition") or "NONE"
+
+        if cfg["want_to_trade"] != "YES":
+            guard = evaluate_trade_guards(
+                cfg["symbol"], cfg["option_type"], cfg["max_active_trades"],
+                positions, orders, gtt_orders,
+                load_auto_order_state().get("recent_submissions", {})
+            )
+            order_engine["active_trade_count"] = guard["active_count"]
+            if cfg.get("signal_exit_b7") == "YES" and cfg.get("exit_condition") in ("BE", "SE"):
+                target_opt = "CE" if cfg["exit_condition"] == "BE" else "PE"
+                order_engine["status_message"] = f"B7=YES & B29={cfg['exit_condition']}: Monitoring & exiting ALL open {target_opt} positions/orders."
+            elif cfg.get("auto_exit_320_b8") == "YES" and is_after_320_pm:
+                order_engine["status_message"] = "B8=YES & Time >= 3:20 PM IST: All open positions/orders squared off."
+            else:
+                order_engine["status_message"] = "Want to Trade (B17) is NO — Order placement paused."
+        else:
+            evaluated, eval_err = prepare_evaluated_order(cfg)
+            if eval_err or not evaluated:
+                order_engine["status_message"] = f"Order Check: {eval_err}"
+            else:
+                order_engine["evaluated_order"] = evaluated
+                with ORDER_EXECUTION_LOCK:
+                    state = load_auto_order_state()
+                    guard = evaluate_trade_guards(
+                        evaluated["symbol"],
+                        evaluated["option_type"],
+                        cfg["max_active_trades"],
+                        positions,
+                        orders,
+                        gtt_orders,
+                        state.get("recent_submissions", {})
+                    )
+                    order_engine["active_trade_count"] = guard["active_count"]
+                    order_engine["guard_blocked"] = not guard["allowed"]
+                    order_engine["guard_reason"] = guard["reason"]
+
+                    if not guard["allowed"]:
+                        order_engine["status_message"] = guard["reason"]
+                        if cfg["manual_order"] != "Auto" and evaluated["signature"] not in state.get("cancelled_signatures", []):
+                            order_engine["show_manual_panel"] = True
+                    elif cfg["manual_order"] == "Auto":
+                        ok, msg, is_ip_err = submit_upstox_evaluated_order(evaluated)
+                        if is_ip_err:
+                            order_engine["show_static_ip_bar"] = True
+                        if ok:
+                            state.setdefault("recent_submissions", {})[evaluated["duplicate_key"]] = get_ist_now().timestamp()
+                            save_auto_order_state(state)
+                            order_engine["auto_execution_notice"] = f"⚡ AUTO-ORDER EXECUTED ({evaluated['symbol']} {evaluated['selected_strike']} {evaluated['option_type']}): {msg}"
+                            order_engine["auto_execution_ok"] = True
+                            order_engine["status_message"] = f"Auto-order placed ({guard['active_count'] + 1}/{cfg['max_active_trades']} active)."
+                            positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, _ = fetch_upstox_positions()
+                            process_dynamic_sl_and_target(positions, gtt_orders, cfg.get("sl_percent"), cfg.get("target_percent"))
+                        else:
+                            order_engine["auto_execution_notice"] = f"❌ AUTO-ORDER FAILED: {msg}"
+                            order_engine["auto_execution_ok"] = False
+                            order_engine["status_message"] = f"Auto-order failed: {msg}"
+                    else:
+                        if evaluated["signature"] in state.get("cancelled_signatures", []):
+                            order_engine["is_cancelled"] = True
+                            order_engine["status_message"] = "Manual order preview cancelled by user."
+                        else:
+                            order_engine["show_manual_panel"] = True
+                            order_engine["status_message"] = f"Manual Mode: Eligible ({guard['active_count']}/{cfg['max_active_trades']} active). Ready for approval."
+
+    LAST_DIAGNOSTICS["total_cycle_ms"] = int((time.time() - cycle_t0) * 1000)
+    LAST_DIAGNOSTICS["updated_at"] = sheet_sync_str
+
     return jsonify({
         "positions": positions,
         "orders": orders,
@@ -3818,163 +3996,33 @@ def api_positions():
         "total_pnl": total_pnl,
         "realised_pnl": realised_pnl,
         "unrealised_pnl": unrealised_pnl,
-        "error": err,
         "order_engine": order_engine,
-        "diagnostics": dict(LAST_DIAGNOSTICS)
+        "diagnostics": LAST_DIAGNOSTICS,
+        "error": error
     })
 
-@app.route("/api/execute_order", methods=["POST"])
-def api_execute_order():
-    body = request.get_json(silent=True) or {}
-    action = str(body.get("action", "")).strip().lower()
-    signature = str(body.get("signature", "")).strip()
-
-    with ORDER_EXECUTION_LOCK:
-        state = load_auto_order_state()
-        if action == "reset":
-            state["cancelled_signatures"] = []
-            save_auto_order_state(state)
-            return jsonify({"success": True, "message": "Cancelled order preview restored."})
-        if action == "cancel":
-            if signature:
-                c_list = state.setdefault("cancelled_signatures", [])
-                if signature not in c_list:
-                    c_list.append(signature)
-                save_auto_order_state(state)
-            return jsonify({"success": True, "message": "Manual order cancelled."})
-        if action == "place":
-            cfg, cfg_err = fetch_dashboard_order_config(force_fresh=True)
-            if cfg_err or not cfg:
-                return jsonify({"success": False, "message": cfg_err or "Cannot read DASHBOARD sheet."})
-            evaluated_order, eval_err = prepare_evaluated_order(cfg)
-            if eval_err or not evaluated_order:
-                return jsonify({"success": False, "message": eval_err or "Order evaluation failed."})
-            positions, orders, gtt_orders, _, _, _, _ = fetch_upstox_positions()
-            recent_subs = state.setdefault("recent_submissions", {})
-            guard = evaluate_trade_guards(
-                evaluated_order["symbol"],
-                evaluated_order["option_type"],
-                cfg["max_active_trades"],
-                positions,
-                orders,
-                gtt_orders,
-                recent_subs,
-                state=state
-            )
-            if not guard["allowed"]:
-                return jsonify({"success": False, "message": guard["reason"]})
-
-            now_ts = get_ist_now().timestamp()
-            dup_key, sig = evaluated_order["duplicate_key"], evaluated_order["signature"]
-            recent_subs[dup_key] = now_ts
-            recent_subs[sig] = now_ts
-            save_auto_order_state(state)
-
-            ok, msg, is_ip_err = submit_upstox_evaluated_order(evaluated_order)
-            if not ok:
-                state = load_auto_order_state()
-                state.get("recent_submissions", {}).pop(dup_key, None)
-                state.get("recent_submissions", {}).pop(sig, None)
-                save_auto_order_state(state)
-            return jsonify({"success": ok, "message": msg, "show_static_ip_bar": is_ip_err})
-    return jsonify({"success": False, "message": "Invalid action."}), 400
-
-@app.route("/api/data")
-def api_data():
-    symbol = request.args.get("symbol", "NIFTY").upper()
-    if symbol not in INSTRUMENT_KEYS:
-        symbol = "NIFTY"
-    selected_expiry = request.args.get("expiry", "ALL")
-    rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
-    return jsonify({
-        "symbol": symbol, "rows": rows, "spot_price": spot_price, "atm_strike": atm_strike,
-        "expiry": expiry, "expiries": expiries, "updated": updated, "pcr": pcr,
-        "total_ce_oi": total_ce_oi, "total_pe_oi": total_pe_oi, "error": error
-    })
-
-@app.route("/api/history")
-def api_history():
-    symbol = request.args.get("symbol", "NIFTY").upper()
-    timeframe = request.args.get("timeframe", "5minute")
-    day_range = request.args.get("day_range", "1day")
-    sheet_name = request.args.get("sheet", None)
-
-    snapshots, err = fetch_history_from_gsheet(symbol, sheet_name=sheet_name)
-    if err or not snapshots:
-        return jsonify({"history": [], "error": err or "No data found in Google Sheet."})
-
-    day_range_map = {"1day": 1, "3day": 3, "1week": 7, "2week": 14, "1month": 30, "3month": 90}
-    days_count = day_range_map.get(day_range, 1)
-
-    unique_dates = list(dict.fromkeys(s.get("date_str", "") for s in snapshots if s.get("date_str")))
-    if unique_dates:
-        allowed_dates = set(unique_dates[-days_count:])
-        snapshots = [s for s in snapshots if s.get("date_str") in allowed_dates]
-
-    tf_seconds = {"5minute": 300, "15minute": 900, "30minute": 1800, "60minute": 3600, "day": 86400}.get(timeframe, 300)
-
-    if tf_seconds > 300 and snapshots:
-        bucketed, current_bucket, last_snap = [], None, None
-        for s in snapshots:
-            ts = s.get("timestamp", 0)
-            b_key = (ts // tf_seconds) if ts > 0 else s.get("formatted_time", "")
-            if current_bucket is None:
-                current_bucket = b_key
-            if b_key != current_bucket:
-                if last_snap:
-                    bucketed.append(last_snap)
-                current_bucket = b_key
-            last_snap = s
-        if last_snap:
-            bucketed.append(last_snap)
-        snapshots = bucketed
-
-    return jsonify({"history": snapshots[-1500:], "error": None})
-
-@app.route("/download_history")
+@app.route("/download_history", methods=["GET"])
 def download_history():
     symbol = request.args.get("symbol", "NIFTY").upper()
-    snapshots, err = fetch_history_from_gsheet(symbol)
-    if err or not snapshots:
-        return f"Error fetching Google Sheet history: {err}", 500
-    si = io.StringIO()
-    writer = csv.writer(si)
-    writer.writerow([
-        "Time", "Symbol", "Price LTP", "ATM Strike", "PCR", "CE OI", "PE OI",
-        "CE Chng OI", "PE Chng OI", "CE Vol", "PE Vol", "CE IV", "PE IV",
-        "CE Delta", "PE Delta", "CE Theta", "PE Theta", "CE Vega", "PE Vega",
-        "CE Gamma", "PE Gamma", "CE Bid", "PE Bid", "CE Ask", "PE Ask",
-        "CE LTP", "PE LTP", "Min ROC (Buy)", "Max ROC (Sell)", "Cross ROC Sig",
-        "Main Volatility", "New Signal", "5 Min Signal", "15 Min Signal", "30 Min Signal", "1 HR Signal"
-    ])
+    snapshots, _ = fetch_history_from_gsheet(symbol)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Timestamp", "Date", "Time", "Symbol", "Spot Price", "ATM Strike", "PCR", "CE OI", "PE OI", "CE Chg OI", "PE Chg OI", "CE Vol", "PE Vol", "CE IV", "PE IV", "CE Delta", "PE Delta", "CE Theta", "PE Theta", "CE Vega", "PE Vega", "CE Gamma", "PE Gamma", "CE Bid", "PE Bid", "CE Ask", "PE Ask", "CE LTP", "PE LTP", "Min ROC (Buy)", "Max ROC (Sell)", "Cross ROC Sig", "Main Volatility", "New Signal", "5 Min Signal (AF)", "15 Min Signal (AG)", "30 Min Signal (AH)", "1 HR Signal (AI)"])
     for s in snapshots:
-        writer.writerow([
-            s.get("datetime"), s.get("symbol"), s.get("spot_price"), s.get("atm_strike"), s.get("pcr"),
-            s.get("ce_oi"), s.get("pe_oi"), s.get("ce_oi_chg"), s.get("pe_oi_chg"), s.get("ce_vol"),
-            s.get("pe_vol"), s.get("ce_iv"), s.get("pe_iv"), s.get("ce_delta"), s.get("pe_delta"),
-            s.get("ce_theta"), s.get("pe_theta"), s.get("ce_vega"), s.get("pe_vega"), s.get("ce_gamma"),
-            s.get("pe_gamma"), s.get("ce_bid"), s.get("pe_bid"), s.get("ce_ask"), s.get("pe_ask"),
-            s.get("ce_ltp"), s.get("pe_ltp"), s.get("min_roc"), s.get("max_roc"), s.get("cross_roc"),
-            s.get("main_volatility"), s.get("new_signal"), s.get("signal_5m"), s.get("signal_15m"),
-            s.get("signal_30m"), s.get("signal_1h")
-        ])
-    return Response(si.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename={symbol}_google_sheet_history.csv"})
+        writer.writerow([s.get("timestamp", ""), s.get("date_str", ""), s.get("formatted_time", ""), s.get("symbol", ""), s.get("spot_price", 0), s.get("atm_strike", 0), s.get("pcr", 0), s.get("ce_oi", 0), s.get("pe_oi", 0), s.get("ce_oi_chg", 0), s.get("pe_oi_chg", 0), s.get("ce_vol", 0), s.get("pe_vol", 0), s.get("ce_iv", 0), s.get("pe_iv", 0), s.get("ce_delta", 0), s.get("pe_delta", 0), s.get("ce_theta", 0), s.get("pe_theta", 0), s.get("ce_vega", 0), s.get("pe_vega", 0), s.get("ce_gamma", 0), s.get("pe_gamma", 0), s.get("ce_bid", 0), s.get("pe_bid", 0), s.get("ce_ask", 0), s.get("pe_ask", 0), s.get("ce_ltp", 0), s.get("pe_ltp", 0), s.get("min_roc", 0), s.get("max_roc", 0), s.get("cross_roc", 0), s.get("main_volatility", 0), s.get("new_signal", ""), s.get("signal_5m", ""), s.get("signal_15m", ""), s.get("signal_30m", ""), s.get("signal_1h", "")])
+    return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment;filename={symbol}_sheet_history.csv"})
 
-@app.route("/download")
-def download():
+@app.route("/download", methods=["GET"])
+def download_csv():
     symbol = request.args.get("symbol", "NIFTY").upper()
     selected_expiry = request.args.get("expiry", "ALL")
-    rows, spot_price, atm_strike, expiry, _, updated, pcr, _, _, error = process_option_data(symbol, selected_expiry)
-    if error:
-        return f"Error generating CSV: {error}", 500
-    si = io.StringIO()
-    writer = csv.writer(si)
-    writer.writerow(["Symbol", symbol, "Expiry", expiry, "Spot Price", spot_price, "ATM Strike", atm_strike, "PCR", pcr, "Updated IST", updated])
-    writer.writerow([])
-    writer.writerow(["CE_OI", "CE_Chg_OI", "CE_Vol", "CE_IV", "CE_Delta", "CE_Theta", "CE_Vega", "CE_Gamma", "CE_Bid", "CE_Ask", "CE_LTP", "Strike_Price", "PE_LTP", "PE_Bid", "PE_Ask", "PE_Delta", "PE_Theta", "PE_Vega", "PE_Gamma", "PE_IV", "PE_Vol", "PE_Chg_OI", "PE_OI"])
+    rows, _, _, expiry, _, _, _, _, _, _ = process_option_data(symbol, selected_expiry)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["CE_OI", "CE_Chg_OI", "CE_Vol", "CE_IV", "CE_Delta", "CE_Theta", "CE_Vega", "CE_Gamma", "CE_Bid", "CE_Ask", "CE_LTP", "Strike", "PE_LTP", "PE_Bid", "PE_Ask", "PE_Delta", "PE_Theta", "PE_Vega", "PE_Gamma", "PE_IV", "PE_Vol", "PE_Chg_OI", "PE_OI"])
     for r in rows:
         writer.writerow([r["ce_oi"], r["ce_oi_chg"], r["ce_vol"], r["ce_iv"], r["ce_delta"], r["ce_theta"], r["ce_vega"], r["ce_gamma"], r["ce_bid"], r["ce_ask"], r["ce_ltp"], r["strike"], r["pe_ltp"], r["pe_bid"], r["pe_ask"], r["pe_delta"], r["pe_theta"], r["pe_vega"], r["pe_gamma"], r["pe_iv"], r["pe_vol"], r["pe_oi_chg"], r["pe_oi"]])
-    return Response(si.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename={symbol}_option_chain.csv"})
+    return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment;filename={symbol}_{expiry}.csv"})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
