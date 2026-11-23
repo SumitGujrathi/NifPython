@@ -33,7 +33,7 @@ ORDER_EXECUTION_LOCK = threading.Lock()
 CACHE_LOCK = threading.Lock()
 
 IST = timezone(timedelta(hours=5, minutes=30))
-DUPLICATE_COOLDOWN_SECONDS = 450  # 1-hour gap required before re-entering same Symbol + CE/PE -5 minutes: 300
+DUPLICATE_COOLDOWN_SECONDS = 420  # Hard 7-minute (420s) cooldown per Symbol + CE/PE from completed exit time
 
 INSTRUMENT_KEYS = {
     "NIFTY": "NSE_INDEX|Nifty 50",
@@ -45,6 +45,10 @@ OPEN_ORDER_STATUSES = {
     "validation pending", "modify pending", "modify validation pending",
     "after market order req received", "put order req received",
     "scheduled", "active"
+}
+
+COMPLETED_ORDER_STATUSES = {
+    "complete", "completed", "filled", "executed", "traded"
 }
 
 FAILED_ORDER_STATUSES = {
@@ -263,10 +267,22 @@ def load_auto_order_state():
             with open(AUTO_ORDER_STATE_PATH, "r") as f:
                 data = json.load(f)
                 if data.get("date") == today:
+                    data.setdefault("recent_submissions", {})
+                    data.setdefault("cancelled_signatures", [])
+                    data.setdefault("exit_cooldowns", {})
+                    data.setdefault("locked_exit_cooldowns", {})
+                    data.setdefault("processed_exit_order_ids", [])
                     return data
     except Exception:
         pass
-    return {"date": today, "recent_submissions": {}, "cancelled_signatures": [], "exit_cooldowns": {}}
+    return {
+        "date": today,
+        "recent_submissions": {},
+        "cancelled_signatures": [],
+        "exit_cooldowns": {},
+        "locked_exit_cooldowns": {},
+        "processed_exit_order_ids": []
+    }
 
 def save_auto_order_state(state):
     try:
@@ -704,12 +720,30 @@ def execute_targeted_or_full_exit(positions, orders, gtt_orders, target_underlyi
                 all_ok = False
 
     if matching_positions:
+        now_exit_ts = get_ist_now().timestamp()
         with ThreadPoolExecutor(max_workers=4) as ex:
-            exit_futs = [ex.submit(exit_position_at_market, p, headers, proxies) for p in matching_positions]
+            exit_futs = {ex.submit(exit_position_at_market, p, headers, proxies): p for p in matching_positions}
             for fut in as_completed(exit_futs):
+                pos_item = exit_futs[fut]
                 ok, msg = fut.result()
                 logs.append(msg)
-                if not ok:
+                if ok:
+                    u, opt = extract_symbol_and_opt_type(pos_item.get("trading_symbol", ""))
+                    if u and opt:
+                        st = load_auto_order_state()
+                        locks = st.setdefault("locked_exit_cooldowns", {})
+                        lock_key = f"{u}|{opt}"
+                        existing_lock = locks.get(lock_key)
+                        if not existing_lock or now_exit_ts > float(existing_lock.get("exit_ts", 0)):
+                            locks[lock_key] = {
+                                "exit_order_id": f"AUTO_EXIT_{int(now_exit_ts)}",
+                                "exit_ts": now_exit_ts,
+                                "unlock_ts": now_exit_ts + DUPLICATE_COOLDOWN_SECONDS,
+                                "trading_symbol": str(pos_item.get("trading_symbol", "")).strip().upper(),
+                                "provisional": True
+                            }
+                            save_auto_order_state(st)
+                else:
                     all_ok = False
 
     return all_ok, " | ".join(logs)
@@ -1119,14 +1153,96 @@ def extract_symbol_and_opt_type(trading_symbol):
     ts = str(trading_symbol or "").strip().upper()
     if not ts:
         return None, None
-    underlying = "BANKNIFTY" if "BANKNIFTY" in ts else ("NIFTY" if (ts.startswith("NIFTY") or re.search(r'\bNIFTY\b', ts)) else None)
+    if "BANKNIFTY" in ts or re.search(r'\bBANK\s*NIFTY\b', ts):
+        underlying = "BANKNIFTY"
+    elif ts.startswith("NIFTY") or re.search(r'\bNIFTY\b', ts):
+        underlying = "NIFTY"
+    else:
+        underlying = None
     opt_match = re.search(r'(?:^|\s|\d)(CE|PE)(?:\s|$|\d)', ts)
     return underlying, (opt_match.group(1) if opt_match else None)
 
-def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, positions, orders, gtt_orders=None, recent_submissions=None):
+def sync_completed_exit_cooldowns(orders, state):
+    """
+    Scans today's COMPLETED orders chronologically per contract to detect true position EXITS.
+    - Strictly ignores CANCELLED, REJECTED, FAILED, OPEN, and PENDING orders.
+    - Strictly ignores ENTRY orders (only orders that close/reduce a position trigger cooldown).
+    - Locks a fixed 7-minute (420s) expiry per isolated key ('NIFTY|PE', 'NIFTY|CE', 'BANKNIFTY|PE', etc.)
+      and records the exit order_id so the polling loop NEVER resets or extends the clock.
+    """
+    locked_cooldowns = state.setdefault("locked_exit_cooldowns", {})
+    processed_ids = set(state.get("processed_exit_order_ids", []))
+    state_dirty = False
+
+    completed_orders = []
+    for idx, o in enumerate(orders):
+        st = str(o.get("status", "")).strip().lower()
+        if st not in COMPLETED_ORDER_STATUSES:
+            continue
+        ts = str(o.get("trading_symbol", "")).strip().upper()
+        txn = str(o.get("transaction_type", "")).strip().upper()
+        if not ts or txn not in ("BUY", "SELL"):
+            continue
+        exec_ts = parse_upstox_order_timestamp(o.get("exchange_timestamp") or o.get("order_timestamp", ""))
+        completed_orders.append((exec_ts, idx, o))
+
+    completed_orders.sort(key=lambda item: (item[0], item[1]))
+
+    net_qty_by_symbol = {}
+    for exec_ts, idx, o in completed_orders:
+        ts = str(o.get("trading_symbol", "")).strip().upper()
+        txn = str(o.get("transaction_type", "")).strip().upper()
+        qty = int(o.get("quantity", 0) or 0)
+        oid = str(o.get("order_id", "")).strip() or f"{ts}|{txn}|{exec_ts}|{idx}"
+
+        prev_qty = net_qty_by_symbol.get(ts, 0)
+        if txn == "BUY":
+            is_exit = prev_qty < 0
+            new_qty = prev_qty + qty
+        else:  # SELL
+            # Closing a long position (prev_qty > 0) or exiting an overnight long position (prev_qty == 0)
+            is_exit = prev_qty >= 0
+            new_qty = prev_qty - qty
+        net_qty_by_symbol[ts] = new_qty
+
+        if not is_exit or oid in processed_ids:
+            continue
+
+        u, opt = extract_symbol_and_opt_type(ts)
+        if u and opt and exec_ts > 0:
+            lock_key = f"{u}|{opt}"
+            existing_lock = locked_cooldowns.get(lock_key)
+            if (
+                existing_lock is None
+                or existing_lock.get("provisional")
+                or exec_ts > float(existing_lock.get("exit_ts", 0))
+            ):
+                locked_cooldowns[lock_key] = {
+                    "exit_order_id": oid,
+                    "exit_ts": exec_ts,
+                    "unlock_ts": exec_ts + DUPLICATE_COOLDOWN_SECONDS,
+                    "trading_symbol": ts,
+                    "provisional": False
+                }
+        processed_ids.add(oid)
+        state_dirty = True
+
+    if state_dirty:
+        state["processed_exit_order_ids"] = list(processed_ids)
+    return state_dirty
+
+def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, positions, orders, gtt_orders=None, recent_submissions=None, state=None):
     gtt_orders = gtt_orders or []
-    recent_submissions = recent_submissions or {}
     now_ts = get_ist_now().timestamp()
+
+    own_state = False
+    if state is None:
+        state = load_auto_order_state()
+        own_state = True
+    if recent_submissions is None:
+        recent_submissions = state.get("recent_submissions", {})
+
+    state_dirty = sync_completed_exit_cooldowns(orders, state)
 
     t_sym = str(target_symbol or "").strip().upper()
     t_opt = str(target_opt_type or "").strip().upper()
@@ -1159,8 +1275,11 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
 
     active_count = len(active_items)
 
+    # 1. Prevent duplicate active position / open order on the exact same Index + Option Side
     dups = [i for i in active_items if i["underlying"] == t_sym and i["option_type"] == t_opt]
     if dups:
+        if own_state and state_dirty:
+            save_auto_order_state(state)
         m = dups[0]
         return {
             "allowed": False,
@@ -1169,47 +1288,52 @@ def evaluate_trade_guards(target_symbol, target_opt_type, max_active_trades, pos
             "reason": f"Duplicate Blocked: {t_sym} {t_opt} already active/open ({m['trading_symbol']} - {m['source']})."
         }
 
-    latest_order_ts = 0.0
-    latest_order_label = ""
-    has_executed_history = False
-
-    for o in orders:
-        st = str(o.get("status", "")).strip().lower()
-        ts = str(o.get("trading_symbol", "")).strip().upper()
-        if not ts or st in FAILED_ORDER_STATUSES:
-            continue
-        u, opt = extract_symbol_and_opt_type(ts)
-        if u == t_sym and opt == t_opt:
-            has_executed_history = True
-            ots = parse_upstox_order_timestamp(o.get("order_timestamp", ""))
-            if ots > latest_order_ts:
-                latest_order_ts = ots
-                latest_order_label = f"{ts} ({o.get('transaction_type', '')} - {o.get('status', '')})"
-
-    for k, sub_ts in recent_submissions.items():
+    # 2. Short 15-second in-flight submission guard (prevents double-click / double-poll race before orderbook updates)
+    for k, sub_ts in list(recent_submissions.items()):
         parts = str(k).split("|")
         if len(parts) >= 2 and parts[0].upper() == t_sym and parts[1].upper() == t_opt:
             sub_f = float(sub_ts or 0)
-            effective_window = DUPLICATE_COOLDOWN_SECONDS if has_executed_history else 30
-            if (now_ts - sub_f) < effective_window and sub_f > latest_order_ts:
-                latest_order_ts = sub_f
-                latest_order_label = f"{t_sym} {t_opt} (Recent Order)"
+            if 0 <= (now_ts - sub_f) < 15:
+                if own_state and state_dirty:
+                    save_auto_order_state(state)
+                return {
+                    "allowed": False,
+                    "active_count": active_count,
+                    "max_active_trades": max_active_trades,
+                    "reason": f"Order In-Flight: {t_sym} {t_opt} submitted {int(now_ts - sub_f)}s ago. Waiting for broker confirmation."
+                }
 
-    if latest_order_ts > 0:
-        elapsed = now_ts - latest_order_ts
-        if 0 <= elapsed < DUPLICATE_COOLDOWN_SECONDS:
-            remaining = DUPLICATE_COOLDOWN_SECONDS - elapsed
-            last_ist_str = datetime.fromtimestamp(latest_order_ts, tz=IST).strftime("%H:%M:%S IST")
+    # 3. Hard 7-minute fixed cooldown ONLY for the exited Index + Option Side (ignores cancelled orders, never extends)
+    lock_key = f"{t_sym}|{t_opt}"
+    locked_cooldowns = state.get("locked_exit_cooldowns", {})
+    lock_info = locked_cooldowns.get(lock_key)
+    if lock_info:
+        exit_ts = float(lock_info.get("exit_ts", 0) or 0)
+        unlock_ts = float(lock_info.get("unlock_ts", 0) or (exit_ts + DUPLICATE_COOLDOWN_SECONDS))
+        if now_ts < unlock_ts:
+            if own_state and state_dirty:
+                save_auto_order_state(state)
+            remaining = unlock_ts - now_ts
+            exit_ist_str = datetime.fromtimestamp(exit_ts, tz=IST).strftime("%H:%M:%S IST")
+            unlock_ist_str = datetime.fromtimestamp(unlock_ts, tz=IST).strftime("%H:%M:%S IST")
+            exited_sym = lock_info.get("trading_symbol") or f"{t_sym} {t_opt}"
             return {
                 "allowed": False,
                 "active_count": active_count,
                 "max_active_trades": max_active_trades,
                 "reason": (
-                    f"1-Hr Cooldown Active: {t_sym} {t_opt} last traded at {last_ist_str} "
-                    f"({latest_order_label}). Wait {format_duration_hm(remaining)} for 1h gap."
+                    f"7-Min Cooldown Active: {t_sym} {t_opt} exited at {exit_ist_str} "
+                    f"({exited_sym}, unlocks at {unlock_ist_str}). Wait {format_duration_hm(remaining)} for 7m gap."
                 )
             }
+        else:
+            del locked_cooldowns[lock_key]
+            state_dirty = True
 
+    if own_state and state_dirty:
+        save_auto_order_state(state)
+
+    # 4. Enforce Max Active Trades limit (B28)
     if max_active_trades is not None and active_count >= max_active_trades:
         return {
             "allowed": False,
@@ -1601,7 +1725,8 @@ def fetch_upstox_positions():
                 "average_price": o.get("average_price", 0.0),
                 "status": st_raw,
                 "is_open": st_raw.lower() in OPEN_ORDER_STATUSES,
-                "order_timestamp": o.get("order_timestamp", "")
+                "order_timestamp": o.get("order_timestamp", ""),
+                "exchange_timestamp": o.get("exchange_timestamp", "")
             })
 
         gtt_orders = []
@@ -3423,8 +3548,10 @@ def api_manual_order_action():
                 positions,
                 orders,
                 gtt_orders,
-                recent_submissions=state.get("recent_submissions", {})
+                recent_submissions=state.get("recent_submissions", {}),
+                state=state
             )
+            save_auto_order_state(state)
             if not guard["allowed"]:
                 return jsonify({"success": False, "message": guard["reason"]})
 
@@ -3502,7 +3629,8 @@ def api_positions():
                             target_underlying=None, target_opt_type=None, only_options=False
                         )
                         if ex_msg:
-                            cooldowns["320_PM_EXIT"] = time.time()
+                            state = load_auto_order_state()
+                            state.setdefault("exit_cooldowns", {})["320_PM_EXIT"] = time.time()
                             save_auto_order_state(state)
                             payload["exit_execution_notice"] = f"⏰ 3:20 PM AUTO EXIT (B8=YES): {ex_msg}"
                             payload["exit_execution_ok"] = bool(ex_ok)
@@ -3528,7 +3656,8 @@ def api_positions():
                                 only_options=True
                             )
                             if ex_msg:
-                                cooldowns[cd_key] = time.time()
+                                state = load_auto_order_state()
+                                state.setdefault("exit_cooldowns", {})[cd_key] = time.time()
                                 save_auto_order_state(state)
                                 payload["exit_execution_notice"] = f"🚪 EXIT CONDITION ({exit_cond} → {cfg['symbol']} {target_opt} @ MARKET, B7=YES): {ex_msg}"
                                 payload["exit_execution_ok"] = bool(ex_ok)
@@ -3554,8 +3683,10 @@ def api_positions():
             positions,
             orders,
             gtt_orders,
-            recent_submissions=state.get("recent_submissions", {})
+            recent_submissions=state.get("recent_submissions", {}),
+            state=state
         )
+        save_auto_order_state(state)
         payload["active_trade_count"] = guard["active_count"]
         payload["guard_blocked"] = not guard["allowed"]
         payload["guard_reason"] = guard["reason"] if not guard["allowed"] else None
@@ -3568,37 +3699,44 @@ def api_positions():
             else:
                 evaluated, eval_err = prepare_evaluated_order(cfg)
                 if eval_err or not evaluated:
-                    payload["status_message"] = eval_err or "Order evaluation skipped."
+                    payload["status_message"] = eval_err or "Order evaluation pending."
                 else:
                     payload["evaluated_order"] = evaluated
                     if cfg["manual_order"].lower() == "auto":
                         with ORDER_EXECUTION_LOCK:
                             state = load_auto_order_state()
-                            recheck = evaluate_trade_guards(
-                                cfg["symbol"], cfg["option_type"], cfg["max_active_trades"],
-                                positions, orders, gtt_orders, recent_submissions=state.get("recent_submissions", {})
+                            guard_recheck = evaluate_trade_guards(
+                                cfg["symbol"],
+                                cfg["option_type"],
+                                cfg["max_active_trades"],
+                                positions,
+                                orders,
+                                gtt_orders,
+                                recent_submissions=state.get("recent_submissions", {}),
+                                state=state
                             )
-                            if not recheck["allowed"]:
-                                payload["status_message"] = f"Skipped: {recheck['reason']}"
+                            save_auto_order_state(state)
+                            if not guard_recheck["allowed"]:
+                                payload["status_message"] = f"Skipped: {guard_recheck['reason']}"
                             else:
-                                ok, exec_msg, is_ip_err = submit_upstox_evaluated_order(evaluated)
-                                state.setdefault("recent_submissions", {})[evaluated["duplicate_key"]] = now_ist.timestamp()
-                                save_auto_order_state(state)
-                                payload["show_static_ip_bar"] = is_ip_err
-                                payload["status_message"] = f"Auto Mode: {exec_msg}"
-                                payload["auto_execution_notice"] = f"AUTO ORDER: {exec_msg}"
+                                ok, msg, is_ip_err = submit_upstox_evaluated_order(evaluated)
+                                if ok:
+                                    state.setdefault("recent_submissions", {})[evaluated["duplicate_key"]] = now_ist.timestamp()
+                                    save_auto_order_state(state)
+                                payload["auto_execution_notice"] = f"🤖 AUTO ORDER EXECUTED: {msg}" if ok else f"⚠️ AUTO ORDER FAILED: {msg}"
                                 payload["auto_execution_ok"] = ok
+                                payload["show_static_ip_bar"] = is_ip_err
+                                payload["status_message"] = msg
                     else:
-                        is_cancelled = evaluated["signature"] in state.get("cancelled_signatures", [])
-                        payload["is_cancelled"] = is_cancelled
-                        if is_cancelled:
-                            payload["show_manual_panel"] = False
-                            payload["status_message"] = "Manual Order Cancelled by User (Click Reload to restore)."
+                        if evaluated["signature"] in state.get("cancelled_signatures", []):
+                            payload["is_cancelled"] = True
+                            payload["status_message"] = "Manual Order preview cancelled by user."
                         else:
                             payload["show_manual_panel"] = True
-                            payload["status_message"] = f"Manual Order Blocked: {guard['reason']}" if not guard["allowed"] else f"Awaiting Manual Approval for {evaluated['symbol']} {evaluated['selected_strike']} {evaluated['option_type']} @ ₹{evaluated['entry_price']}"
+                            payload["status_message"] = "Manual Mode: Review & click 'Place Order' to execute."
 
-    LAST_DIAGNOSTICS["total_cycle_ms"] = int((time.time() - cycle_t0) * 1000)
+    total_ms = int((time.time() - cycle_t0) * 1000)
+    LAST_DIAGNOSTICS["total_cycle_ms"] = total_ms
     LAST_DIAGNOSTICS["updated_at"] = now_ist.strftime("%H:%M:%S IST")
 
     resp = jsonify({
@@ -3608,168 +3746,211 @@ def api_positions():
         "total_pnl": total_pnl,
         "realised_pnl": realised_pnl,
         "unrealised_pnl": unrealised_pnl,
+        "error": error,
         "order_engine": payload,
-        "diagnostics": dict(LAST_DIAGNOSTICS),
-        "error": error
+        "diagnostics": LAST_DIAGNOSTICS
     })
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return resp
 
-@app.route("/Live_Trade_Position", methods=["GET"])
-def live_trade_position():
+@app.route("/positions")
+def positions_dashboard():
     return render_template_string(POSITIONS_HTML_TEMPLATE)
+
+@app.route("/")
+def index():
+    symbol = request.args.get("symbol", "NIFTY").upper()
+    if symbol not in INSTRUMENT_KEYS:
+        symbol = "NIFTY"
+    selected_expiry = request.args.get("expiry", "ALL")
+    rows, spot_price, atm_strike, expiry, expiries, updated, pcr, t_ce, t_pe, error = process_option_data(symbol, selected_expiry)
+    return render_template_string(
+        MAIN_HTML_TEMPLATE,
+        symbol=symbol,
+        rows=rows,
+        spot_price=spot_price,
+        atm_strike=atm_strike,
+        expiry=expiry,
+        expiries=expiries,
+        updated=updated,
+        pcr=pcr,
+        total_ce_oi=t_ce,
+        total_pe_oi=t_pe,
+        error=error
+    )
+
+@app.route("/analysis")
+def analysis():
+    symbol = request.args.get("symbol", "NIFTY").upper()
+    if symbol not in INSTRUMENT_KEYS:
+        symbol = "NIFTY"
+    selected_expiry = request.args.get("expiry", "ALL")
+    token = get_valid_token()
+    expiries = []
+    if token:
+        expiries, _ = get_cached_expiries(symbol, {"Accept": "application/json", "Authorization": f"Bearer {token}"})
+    return render_template_string(ANALYSIS_HTML_TEMPLATE, symbol=symbol, expiry=selected_expiry, expiries=expiries)
+
+@app.route("/api/data")
+def api_data():
+    symbol = request.args.get("symbol", "NIFTY").upper()
+    if symbol not in INSTRUMENT_KEYS:
+        symbol = "NIFTY"
+    selected_expiry = request.args.get("expiry", "ALL")
+    rows, spot_price, atm_strike, expiry, expiries, updated, pcr, t_ce, t_pe, error = process_option_data(symbol, selected_expiry)
+    return jsonify({
+        "symbol": symbol,
+        "rows": rows,
+        "spot_price": spot_price,
+        "atm_strike": atm_strike,
+        "expiry": expiry,
+        "expiries": expiries,
+        "updated": updated,
+        "pcr": pcr,
+        "total_ce_oi": t_ce,
+        "total_pe_oi": t_pe,
+        "error": error
+    })
 
 @app.route("/api/history")
 def api_history():
     symbol = request.args.get("symbol", "NIFTY").upper()
+    if symbol not in INSTRUMENT_KEYS:
+        symbol = "NIFTY"
     timeframe = request.args.get("timeframe", "5minute")
-    metric = request.args.get("metric", "price_pcr").lower()
-    day_range = request.args.get("day_range", "1day").lower()
-    chart_type = request.args.get("chart_type", "history").lower()
-    sym_clean = "BANKNIFTY" if "BANK" in symbol else "NIFTY"
+    day_range = request.args.get("day_range", "1day")
+    chart_type = request.args.get("chart_type", "history")
+    sheet_name = request.args.get("sheet", None)
 
-    if chart_type == "signal":
-        tf = timeframe.lower()
-        tf_str = "15_MIN" if "15" in tf else ("30_MIN" if "30" in tf else ("1_HR" if any(k in tf for k in ("60", "1h", "hour", "hr", "day")) else "5_MIN"))
-        target_sheet = f"{sym_clean}_{tf_str}"
-    else:
-        target_sheet = sym_clean
-
-    snapshots, err = fetch_history_from_gsheet(symbol, sheet_name=target_sheet)
-    if err:
-        return jsonify({"history": [], "count": 0, "error": err})
+    snapshots, error = fetch_history_from_gsheet(symbol, sheet_name)
+    if error:
+        return jsonify({"symbol": symbol, "history": [], "error": error})
     if not snapshots:
-        return jsonify({"history": [], "count": 0})
+        return jsonify({"symbol": symbol, "history": [], "error": f"No historical snapshots found in Google Sheet for {symbol}."})
 
-    day_map = {"1day": 86400, "3day": 259200, "1week": 604800, "2week": 1209600, "1month": 2592000, "3month": 7776000}
-    max_ts = max((s["timestamp"] for s in snapshots if s["timestamp"] > 0), default=0)
-    if max_ts > 0 and day_range in day_map:
-        cutoff = max_ts - day_map[day_range]
-        snapshots = [s for s in snapshots if s["timestamp"] >= cutoff or s["timestamp"] == 0]
+    range_days_map = {"1day": 1, "3day": 3, "1week": 7, "2week": 14, "1month": 30, "3month": 90}
+    target_days = range_days_map.get(day_range, 1)
 
-    if timeframe == "5minute" or not snapshots:
-        sliced = snapshots[-1500:]
+    unique_dates = []
+    seen_dates = set()
+    for s in snapshots:
+        d = s.get("date_str") or (s["datetime"].split(" ")[0] if " " in s.get("datetime", "") else "")
+        if d and d not in seen_dates:
+            seen_dates.add(d)
+            unique_dates.append(d)
+
+    if unique_dates:
+        allowed_dates = set(unique_dates[-target_days:])
+        filtered_by_days = [
+            s for s in snapshots
+            if (s.get("date_str") or (s["datetime"].split(" ")[0] if " " in s.get("datetime", "") else "")) in allowed_dates
+        ]
     else:
-        sec_map = {"15minute": 900, "30minute": 1800, "60minute": 3600, "day": 86400}
-        interval_sec = sec_map.get(timeframe, 300)
-        grouped = {}
-        sig_fields = ("new_signal", "signal_5m", "signal_15m", "signal_30m", "signal_1h")
-        for idx, item in enumerate(snapshots):
-            ts = item["timestamp"]
-            bucket = (ts // interval_sec) * interval_sec if ts > 0 else (idx // (interval_sec // 300))
-            if bucket not in grouped:
-                grouped[bucket] = dict(item)
+        max_pts = target_days * 375
+        filtered_by_days = snapshots[-max_pts:]
+
+    tf_minutes_map = {"1minute": 1, "5minute": 5, "15minute": 15, "30minute": 30, "60minute": 60, "day": 1440}
+    step_mins = tf_minutes_map.get(timeframe, 5)
+    bucket_sec = step_mins * 60
+
+    if step_mins <= 1:
+        sampled = filtered_by_days
+    else:
+        sampled = []
+        last_bucket = None
+        for s in filtered_by_days:
+            ts = s.get("timestamp", 0)
+            if ts > 0:
+                b_id = ts // bucket_sec
+                if b_id != last_bucket:
+                    sampled.append(s)
+                    last_bucket = b_id
+                else:
+                    prev = sampled[-1]
+                    for sig_k in ("new_signal", "signal_5m", "signal_15m", "signal_30m", "signal_1h"):
+                        if s.get(sig_k) in ("B", "BE", "S", "SE"):
+                            prev[sig_k] = s[sig_k]
             else:
-                prev = grouped[bucket]
-                merged = dict(item)
-                for sf in sig_fields:
-                    if not merged.get(sf) and prev.get(sf):
-                        merged[sf] = prev[sf]
-                grouped[bucket] = merged
-        sliced = [grouped[b] for b in sorted(grouped.keys())][-1500:]
+                sampled.append(s)
 
     if chart_type == "signal":
-        slim = [{
-            "datetime": s["datetime"],
-            "date_str": s["date_str"],
-            "formatted_time": s["formatted_time"],
-            "min_roc": s["min_roc"],
-            "max_roc": s["max_roc"],
-            "cross_roc": s["cross_roc"],
-            "main_volatility": s["main_volatility"],
-            "new_signal": s["new_signal"]
-        } for s in sliced]
+        for s in sampled:
+            s["sig"] = s.get("new_signal", "")
     else:
-        tf_sig_map = {
+        tf_sig_key = {
             "5minute": "signal_5m",
             "15minute": "signal_15m",
             "30minute": "signal_30m",
             "60minute": "signal_1h",
             "day": "signal_1h"
-        }
-        sig_key = tf_sig_map.get(timeframe, "signal_5m")
-        metric_pair_map = {
-            "price_pcr": ("spot_price", "pcr"),
-            "oi": ("ce_oi", "pe_oi"),
-            "oi_chg": ("ce_oi_chg", "pe_oi_chg"),
-            "vol": ("ce_vol", "pe_vol"),
-            "iv": ("ce_iv", "pe_iv"),
-            "delta": ("ce_delta", "pe_delta"),
-            "theta": ("ce_theta", "pe_theta"),
-            "vega": ("ce_vega", "pe_vega"),
-            "gamma": ("ce_gamma", "pe_gamma"),
-            "bid": ("ce_bid", "pe_bid"),
-            "ask": ("ce_ask", "pe_ask"),
-            "ltp": ("ce_ltp", "pe_ltp")
-        }
-        k1, k2 = metric_pair_map.get(metric, ("spot_price", "pcr"))
-        slim = [{
-            "datetime": s["datetime"],
-            "date_str": s["date_str"],
-            "formatted_time": s["formatted_time"],
-            k1: s[k1],
-            k2: s[k2],
-            sig_key: s[sig_key]
-        } for s in sliced]
+        }.get(timeframe, "signal_5m")
+        for s in sampled:
+            s["sig"] = s.get(tf_sig_key, "")
 
-    return jsonify({"history": slim, "count": len(slim)})
+    return jsonify({"symbol": symbol, "history": sampled, "error": None})
 
-@app.route("/api/data")
-def api_data():
+@app.route("/download_history")
+def download_history():
     symbol = request.args.get("symbol", "NIFTY").upper()
-    selected_expiry = request.args.get("expiry", "ALL").upper()
-    rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
-    return jsonify({
-        "rows": rows, "spot_price": spot_price, "atm_strike": atm_strike,
-        "expiry": expiry, "expiries": expiries, "updated": updated,
-        "pcr": pcr, "total_ce_oi": total_ce_oi, "total_pe_oi": total_pe_oi, "error": error
-    })
-
-@app.route("/", methods=["GET", "HEAD"])
-def index():
-    if request.method == "HEAD":
-        return Response(status=200)
-    symbol = request.args.get("symbol", "NIFTY").upper()
-    selected_expiry = request.args.get("expiry", "ALL").upper()
-    rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
-    return render_template_string(MAIN_HTML_TEMPLATE, rows=rows, symbol=symbol, spot_price=spot_price, atm_strike=atm_strike, expiry=expiry, expiries=expiries, updated=updated, pcr=pcr, total_ce_oi=total_ce_oi, total_pe_oi=total_pe_oi, error=error)
-
-@app.route("/analysis", methods=["GET"])
-def analysis_dashboard():
-    symbol = request.args.get("symbol", "NIFTY").upper()
-    selected_expiry = request.args.get("expiry", "ALL").upper()
-    with CACHE_LOCK:
-        cached_exp = EXPIRY_CACHE.get(symbol, {}).get("expiries", [])
-    return render_template_string(ANALYSIS_HTML_TEMPLATE, symbol=symbol, expiry=selected_expiry, expiries=cached_exp)
+    if symbol not in INSTRUMENT_KEYS:
+        symbol = "NIFTY"
+    snapshots, _ = fetch_history_from_gsheet(symbol)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Time", "Symbol", "Price LTP", "ATM Strike", "PCR", "CE OI", "PE OI",
+        "CE Chg in OI", "PE Chg in OI", "CE Vol", "PE Vol", "CE IV", "PE IV",
+        "CE Delta", "PE Delta", "CE Theta", "PE Theta", "CE Vega", "PE Vega",
+        "CE Gamma", "PE Gamma", "CE Bid", "PE Bid", "CE Ask", "PE Ask",
+        "CE LTP", "PE LTP", "Min ROC (Buy)", "Max ROC (Sell)", "Cross ROC Sig",
+        "Main Volatility", "New Signal", "5 Min Signal", "15 Min Signal",
+        "30 Min Signal", "1 HR Signal"
+    ])
+    for s in snapshots:
+        writer.writerow([
+            s.get("datetime", ""), s.get("symbol", ""), s.get("spot_price", 0), s.get("atm_strike", 0), s.get("pcr", 0),
+            s.get("ce_oi", 0), s.get("pe_oi", 0), s.get("ce_oi_chg", 0), s.get("pe_oi_chg", 0),
+            s.get("ce_vol", 0), s.get("pe_vol", 0), s.get("ce_iv", 0), s.get("pe_iv", 0),
+            s.get("ce_delta", 0), s.get("pe_delta", 0), s.get("ce_theta", 0), s.get("pe_theta", 0),
+            s.get("ce_vega", 0), s.get("pe_vega", 0), s.get("ce_gamma", 0), s.get("pe_gamma", 0),
+            s.get("ce_bid", 0), s.get("pe_bid", 0), s.get("ce_ask", 0), s.get("pe_ask", 0),
+            s.get("ce_ltp", 0), s.get("pe_ltp", 0), s.get("min_roc", 0), s.get("max_roc", 0),
+            s.get("cross_roc", 0), s.get("main_volatility", 0), s.get("new_signal", ""),
+            s.get("signal_5m", ""), s.get("signal_15m", ""), s.get("signal_30m", ""), s.get("signal_1h", "")
+        ])
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment;filename={symbol}_Historical_GoogleSheet_Data.csv"}
+    )
 
 @app.route("/download")
 def download_csv():
     symbol = request.args.get("symbol", "NIFTY").upper()
-    selected_expiry = request.args.get("expiry", "ALL").upper()
-    rows, spot_price, atm_strike, expiry, expiries, updated, pcr, total_ce_oi, total_pe_oi, error = process_option_data(symbol, selected_expiry)
-    si = io.StringIO()
-    cw = csv.writer(si)
-    cw.writerow([f"Symbol: {symbol}", f"Spot Price: {spot_price}", f"ATM Strike: {atm_strike}", f"Expiry: {expiry}", f"PCR: {pcr}", f"Updated: {updated}"])
-    cw.writerow(["CE OI", "CE Chg in OI", "CE Vol", "CE IV", "CE Delta", "CE Theta", "CE Vega", "CE Gamma", "CE Bid", "CE Ask", "CE LTP", "STRIKE", "PE LTP", "PE Bid", "PE Ask", "PE Delta", "PE Theta", "PE Vega", "PE Gamma", "PE IV", "PE Vol", "PE Chg in OI", "PE OI"])
-    if not error:
-        for r in rows:
-            cw.writerow([r["ce_oi"], r["ce_oi_chg"], r["ce_vol"], r["ce_iv"], r["ce_delta"], r["ce_theta"], r["ce_vega"], r["ce_gamma"], r["ce_bid"], r["ce_ask"], r["ce_ltp"], r["strike"], r["pe_ltp"], r["pe_bid"], r["pe_ask"], r["pe_delta"], r["pe_theta"], r["pe_vega"], r["pe_gamma"], r["pe_iv"], r["pe_vol"], r["pe_oi_chg"], r["pe_oi"]])
-    output = Response(si.getvalue(), mimetype="text/csv")
-    output.headers["Content-Disposition"] = f"attachment; filename={symbol}_{expiry}_Option_Chain.csv"
-    return output
-
-@app.route("/download_history")
-def download_history_csv():
-    symbol = request.args.get("symbol", "NIFTY").upper()
-    snapshots, _ = fetch_history_from_gsheet(symbol)
-    si = io.StringIO()
-    cw = csv.writer(si)
-    cw.writerow(["Datetime", "Formatted Time", "Symbol", "Spot Price", "ATM Strike", "PCR", "CE OI", "PE OI", "CE Chg in OI", "PE Chg in OI", "CE Vol", "PE Vol", "CE IV", "PE IV", "CE Delta", "PE Delta", "CE Theta", "PE Theta", "CE Vega", "PE Vega", "CE Gamma", "PE Gamma", "CE Ask", "PE Bid", "Min ROC (Buy)", "Max ROC (Sell)", "Cross ROC Sig", "Main Volatility", "New Signal", "5 Min Signal", "15 Min Signal", "30 Min Signal", "1 HR Signal"])
-    for s in snapshots:
-        cw.writerow([s.get("datetime"), s.get("formatted_time"), s.get("symbol"), s.get("spot_price"), s.get("atm_strike"), s.get("pcr"), s.get("ce_oi"), s.get("pe_oi"), s.get("ce_oi_chg"), s.get("pe_oi_chg"), s.get("ce_vol"), s.get("pe_vol"), s.get("ce_iv"), s.get("pe_iv"), s.get("ce_delta"), s.get("pe_delta"), s.get("ce_theta"), s.get("pe_theta"), s.get("ce_vega"), s.get("pe_vega"), s.get("ce_gamma"), s.get("pe_gamma"), s.get("ce_ask"), s.get("pe_bid"), s.get("min_roc"), s.get("max_roc"), s.get("cross_roc"), s.get("main_volatility"), s.get("new_signal"), s.get("signal_5m"), s.get("signal_15m"), s.get("signal_30m"), s.get("signal_1h")])
-    output = Response(si.getvalue(), mimetype="text/csv")
-    output.headers["Content-Disposition"] = f"attachment; filename={symbol}_GoogleSheet_Historical_Trend.csv"
-    return output
+    if symbol not in INSTRUMENT_KEYS:
+        symbol = "NIFTY"
+    selected_expiry = request.args.get("expiry", "ALL")
+    rows, spot_price, atm_strike, expiry, expiries, updated, pcr, t_ce, t_pe, error = process_option_data(symbol, selected_expiry)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Symbol", "Expiry", "Spot Price", "ATM Strike", "PCR", "Total Call OI", "Total Put OI",
+        "CE OI", "CE Chg in OI", "CE Vol", "CE IV", "CE Delta", "CE Theta", "CE Vega", "CE Gamma",
+        "CE Bid", "CE Ask", "CE LTP", "Strike Price", "PE LTP", "PE Bid", "PE Ask",
+        "PE Delta", "PE Theta", "PE Vega", "PE Gamma", "PE IV", "PE Vol", "PE Chg in OI", "PE OI", "Last Updated (IST)"
+    ])
+    for r in rows:
+        writer.writerow([
+            symbol, expiry, spot_price, atm_strike, pcr, t_ce, t_pe,
+            r["ce_oi"], r["ce_oi_chg"], r["ce_vol"], r["ce_iv"], r["ce_delta"], r["ce_theta"], r["ce_vega"], r["ce_gamma"],
+            r["ce_bid"], r["ce_ask"], r["ce_ltp"], r["strike"], r["pe_ltp"], r["pe_bid"], r["pe_ask"],
+            r["pe_delta"], r["pe_theta"], r["pe_vega"], r["pe_gamma"], r["pe_iv"], r["pe_vol"], r["pe_oi_chg"], r["pe_oi"], updated
+        ])
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment;filename={symbol}_{expiry}_Pro_Option_Chain.csv"}
+    )
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
