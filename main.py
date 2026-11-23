@@ -300,7 +300,9 @@ def round_tick(price, tick=0.05):
     return round(round(price / tick) * tick, 2)
 
 # --- DYNAMIC TRAILING SL & TARGET ENGINE ---
-def compute_dynamic_sl_target(side, entry_price, current_ltp, prev_best_price, sl_percent, target_percent, prev_sl=None, prev_target=None):
+TRAILING_SL_PERCENT = 5.0  # Initial SL comes from B26 (sl_percent); Trailing SL always steps every 5% positive move
+
+def compute_dynamic_sl_target(side, entry_price, current_ltp, prev_best_price, sl_percent, target_percent, prev_sl=None, prev_target=None, trail_percent=TRAILING_SL_PERCENT):
     side = str(side).upper()
     entry_price = float(entry_price)
     current_ltp = float(current_ltp) if current_ltp and current_ltp > 0 else entry_price
@@ -313,7 +315,10 @@ def compute_dynamic_sl_target(side, entry_price, current_ltp, prev_best_price, s
 
         new_sl = None
         if sl_percent is not None and sl_percent > 0:
-            cand = round_tick(entry_price * (1.0 - sl_percent / 100.0) + fav * (sl_percent / 100.0))
+            initial_sl = entry_price * (1.0 - sl_percent / 100.0)
+            trail_step = entry_price * (trail_percent / 100.0)
+            completed_steps = int((fav + 1e-9) // trail_step) if trail_step > 0 else 0
+            cand = round_tick(initial_sl + completed_steps * trail_step)
             new_sl = max(float(prev_sl), cand) if prev_sl is not None else cand
 
         new_target = None
@@ -328,7 +333,10 @@ def compute_dynamic_sl_target(side, entry_price, current_ltp, prev_best_price, s
 
         new_sl = None
         if sl_percent is not None and sl_percent > 0:
-            cand = round_tick(entry_price * (1.0 + sl_percent / 100.0) - fav * (sl_percent / 100.0))
+            initial_sl = entry_price * (1.0 + sl_percent / 100.0)
+            trail_step = entry_price * (trail_percent / 100.0)
+            completed_steps = int((fav + 1e-9) // trail_step) if trail_step > 0 else 0
+            cand = round_tick(initial_sl - completed_steps * trail_step)
             new_sl = min(float(prev_sl), cand) if prev_sl is not None else cand
 
         new_target = None
@@ -491,6 +499,7 @@ def process_dynamic_sl_and_target(positions, gtt_orders, default_sl_pct=None, de
                 "entry_price": entry_price if entry_price > 0 else gtt_entry,
                 "best_price": entry_price if entry_price > 0 else gtt_entry,
                 "sl_percent": inf_sl,
+                "trail_percent": TRAILING_SL_PERCENT,
                 "target_percent": inf_tgt,
                 "current_sl": gtt_sl,
                 "current_target": gtt_tgt
@@ -518,7 +527,11 @@ def process_dynamic_sl_and_target(positions, gtt_orders, default_sl_pct=None, de
                 g_tgt = float(tr["trigger_price"])
                 broker_tgt = max(broker_tgt, g_tgt) if (side == "BUY" and broker_tgt is not None) else (min(broker_tgt, g_tgt) if (side == "SELL" and broker_tgt is not None) else g_tgt)
 
-        dyn = compute_dynamic_sl_target(side, rec["entry_price"], ltp, rec.get("best_price"), sl_pct, tgt_pct, broker_sl, broker_tgt)
+        dyn = compute_dynamic_sl_target(
+            side, rec["entry_price"], ltp, rec.get("best_price"),
+            sl_pct, tgt_pct, broker_sl, broker_tgt,
+            trail_percent=TRAILING_SL_PERCENT
+        )
         if dyn["best_price"] != rec.get("best_price"):
             rec["best_price"] = dyn["best_price"]
             state_dirty = True
@@ -1072,11 +1085,12 @@ def submit_upstox_evaluated_order(evaluated_order):
                 tsl_state = load_dynamic_tsl_state()
                 tsl_state.setdefault("by_token", {})[inst_token] = {
                     "side": txn_type, "entry_price": entry_price, "best_price": entry_price,
-                    "sl_percent": evaluated_order.get("sl_percent"), "target_percent": evaluated_order.get("target_percent"),
+                    "sl_percent": evaluated_order.get("sl_percent"), "trail_percent": TRAILING_SL_PERCENT,
+                    "target_percent": evaluated_order.get("target_percent"),
                     "current_sl": sl_price, "current_target": target_price
                 }
                 save_dynamic_tsl_state(tsl_state)
-                return True, f"GTT Multi-Leg Order Placed! ID(s): {', '.join(gtt_ids) if gtt_ids else 'Confirmed'} | Entry: ₹{entry_price} | Dynamic SL: {sl_price or 'Blank'} | Dynamic Target: {target_price or 'Blank'}", False
+                return True, f"GTT Multi-Leg Order Placed! ID(s): {', '.join(gtt_ids) if gtt_ids else 'Confirmed'} | Entry: ₹{entry_price} | Initial SL: {sl_price or 'Blank'} (5% Trail) | Dynamic Target: {target_price or 'Blank'}", False
             err = rj.get("errors", [{}])[0].get("message") if isinstance(rj.get("errors"), list) and rj.get("errors") else res.text
             if res.status_code == 403 and "static IP" in err:
                 return False, f"Upstox Static IP Block (403): Outbound IP '{get_current_outbound_ip()}' is not registered.", True
@@ -3068,7 +3082,7 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
                 document.getElementById("moProduct").innerText = ev.product_label;
                 document.getElementById("moEntryPrice").innerText = `₹ ${ev.entry_price}`;
                 document.getElementById("moTotalInvest").innerText = `₹ ${Number(ev.total_investment).toLocaleString('en-IN')}`;
-                document.getElementById("moStopLoss").innerText = ev.sl_price != null ? `₹ ${ev.sl_price} (${ev.sl_percent}% Dynamic)` : "Blank";
+                document.getElementById("moStopLoss").innerText = ev.sl_price != null ? `₹ ${ev.sl_price} (${ev.sl_percent}% SL | 5% Trail)` : "Blank";
                 document.getElementById("moTarget").innerText = ev.target_price != null ? `₹ ${ev.target_price} (${ev.target_percent}% Dynamic)` : "Blank";
 
                 const warnBadge = document.getElementById("manualGuardWarningBadge");
