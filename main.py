@@ -1918,13 +1918,12 @@ MAIN_HTML_TEMPLATE = """<!DOCTYPE html>
 </html>"""
 
 # --- ANALYSIS DASHBOARD TEMPLATE (FREEZABLE ZOOM + SMOOTH LEFT/RIGHT DRAG PANNING) ---
+# --- ANALYSIS DASHBOARD TEMPLATE (BOTTOM-RIGHT + / - ZOOM & < / > LEFT-RIGHT PAN) ---
 ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
     <title>{{ symbol }} Option Chain & Technical Chart Analysis</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #0f172a; color: #f8fafc; }
         h2 { color: #38bdf8; margin-bottom: 5px; }
@@ -1933,14 +1932,8 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         .btn { padding: 9px 18px; color: #fff; background-color: #3b82f6; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 14px; border: none; cursor: pointer; }
         .btn-table { background-color: #64748b; }
         .btn-dl { background-color: #10b981; font-size: 12px; padding: 6px 12px; text-decoration: none; color: #fff; border-radius: 6px; font-weight: bold; }
-        .zoom-toolbar { display: inline-flex; align-items: center; gap: 6px; background: #0f172a; padding: 4px 8px; border-radius: 8px; border: 1px solid #334155; }
-        .btn-zoom { background-color: #334155; color: #f8fafc; border: 1px solid #475569; padding: 5px 10px; border-radius: 5px; font-size: 12px; font-weight: 700; cursor: pointer; transition: background-color 0.15s, opacity 0.15s; }
-        .btn-zoom:hover:not(:disabled) { background-color: #475569; }
-        .btn-zoom:disabled { opacity: 0.38; cursor: not-allowed; background-color: #1e293b; color: #64748b; border-color: #334155; }
-        .btn-zoom-lock { background-color: #78350f; color: #fbbf24; border: 1px solid #f59e0b; padding: 5px 11px; border-radius: 5px; font-size: 12px; font-weight: 700; cursor: pointer; transition: all 0.15s; }
-        .btn-zoom-lock.unlocked { background-color: #065f46; color: #34d399; border-color: #10b981; }
-        .btn-zoom-reset { background-color: #1e293b; color: #94a3b8; border: 1px solid #475569; padding: 5px 10px; border-radius: 5px; font-size: 12px; font-weight: 700; cursor: pointer; }
-        .btn-zoom-reset.active-zoom { background-color: #f59e0b; color: #0f172a; border-color: #fbbf24; }
+        .btn-wheel-lock { background-color: #334155; color: #cbd5e1; border: 1px solid #475569; padding: 6px 11px; border-radius: 6px; font-size: 12px; font-weight: 700; cursor: pointer; }
+        .btn-wheel-lock.unlocked { background-color: #065f46; color: #34d399; border-color: #10b981; }
         select { padding: 9px 14px; background: #0f172a; color: #38bdf8; border: 1px solid #334155; border-radius: 6px; font-weight: 600; font-size: 14px; outline: none; }
         .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; }
         .card { background: #1e293b; padding: 16px; border-radius: 10px; border-left: 5px solid #3b82f6; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
@@ -1951,18 +1944,80 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         .gauge-pe { background-color: #22c55e; height: 100%; transition: width 0.4s ease; }
         .gauge-ce { background-color: #ef4444; height: 100%; transition: width 0.4s ease; }
         .chart-box { background: #1e293b; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); margin-bottom: 30px; position: relative; }
-        .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 10px; }
+        .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 10px; }
         .chart-title { font-size: 18px; font-weight: bold; color: #f8fafc; }
-        .zoom-hint { font-size: 12px; color: #94a3b8; margin-bottom: 10px; }
         .timer-badge { background: #0284c7; color: #ffffff; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
         .error-msg { color: #f87171; font-weight: bold; padding: 15px; background: #450a0a; border-radius: 8px; }
-        .canvas-wrap { position: relative; height: 420px; width: 100%; }
+        .canvas-wrap { position: relative; height: 430px; width: 100%; }
         .canvas-wrap canvas { touch-action: pan-y; user-select: none; }
+
+        /* Bottom-Right Floating Zoom (+ / -) & Left/Right (< / >) Navigation HUD */
+        .chart-nav-hud {
+            position: absolute;
+            bottom: 34px;
+            right: 14px;
+            z-index: 25;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            background: rgba(15, 23, 42, 0.90);
+            backdrop-filter: blur(4px);
+            border: 1px solid #475569;
+            border-radius: 8px;
+            padding: 5px 8px;
+            box-shadow: 0 6px 16px rgba(0, 0, 0, 0.55);
+        }
+        .hud-btn {
+            background: #1e293b;
+            color: #f8fafc;
+            border: 1px solid #475569;
+            border-radius: 5px;
+            min-width: 30px;
+            height: 28px;
+            padding: 0 8px;
+            font-size: 15px;
+            font-weight: 800;
+            line-height: 1;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            transition: background-color 0.14s, border-color 0.14s, opacity 0.14s;
+        }
+        .hud-btn:hover:not(:disabled) {
+            background: #0284c7;
+            border-color: #38bdf8;
+            color: #ffffff;
+        }
+        .hud-btn:active:not(:disabled) {
+            transform: scale(0.95);
+        }
+        .hud-btn:disabled {
+            opacity: 0.35;
+            cursor: not-allowed;
+        }
+        .hud-sep {
+            width: 1px;
+            height: 18px;
+            background: #334155;
+            margin: 0 2px;
+        }
+        .hud-reset {
+            background: #78350f;
+            border-color: #f59e0b;
+            color: #fbbf24;
+            font-size: 13px;
+        }
+        .hud-reset:hover:not(:disabled) {
+            background: #b45309;
+            border-color: #fbbf24;
+            color: #ffffff;
+        }
     </style>
 </head>
 <body>
     <h2>📊 {{ symbol }} Advanced Analytics & Google Sheet Memory Dashboard</h2>
-    <div class="subtitle">High-speed parallel auto-sync — Click "🔒 Zoom: Frozen" to unrelease Zoom + / − and Left ↔ Right Drag Panning</div>
+    <div class="subtitle">Use the bottom-right <strong>&lt; / &gt;</strong> and <strong>+ / −</strong> controls (or drag left/right after zooming in) to inspect any section</div>
 
     <div class="nav-bar">
         <label style="color: #94a3b8; font-weight: bold;">Symbol:</label>
@@ -2015,25 +2070,31 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
     </div>
 
+    <!-- CHART 1: OPTION CHAIN BAR CHART -->
     <div class="chart-box">
         <div class="chart-header">
             <div class="chart-title" id="chartHeaderTitle">Change in Open Interest (Chg in OI)</div>
             <span style="color: #facc15; font-size: 13px; font-weight: bold;">★ Yellow Line = Spot ATM Strike | Dashed Lines = Linear Trendlines</span>
         </div>
-        <canvas id="analysisChart" style="max-height: 480px;"></canvas>
+        <div class="canvas-wrap">
+            <canvas id="analysisChart" ondblclick="resetChartZoom('analysis')"></canvas>
+            <div class="chart-nav-hud">
+                <button type="button" class="hud-btn" id="analysisPanLeftBtn" onclick="panChartBy('analysis', -1)" title="Move Left" disabled>&lt;</button>
+                <button type="button" class="hud-btn" id="analysisPanRightBtn" onclick="panChartBy('analysis', 1)" title="Move Right" disabled>&gt;</button>
+                <span class="hud-sep"></span>
+                <button type="button" class="hud-btn" id="analysisZoomInBtn" onclick="zoomChartBy('analysis', 'in')" title="Zoom In">+</button>
+                <button type="button" class="hud-btn" id="analysisZoomOutBtn" onclick="zoomChartBy('analysis', 'out')" title="Zoom Out" disabled>−</button>
+                <button type="button" class="hud-btn hud-reset" id="analysisResetBtn" onclick="resetChartZoom('analysis')" title="Reset Zoom" style="display:none;">↺</button>
+            </div>
+        </div>
     </div>
 
+    <!-- CHART 2: HISTORICAL SNAPSHOT TREND -->
     <div class="chart-box">
         <div class="chart-header">
             <span class="chart-title">2 - 📈 Historical Snapshot Trend (Google Sheet Memory — B / BE / S / SE Signals)</span>
             <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-                <div class="zoom-toolbar">
-                    <button type="button" id="histZoomLockBtn" class="btn-zoom-lock" onclick="toggleZoomFreeze('history')" title="Click to Unrelease or Freeze Zoom & Drag Pan Controls">🔒 Zoom: Frozen</button>
-                    <button type="button" id="histDragModeBtn" class="btn-zoom" onclick="toggleChartDragMode('history')" title="Switch between Drag Left/Right Pan and Area Zoom" style="background-color: #0284c7;" disabled>✋ Drag: Pan</button>
-                    <button type="button" id="histZoomInBtn" class="btn-zoom" onclick="stepChartZoom('history', 1.35)" title="Zoom In (Unrelease Zoom first)" disabled>+</button>
-                    <button type="button" id="histZoomOutBtn" class="btn-zoom" onclick="stepChartZoom('history', 0.74)" title="Zoom Out (Unrelease Zoom first)" disabled>−</button>
-                    <button type="button" id="histResetZoomBtn" class="btn-zoom-reset" onclick="resetChartZoom('history')" title="Reset Zoom">🔄 Reset Zoom</button>
-                </div>
+                <button type="button" id="historyWheelBtn" class="btn-wheel-lock" onclick="toggleWheelZoom('history')" title="Enable or Freeze Mouse Wheel Zoom">🖱️ Wheel: Frozen</button>
                 <label style="color: #94a3b8; font-weight: bold;">Head of Dropdown:</label>
                 <select id="historyMetricSelector" onchange="loadHistoricalChart(true)">
                     <option value="price_pcr" selected>Price LTP / PCR</option>
@@ -2061,23 +2122,25 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                 <a id="downloadHistoryBtn" href="/download_history?symbol={{ symbol }}" class="btn-dl">📥 CSV</a>
             </div>
         </div>
-        <div class="zoom-hint" id="histZoomHint">🔒 <strong>Zoom is Frozen:</strong> Click <strong>"🔒 Zoom: Frozen"</strong> to unrelease <strong>+</strong> / <strong>−</strong> zoom and <strong>Left ↔ Right</strong> drag panning.</div>
         <div class="canvas-wrap">
             <canvas id="historyChart" ondblclick="resetChartZoom('history')"></canvas>
+            <div class="chart-nav-hud">
+                <button type="button" class="hud-btn" id="historyPanLeftBtn" onclick="panChartBy('history', -1)" title="Move Left" disabled>&lt;</button>
+                <button type="button" class="hud-btn" id="historyPanRightBtn" onclick="panChartBy('history', 1)" title="Move Right" disabled>&gt;</button>
+                <span class="hud-sep"></span>
+                <button type="button" class="hud-btn" id="historyZoomInBtn" onclick="zoomChartBy('history', 'in')" title="Zoom In">+</button>
+                <button type="button" class="hud-btn" id="historyZoomOutBtn" onclick="zoomChartBy('history', 'out')" title="Zoom Out" disabled>−</button>
+                <button type="button" class="hud-btn hud-reset" id="historyResetBtn" onclick="resetChartZoom('history')" title="Reset Zoom" style="display:none;">↺</button>
+            </div>
         </div>
     </div>
 
+    <!-- CHART 3: MAIN SIGNAL -->
     <div class="chart-box">
         <div class="chart-header">
             <span class="chart-title">3 - 🚀 Main Signal (B / BE / S / SE)</span>
             <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-                <div class="zoom-toolbar">
-                    <button type="button" id="sigZoomLockBtn" class="btn-zoom-lock" onclick="toggleZoomFreeze('signal')" title="Click to Unrelease or Freeze Zoom & Drag Pan Controls">🔒 Zoom: Frozen</button>
-                    <button type="button" id="sigDragModeBtn" class="btn-zoom" onclick="toggleChartDragMode('signal')" title="Switch between Drag Left/Right Pan and Area Zoom" style="background-color: #0284c7;" disabled>✋ Drag: Pan</button>
-                    <button type="button" id="sigZoomInBtn" class="btn-zoom" onclick="stepChartZoom('signal', 1.35)" title="Zoom In (Unrelease Zoom first)" disabled>+</button>
-                    <button type="button" id="sigZoomOutBtn" class="btn-zoom" onclick="stepChartZoom('signal', 0.74)" title="Zoom Out (Unrelease Zoom first)" disabled>−</button>
-                    <button type="button" id="sigResetZoomBtn" class="btn-zoom-reset" onclick="resetChartZoom('signal')" title="Reset Zoom">🔄 Reset Zoom</button>
-                </div>
+                <button type="button" id="signalWheelBtn" class="btn-wheel-lock" onclick="toggleWheelZoom('signal')" title="Enable or Freeze Mouse Wheel Zoom">🖱️ Wheel: Frozen</button>
                 <label style="color: #94a3b8; font-weight: bold;">Data Day Range:</label>
                 <select id="signalDayRangeSelector" onchange="loadSignalChart(true)">
                     <option value="1day" selected>1 Day</option><option value="3day">3 Day</option><option value="1week">1 Week</option>
@@ -2089,9 +2152,16 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                 </select>
             </div>
         </div>
-        <div class="zoom-hint" id="sigZoomHint">🔒 <strong>Zoom is Frozen:</strong> Click <strong>"🔒 Zoom: Frozen"</strong> to unrelease <strong>+</strong> / <strong>−</strong> zoom and <strong>Left ↔ Right</strong> drag panning.</div>
         <div class="canvas-wrap">
             <canvas id="signalChart" ondblclick="resetChartZoom('signal')"></canvas>
+            <div class="chart-nav-hud">
+                <button type="button" class="hud-btn" id="signalPanLeftBtn" onclick="panChartBy('signal', -1)" title="Move Left" disabled>&lt;</button>
+                <button type="button" class="hud-btn" id="signalPanRightBtn" onclick="panChartBy('signal', 1)" title="Move Right" disabled>&gt;</button>
+                <span class="hud-sep"></span>
+                <button type="button" class="hud-btn" id="signalZoomInBtn" onclick="zoomChartBy('signal', 'in')" title="Zoom In">+</button>
+                <button type="button" class="hud-btn" id="signalZoomOutBtn" onclick="zoomChartBy('signal', 'out')" title="Zoom Out" disabled>−</button>
+                <button type="button" class="hud-btn hud-reset" id="signalResetBtn" onclick="resetChartZoom('signal')" title="Reset Zoom" style="display:none;">↺</button>
+            </div>
         </div>
     </div>
 
@@ -2104,177 +2174,232 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         let hasHistoryData = false, hasSignalData = false;
         let histAbortCtrl = null, sigAbortCtrl = null, dataAbortCtrl = null;
 
-        // Zoom starts FROZEN (true) until user clicks "Zoom: Frozen" to unrelease it.
-        // Once released, dragAreaZoomState is false by default so dragging Left <-> Right moves/pans immediately!
-        const zoomFrozenState = { history: true, signal: true };
-        const dragAreaZoomState = { history: false, signal: false };
-
+        const wheelZoomEnabled = { analysis: false, history: false, signal: false };
         const DATE_PALETTE = ['#38bdf8', '#facc15', '#4ade80', '#f472b6', '#a78bfa', '#fb923c', '#2dd4bf'];
 
-        function getChartKey(chart) {
-            if (chart === historyChartObj) return 'history';
-            if (chart === signalChartObj) return 'signal';
+        function getChartInstance(chartKey) {
+            if (chartKey === 'analysis') return myChart;
+            if (chartKey === 'history') return historyChartObj;
+            if (chartKey === 'signal') return signalChartObj;
             return null;
         }
 
-        function setDragModeUI(chartKey, isAreaZoom) {
-            const chart = chartKey === 'history' ? historyChartObj : signalChartObj;
-            const btn = document.getElementById(chartKey === 'history' ? 'histDragModeBtn' : 'sigDragModeBtn');
-            const canvas = document.getElementById(chartKey === 'history' ? 'historyChart' : 'signalChart');
-            dragAreaZoomState[chartKey] = isAreaZoom;
-
-            if (isAreaZoom) {
-                btn.innerText = '🔍 Drag: Area Zoom';
-                btn.style.backgroundColor = '#334155';
-                if (canvas) canvas.style.cursor = zoomFrozenState[chartKey] ? 'default' : 'crosshair';
-            } else {
-                btn.innerText = '✋ Drag: Pan';
-                btn.style.backgroundColor = '#0284c7';
-                if (canvas) canvas.style.cursor = zoomFrozenState[chartKey] ? 'default' : 'grab';
-            }
-
-            if (chart && chart.options && chart.options.plugins && chart.options.plugins.zoom) {
-                const frozen = zoomFrozenState[chartKey];
-                const z = chart.options.plugins.zoom;
-                z.pan.enabled = !frozen;
-                z.pan.modifierKey = (!frozen && isAreaZoom) ? 'shift' : null;
-                z.zoom.drag.enabled = (!frozen && isAreaZoom);
-                z.zoom.drag.modifierKey = (!frozen && !isAreaZoom) ? 'shift' : null;
-                chart.update('none');
-            }
-        }
-
-        function updateZoomBadge(chart) {
-            const chartKey = getChartKey(chart);
-            if (!chartKey) return;
-            const btn = document.getElementById(chartKey === 'history' ? 'histResetZoomBtn' : 'sigResetZoomBtn');
+        function toggleWheelZoom(chartKey) {
+            wheelZoomEnabled[chartKey] = !wheelZoomEnabled[chartKey];
+            const btn = document.getElementById(chartKey + 'WheelBtn');
             if (!btn) return;
-            const zoomed = typeof chart.isZoomedOrPanned === 'function'
-                ? chart.isZoomedOrPanned()
-                : (chart.options.scales.x.min !== undefined || chart.options.scales.x.max !== undefined);
-            if (zoomed) {
-                btn.classList.add('active-zoom');
+            if (wheelZoomEnabled[chartKey]) {
+                btn.innerText = '🖱️ Wheel: Active';
+                btn.classList.add('unlocked');
             } else {
-                btn.classList.remove('active-zoom');
+                btn.innerText = '🖱️ Wheel: Frozen';
+                btn.classList.remove('unlocked');
             }
         }
 
-        function buildInteractiveZoomOptions(isFrozen = true) {
-            return {
-                limits: {
-                    x: { min: 0, max: 10000, minRange: 3 }
-                },
-                pan: {
-                    enabled: !isFrozen,
-                    mode: 'x',
-                    modifierKey: null,
-                    threshold: 2,
-                    onPanComplete: ({ chart }) => updateZoomBadge(chart)
-                },
-                zoom: {
-                    wheel: {
-                        enabled: !isFrozen,
-                        speed: 0.12
-                    },
-                    pinch: {
-                        enabled: !isFrozen
-                    },
-                    drag: {
-                        enabled: false,
-                        modifierKey: 'shift',
-                        backgroundColor: 'rgba(56, 189, 248, 0.24)',
-                        borderColor: '#38bdf8',
-                        borderWidth: 1.5,
-                        threshold: 6
-                    },
-                    mode: 'x',
-                    onZoomComplete: ({ chart }) => {
-                        updateZoomBadge(chart);
-                        const key = getChartKey(chart);
-                        // Automatically return to Left <-> Right Drag Pan mode right after zooming in
-                        if (key && !zoomFrozenState[key] && dragAreaZoomState[key]) {
-                            setDragModeUI(key, false);
-                        }
-                    }
-                }
-            };
+        function updateZoomControlsUI(chartKey) {
+            const chart = getChartInstance(chartKey);
+            const leftBtn = document.getElementById(chartKey + 'PanLeftBtn');
+            const rightBtn = document.getElementById(chartKey + 'PanRightBtn');
+            const inBtn = document.getElementById(chartKey + 'ZoomInBtn');
+            const outBtn = document.getElementById(chartKey + 'ZoomOutBtn');
+            const resetBtn = document.getElementById(chartKey + 'ResetBtn');
+            const canvas = document.getElementById(chartKey === 'analysis' ? 'analysisChart' : (chartKey === 'history' ? 'historyChart' : 'signalChart'));
+
+            if (!chart || !chart.data || !chart.data.labels) return;
+            const total = chart.data.labels.length;
+            const xScale = chart.options.scales.x;
+            const isZoomed = (xScale.min !== undefined || xScale.max !== undefined) && total > 3;
+
+            const curMin = (xScale.min !== undefined) ? xScale.min : 0;
+            const curMax = (xScale.max !== undefined) ? xScale.max : Math.max(0, total - 1);
+            const minSpan = Math.min(4, Math.max(1, total - 1));
+
+            if (inBtn) inBtn.disabled = (total <= 3) || ((curMax - curMin) <= minSpan);
+            if (outBtn) outBtn.disabled = !isZoomed;
+            if (leftBtn) leftBtn.disabled = !isZoomed || (curMin <= 0);
+            if (rightBtn) rightBtn.disabled = !isZoomed || (curMax >= total - 1);
+            if (resetBtn) resetBtn.style.display = isZoomed ? 'inline-flex' : 'none';
+            if (canvas) canvas.style.cursor = isZoomed ? 'grab' : 'default';
         }
 
-        function applyCategoryZoomLimits(chart, pointCount) {
-            if (!chart || !chart.options || !chart.options.plugins || !chart.options.plugins.zoom) return;
-            const maxIdx = Math.max(0, (pointCount || 1) - 1);
-            chart.options.plugins.zoom.limits = {
-                x: { min: 0, max: maxIdx, minRange: Math.min(3, maxIdx) }
-            };
-        }
+        function zoomChartBy(chartKey, direction) {
+            const chart = getChartInstance(chartKey);
+            if (!chart || !chart.data || !chart.data.labels) return;
+            const total = chart.data.labels.length;
+            if (total <= 3) return;
 
-        function toggleZoomFreeze(chartKey) {
-            const isHist = chartKey === 'history';
-            const chart = isHist ? historyChartObj : signalChartObj;
-            const lockBtn = document.getElementById(isHist ? 'histZoomLockBtn' : 'sigZoomLockBtn');
-            const dragBtn = document.getElementById(isHist ? 'histDragModeBtn' : 'sigDragModeBtn');
-            const zoomInBtn = document.getElementById(isHist ? 'histZoomInBtn' : 'sigZoomInBtn');
-            const zoomOutBtn = document.getElementById(isHist ? 'histZoomOutBtn' : 'sigZoomOutBtn');
-            const hintEl = document.getElementById(isHist ? 'histZoomHint' : 'sigZoomHint');
+            const xScale = chart.options.scales.x;
+            const curMin = (xScale.min !== undefined) ? xScale.min : 0;
+            const curMax = (xScale.max !== undefined) ? xScale.max : (total - 1);
+            const curSpan = Math.max(1, curMax - curMin);
+            const minSpan = Math.min(4, total - 1);
 
-            zoomFrozenState[chartKey] = !zoomFrozenState[chartKey];
-            const frozen = zoomFrozenState[chartKey];
-
-            zoomInBtn.disabled = frozen;
-            zoomOutBtn.disabled = frozen;
-            dragBtn.disabled = frozen;
-
-            if (frozen) {
-                lockBtn.innerText = '🔒 Zoom: Frozen';
-                lockBtn.classList.remove('unlocked');
-                hintEl.innerHTML = '🔒 <strong>Zoom is Frozen:</strong> Click <strong>"🔒 Zoom: Frozen"</strong> to unrelease <strong>+</strong> / <strong>−</strong> zoom and <strong>Left ↔ Right</strong> drag panning.';
-                if (chart && chart.options && chart.options.plugins && chart.options.plugins.zoom) {
-                    const z = chart.options.plugins.zoom;
-                    z.zoom.wheel.enabled = false;
-                    z.zoom.pinch.enabled = false;
-                    z.zoom.drag.enabled = false;
-                    z.pan.enabled = false;
-                    chart.update('none');
-                }
-                const canvas = document.getElementById(isHist ? 'historyChart' : 'signalChart');
-                if (canvas) canvas.style.cursor = 'default';
+            if (direction === 'in') {
+                const newSpan = Math.max(minSpan, Math.floor(curSpan * 0.72));
+                if (newSpan >= curSpan && curSpan <= minSpan) return;
+                const mid = (curMin + curMax) / 2;
+                let newMin = Math.round(mid - newSpan / 2);
+                let newMax = newMin + newSpan;
+                if (newMax > total - 1) { newMax = total - 1; newMin = Math.max(0, newMax - newSpan); }
+                if (newMin < 0) { newMin = 0; newMax = Math.min(total - 1, newMin + newSpan); }
+                xScale.min = newMin;
+                xScale.max = newMax;
             } else {
-                lockBtn.innerText = '🔓 Zoom: Released';
-                lockBtn.classList.add('unlocked');
-                hintEl.innerHTML = '🔓 <strong>Zoom Released:</strong> Use <strong>+</strong> / <strong>−</strong> or scroll wheel to zoom, then <strong>drag Left ↔ Right</strong> to pan across the chart (Shift+Drag for area zoom).';
-                if (chart && chart.options && chart.options.plugins && chart.options.plugins.zoom) {
-                    const z = chart.options.plugins.zoom;
-                    z.zoom.wheel.enabled = true;
-                    z.zoom.pinch.enabled = true;
+                const newSpan = Math.min(total - 1, Math.max(curSpan + 2, Math.ceil(curSpan * 1.38)));
+                if (newSpan >= total - 1) {
+                    delete xScale.min;
+                    delete xScale.max;
+                } else {
+                    const mid = (curMin + curMax) / 2;
+                    let newMin = Math.round(mid - newSpan / 2);
+                    let newMax = newMin + newSpan;
+                    if (newMax > total - 1) { newMax = total - 1; newMin = Math.max(0, newMax - newSpan); }
+                    if (newMin < 0) { newMin = 0; newMax = Math.min(total - 1, newMin + newSpan); }
+                    xScale.min = newMin;
+                    xScale.max = newMax;
                 }
-                setDragModeUI(chartKey, dragAreaZoomState[chartKey]);
             }
+
+            chart.update('none');
+            updateZoomControlsUI(chartKey);
         }
 
-        function toggleChartDragMode(chartKey) {
-            if (zoomFrozenState[chartKey]) return;
-            setDragModeUI(chartKey, !dragAreaZoomState[chartKey]);
-        }
+        function panChartBy(chartKey, dirSign) {
+            const chart = getChartInstance(chartKey);
+            if (!chart || !chart.data || !chart.data.labels) return;
+            const total = chart.data.labels.length;
+            const xScale = chart.options.scales.x;
+            if (xScale.min === undefined && xScale.max === undefined) return;
 
-        function stepChartZoom(chartKey, factor) {
-            if (zoomFrozenState[chartKey]) return;
-            const chart = chartKey === 'history' ? historyChartObj : signalChartObj;
-            if (!chart || typeof chart.zoom !== 'function') return;
-            chart.zoom(factor, 'none');
-            updateZoomBadge(chart);
+            const curMin = (xScale.min !== undefined) ? xScale.min : 0;
+            const curMax = (xScale.max !== undefined) ? xScale.max : (total - 1);
+            const span = curMax - curMin;
+            const step = Math.max(1, Math.round(span * 0.25));
+
+            let newMin = curMin + (dirSign * step);
+            let newMax = curMax + (dirSign * step);
+
+            if (newMin < 0) {
+                newMin = 0;
+                newMax = span;
+            }
+            if (newMax > total - 1) {
+                newMax = total - 1;
+                newMin = Math.max(0, (total - 1) - span);
+            }
+
+            xScale.min = newMin;
+            xScale.max = newMax;
+            chart.update('none');
+            updateZoomControlsUI(chartKey);
         }
 
         function resetChartZoom(chartKey) {
-            const chart = chartKey === 'history' ? historyChartObj : signalChartObj;
+            const chart = getChartInstance(chartKey);
+            if (!chart || !chart.options || !chart.options.scales || !chart.options.scales.x) return;
+            delete chart.options.scales.x.min;
+            delete chart.options.scales.x.max;
+            chart.update('none');
+            updateZoomControlsUI(chartKey);
+        }
+
+        function preserveZoomWindowAfterReload(chartKey, newTotal, resetWindow) {
+            const chart = getChartInstance(chartKey);
             if (!chart) return;
-            if (typeof chart.resetZoom === 'function') {
-                chart.resetZoom('none');
-            } else if (chart.options && chart.options.scales && chart.options.scales.x) {
-                delete chart.options.scales.x.min;
-                delete chart.options.scales.x.max;
-                chart.update('none');
+            const xScale = chart.options.scales.x;
+            if (resetWindow || newTotal <= 3) {
+                delete xScale.min;
+                delete xScale.max;
+                return;
             }
-            updateZoomBadge(chart);
+            if (xScale.min !== undefined || xScale.max !== undefined) {
+                let minIdx = xScale.min ?? 0;
+                let maxIdx = xScale.max ?? (newTotal - 1);
+                const span = Math.max(2, maxIdx - minIdx);
+                if (maxIdx > newTotal - 1) {
+                    maxIdx = newTotal - 1;
+                    minIdx = Math.max(0, maxIdx - span);
+                }
+                if (minIdx < 0) minIdx = 0;
+                if (maxIdx - minIdx >= newTotal - 1) {
+                    delete xScale.min;
+                    delete xScale.max;
+                } else {
+                    xScale.min = minIdx;
+                    xScale.max = maxIdx;
+                }
+            }
+        }
+
+        function bindCanvasDragAndWheel(canvasId, chartKey) {
+            const canvas = document.getElementById(canvasId);
+            if (!canvas) return;
+
+            let isDragging = false;
+            let startX = 0;
+            let startMin = 0;
+            let startMax = 0;
+
+            canvas.addEventListener('pointerdown', (e) => {
+                if (e.button !== 0 && e.pointerType === 'mouse') return;
+                const chart = getChartInstance(chartKey);
+                if (!chart || !chart.data || !chart.data.labels) return;
+                const xScale = chart.options.scales.x;
+                if (xScale.min === undefined && xScale.max === undefined) return;
+
+                isDragging = true;
+                startX = e.clientX;
+                startMin = xScale.min ?? 0;
+                startMax = xScale.max ?? (chart.data.labels.length - 1);
+                canvas.style.cursor = 'grabbing';
+                try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+            });
+
+            canvas.addEventListener('pointermove', (e) => {
+                if (!isDragging) return;
+                const chart = getChartInstance(chartKey);
+                if (!chart || !chart.chartArea || !chart.data || !chart.data.labels) return;
+                const total = chart.data.labels.length;
+                const plotWidth = Math.max(50, chart.chartArea.right - chart.chartArea.left);
+                const span = startMax - startMin;
+                if (span <= 0) return;
+
+                const deltaPx = e.clientX - startX;
+                const deltaIdx = Math.round((-deltaPx / plotWidth) * span);
+
+                let newMin = startMin + deltaIdx;
+                let newMax = startMax + deltaIdx;
+                if (newMin < 0) { newMin = 0; newMax = span; }
+                if (newMax > total - 1) { newMax = total - 1; newMin = Math.max(0, (total - 1) - span); }
+
+                const xScale = chart.options.scales.x;
+                if (xScale.min !== newMin || xScale.max !== newMax) {
+                    xScale.min = newMin;
+                    xScale.max = newMax;
+                    chart.update('none');
+                    updateZoomControlsUI(chartKey);
+                }
+            });
+
+            const stopDrag = (e) => {
+                if (!isDragging) return;
+                isDragging = false;
+                try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+                updateZoomControlsUI(chartKey);
+            };
+            canvas.addEventListener('pointerup', stopDrag);
+            canvas.addEventListener('pointercancel', stopDrag);
+
+            canvas.addEventListener('wheel', (e) => {
+                if (!wheelZoomEnabled[chartKey]) return;
+                e.preventDefault();
+                if (e.deltaY < 0) {
+                    zoomChartBy(chartKey, 'in');
+                } else if (e.deltaY > 0) {
+                    zoomChartBy(chartKey, 'out');
+                }
+            }, { passive: false });
         }
 
         const hoverCrosshairPlugin = {
@@ -2488,6 +2613,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 
         function switchExpiry(newExp) {
             currentExpiry = newExp;
+            resetChartZoom('analysis');
             fetchOptionChainData();
         }
 
@@ -2528,12 +2654,12 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     },
                     plugins: {
                         legend: { labels: { color: '#f8fafc', font: { size: 13 } } },
-                        tooltip: buildTimeOnlyTooltipConfig('Time'),
-                        zoom: buildInteractiveZoomOptions(zoomFrozenState.signal)
+                        tooltip: buildTimeOnlyTooltipConfig('Time')
                     }
                 },
                 plugins: [dateBandPlugin, zeroLinePlugin, signalLabelPlugin, hoverCrosshairPlugin]
             });
+            bindCanvasDragAndWheel('signalChart', 'signal');
         }
 
         function loadSignalChart(isManualChange = false) {
@@ -2545,9 +2671,6 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             return fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&day_range=${dayRange}&chart_type=signal`, { signal: sigAbortCtrl.signal })
                 .then(res => res.json())
                 .then(data => {
-                    if (isManualChange) {
-                        resetChartZoom('signal');
-                    }
                     if (data.error || !(data.history && data.history.length)) {
                         if (isManualChange || !hasSignalData) {
                             signalChartObj._dateColors = [];
@@ -2555,8 +2678,9 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                             signalChartObj._hoverTimes = [];
                             signalChartObj.data.labels = [data.error || "No data found for Main Signal."];
                             signalChartObj.data.datasets = [{ label: 'Status', data: [0], borderColor: '#ef4444' }];
-                            applyCategoryZoomLimits(signalChartObj, 1);
+                            preserveZoomWindowAfterReload('signal', 1, true);
                             signalChartObj.update('none');
+                            updateZoomControlsUI('signal');
                         }
                         return;
                     }
@@ -2569,7 +2693,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 
                     const times = snapshots.map(s => s.formatted_time || s.datetime);
                     signalChartObj.data.labels = times;
-                    applyCategoryZoomLimits(signalChartObj, times.length);
+                    preserveZoomWindowAfterReload('signal', times.length, isManualChange);
                     signalChartObj.data.datasets = [
                         { label: 'Min ROC (Buy)', data: snapshots.map(s => s.min_roc || 0), borderColor: '#22c55e', borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: 0.2 },
                         { label: 'Max ROC (Sell)', data: snapshots.map(s => s.max_roc || 0), borderColor: '#ef4444', borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: 0.2 },
@@ -2577,7 +2701,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                         { label: 'Main Volatility', data: snapshots.map(s => s.main_volatility || 0), signalLabels: snapshots.map(s => s.new_signal || ""), borderColor: '#38bdf8', borderWidth: 3, pointRadius: 3, pointHoverRadius: 4, tension: 0.2 }
                     ];
                     signalChartObj.update('none');
-                    updateZoomBadge(signalChartObj);
+                    updateZoomControlsUI('signal');
                 })
                 .catch(err => { if (err.name !== 'AbortError') console.error("Signal chart error:", err); });
         }
@@ -2606,12 +2730,12 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     },
                     plugins: {
                         legend: { labels: { color: '#f8fafc', font: { size: 13 } } },
-                        tooltip: buildTimeOnlyTooltipConfig('Time'),
-                        zoom: buildInteractiveZoomOptions(zoomFrozenState.history)
+                        tooltip: buildTimeOnlyTooltipConfig('Time')
                     }
                 },
                 plugins: [dateBandPlugin, signalLabelPlugin, hoverCrosshairPlugin]
             });
+            bindCanvasDragAndWheel('historyChart', 'history');
         }
 
         function loadHistoricalChart(isManualChange = false) {
@@ -2634,9 +2758,6 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             return fetch(`/api/history?symbol=${currentSymbol}&timeframe=${timeframe}&metric=${metric}&day_range=${dayRange}&chart_type=history`, { signal: histAbortCtrl.signal })
                 .then(res => res.json())
                 .then(data => {
-                    if (isManualChange) {
-                        resetChartZoom('history');
-                    }
                     if (data.error || !(data.history && data.history.length)) {
                         if (isManualChange || !hasHistoryData) {
                             historyChartObj._dateColors = [];
@@ -2644,8 +2765,9 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                             historyChartObj._hoverTimes = [];
                             historyChartObj.data.labels = [data.error || "No data found in Google Sheet."];
                             historyChartObj.data.datasets = [{ label: 'Status', data: [0], borderColor: '#ef4444' }];
-                            applyCategoryZoomLimits(historyChartObj, 1);
+                            preserveZoomWindowAfterReload('history', 1, true);
                             historyChartObj.update('none');
+                            updateZoomControlsUI('history');
                         }
                         return;
                     }
@@ -2695,10 +2817,10 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                         datasets.push({ label: `${cfg.r2} Trend`, data: computeLinearTrend(peVals), borderColor: '#4ade80', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, yAxisID: 'y' });
                     }
                     historyChartObj.data.labels = times;
-                    applyCategoryZoomLimits(historyChartObj, times.length);
+                    preserveZoomWindowAfterReload('history', times.length, isManualChange);
                     historyChartObj.data.datasets = datasets;
                     historyChartObj.update('none');
-                    updateZoomBadge(historyChartObj);
+                    updateZoomControlsUI('history');
                 })
                 .catch(err => { if (err.name !== 'AbortError') console.error("Historical chart error:", err); });
         }
@@ -2711,7 +2833,8 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                     const meta = chart.getDatasetMeta(0);
                     if (meta && meta.data[index]) {
                         const x = meta.data[index].x;
-                        const { top, bottom } = chart.scales.y;
+                        const { top, bottom, left, right } = chart.chartArea || chart.scales.y;
+                        if (x < left || x > right) return;
                         const ctx = chart.ctx;
                         ctx.save();
                         ctx.beginPath();
@@ -2798,6 +2921,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                 },
                 plugins: [spotLinePlugin, hoverCrosshairPlugin]
             });
+            bindCanvasDragAndWheel('analysisChart', 'analysis');
         }
 
         function updateChartMetric() {
@@ -2816,11 +2940,13 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 
             document.getElementById("chartHeaderTitle").innerText = metricTitle;
             myChart.data.labels = strikes;
+            preserveZoomWindowAfterReload('analysis', strikes.length, false);
             myChart.data.datasets[0].label = peLabel; myChart.data.datasets[0].data = peData;
             myChart.data.datasets[1].label = ceLabel; myChart.data.datasets[1].data = ceData;
             myChart.data.datasets[2].label = `${peLabel} Trend`; myChart.data.datasets[2].data = computeLinearTrend(peData);
             myChart.data.datasets[3].label = `${ceLabel} Trend`; myChart.data.datasets[3].data = computeLinearTrend(ceData);
             myChart.update('none');
+            updateZoomControlsUI('analysis');
 
             const count = rawRows.length || 1;
             const peSum = peData.reduce((a, b) => a + Math.abs(b), 0);
@@ -2877,7 +3003,6 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
     </script>
 </body>
 </html>"""
-
 # --- PASSWORD LOGIN TEMPLATE FOR /positions ---
 POSITIONS_LOGIN_HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
