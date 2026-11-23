@@ -11,9 +11,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from requests.adapters import HTTPAdapter
 import pyotp
-from flask import Flask, render_template_string, request, Response, jsonify
+from flask import Flask, render_template_string, request, Response, jsonify, redirect
 
 app = Flask(__name__)
+app.url_map.strict_slashes = False
 
 # --- ENVIRONMENT CONFIGURATION ---
 CLIENT_ID = os.getenv("UPSTOX_CLIENT_ID")
@@ -92,7 +93,7 @@ def get_upstox_proxies():
         return {"http": clean, "https": clean}
     return None
 
-# --- SESSION MANAGEMENT ---
+# --- SESSION & OAUTH MANAGEMENT ---
 def load_session_token():
     try:
         if os.path.exists(SESSION_FILE_PATH):
@@ -119,6 +120,37 @@ def invalidate_session():
             os.remove(SESSION_FILE_PATH)
         except Exception:
             pass
+
+def exchange_oauth_code(auth_code):
+    if not auth_code or not CLIENT_ID or not CLIENT_SECRET:
+        return None
+    try:
+        res = HTTP_SESSION.post(
+            "https://api.upstox.com/v2/login/authorization/token",
+            data={
+                "code": str(auth_code).strip(),
+                "client_id": str(CLIENT_ID).strip(),
+                "client_secret": str(CLIENT_SECRET).strip(),
+                "redirect_uri": str(REDIRECT_URI).strip(),
+                "grant_type": "authorization_code"
+            },
+            headers={
+                "accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            proxies=get_upstox_proxies(),
+            timeout=10
+        )
+        if res.status_code == 200:
+            jd = res.json()
+            token = jd.get("access_token") or jd.get("data", {}).get("access_token")
+            if token:
+                save_session_token(token)
+                AUTH_COOLDOWN["last_failure_time"] = 0
+                return token
+    except Exception:
+        pass
+    return None
 
 def perform_single_auth(force_refresh=False):
     with AUTH_THREAD_LOCK:
@@ -1200,7 +1232,6 @@ def sync_completed_exit_cooldowns(orders, state):
             is_exit = prev_qty < 0
             new_qty = prev_qty + qty
         else:  # SELL
-            # Closing a long position (prev_qty > 0) or exiting an overnight long position (prev_qty == 0)
             is_exit = prev_qty >= 0
             new_qty = prev_qty - qty
         net_qty_by_symbol[ts] = new_qty
@@ -1931,9 +1962,10 @@ MAIN_HTML_TEMPLATE = """<!DOCTYPE html>
         .metric-card { background: #f8f9fa; padding: 10px 16px; border-radius: 6px; border-left: 4px solid #007bff; }
         .pcr-bullish { border-left-color: #28a745; color: #1e7e34; }
         .pcr-bearish { border-left-color: #dc3545; color: #bd2130; }
-        .btn { display: inline-block; padding: 8px 16px; color: #fff; background-color: #007bff; text-decoration: none; border-radius: 4px; margin-right: 10px; font-weight: 500; }
+        .btn { display: inline-block; padding: 8px 16px; color: #fff; background-color: #007bff; text-decoration: none; border-radius: 4px; margin-right: 6px; font-weight: 600; }
         .btn-success { background-color: #28a745; }
         .btn-purple { background-color: #6f42c1; }
+        .btn-dark { background-color: #0f172a; }
         select { padding: 8px 12px; font-size: 14px; border-radius: 4px; border: 1px solid #ced4da; outline: none; font-weight: 600; }
         .table-container { overflow-x: auto; background: #fff; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.06); }
         table { width: 100%; border-collapse: collapse; min-width: 1300px; }
@@ -1964,7 +1996,7 @@ MAIN_HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="metric-card"><strong>Total Put OI:</strong> {{ "{:,}".format(total_pe_oi) }}</div>
             <div class="metric-card"><strong>Last Updated (IST):</strong> {{ updated }}</div>
         </div>
-        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+        <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
             <a href="/?symbol=NIFTY&expiry={{ expiry }}" class="btn">View NIFTY</a>
             <a href="/?symbol=BANKNIFTY&expiry={{ expiry }}" class="btn">View BANKNIFTY</a>
             <form method="GET" action="/" style="display: inline-flex; align-items: center; gap: 6px; margin: 0;">
@@ -1975,8 +2007,9 @@ MAIN_HTML_TEMPLATE = """<!DOCTYPE html>
                     {% for exp in expiries %}<option value="{{ exp }}" {% if exp == expiry %}selected{% endif %}>{{ exp }}</option>{% endfor %}
                 </select>
             </form>
-            <a href="/analysis?symbol={{ symbol }}&expiry={{ expiry }}" class="btn btn-purple">📊 Open Analysis Dashboard</a>
-            <a href="/download?symbol={{ symbol }}&expiry={{ expiry }}" class="btn btn-success">Download Full CSV</a>
+            <a href="/analysis?symbol={{ symbol }}&expiry={{ expiry }}" class="btn btn-purple">📊 Analysis Dashboard</a>
+            <a href="/positions" class="btn btn-dark">🔐 Live Positions & Auto-Trade</a>
+            <a href="/download?symbol={{ symbol }}&expiry={{ expiry }}" class="btn btn-success">Download CSV</a>
         </div>
     </div>
     {% if error %}<div class="error-msg">Error: {{ error }}</div>{% else %}
@@ -2018,8 +2051,9 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         h2 { color: #38bdf8; margin-bottom: 5px; }
         .subtitle { color: #94a3b8; font-size: 14px; margin-bottom: 20px; }
         .nav-bar { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; align-items: center; background: #1e293b; padding: 15px; border-radius: 10px; }
-        .btn { padding: 9px 18px; color: #fff; background-color: #3b82f6; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 14px; border: none; cursor: pointer; }
+        .btn { padding: 9px 16px; color: #fff; background-color: #3b82f6; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 13px; border: none; cursor: pointer; }
         .btn-table { background-color: #64748b; }
+        .btn-live { background-color: #10b981; color: #052e16; font-weight: 800; }
         .btn-dl { background-color: #10b981; font-size: 12px; padding: 6px 12px; text-decoration: none; color: #fff; border-radius: 6px; font-weight: bold; }
         .zoom-toolbar { display: inline-flex; align-items: center; gap: 6px; background: #0f172a; padding: 4px 8px; border-radius: 8px; border: 1px solid #334155; }
         .btn-zoom { background-color: #334155; color: #f8fafc; border: 1px solid #475569; padding: 5px 10px; border-radius: 5px; font-size: 12px; font-weight: 700; cursor: pointer; transition: background-color 0.15s; }
@@ -2055,13 +2089,13 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             <option value="BANKNIFTY" {% if symbol == 'BANKNIFTY' %}selected{% endif %}>BANK NIFTY</option>
         </select>
 
-        <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Expiry:</label>
+        <label style="color: #94a3b8; font-weight: bold; margin-left: 6px;">Expiry:</label>
         <select id="expirySelector" onchange="switchExpiry(this.value)">
             <option value="ALL" {% if expiry == 'ALL EXPIRIES (CONSOLIDATED)' or expiry == 'ALL' or not expiry %}selected{% endif %}>★ ALL EXPIRIES (CONSOLIDATED)</option>
             {% for exp in expiries %}<option value="{{ exp }}" {% if exp == expiry %}selected{% endif %}>{{ exp }}</option>{% endfor %}
         </select>
 
-        <label style="color: #94a3b8; font-weight: bold; margin-left: 10px;">Bar Chart Metric:</label>
+        <label style="color: #94a3b8; font-weight: bold; margin-left: 6px;">Bar Chart Metric:</label>
         <select id="metricSelector" onchange="updateChartMetric()">
             <option value="oi_chg" selected>Change in Open Interest (Chg in OI)</option>
             <option value="depth_qty">1 - Order Book Depth Quantity (Put Bid Qty vs Call Ask Qty)</option>
@@ -2071,9 +2105,10 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             <option value="theta">Theta Time Decay</option>
         </select>
 
-        <div style="margin-left: auto; display: flex; align-items: center; gap: 12px;">
+        <div style="margin-left: auto; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
             <span class="timer-badge" id="syncBadge">Auto Sync: <span id="countdown">10</span>s</span>
-            <a href="/?symbol={{ symbol }}&expiry={{ expiry }}" class="btn btn-table">📋 Back to Table View</a>
+            <a href="/?symbol={{ symbol }}&expiry={{ expiry }}" class="btn btn-table">📋 Option Chain</a>
+            <a href="/positions" class="btn btn-live">🔐 Live Positions</a>
         </div>
     </div>
 
@@ -2880,6 +2915,8 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #0b1329; color: #f8fafc; }
         h2 { color: #38bdf8; margin-bottom: 5px; }
         .subtitle { color: #94a3b8; font-size: 13px; margin-bottom: 18px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+        .nav-link-btn { background: #1e293b; border: 1px solid #334155; color: #38bdf8; padding: 5px 12px; border-radius: 6px; font-size: 12px; font-weight: 700; text-decoration: none; }
+        .nav-link-btn:hover { background: #334155; }
         .timer-badge { background: #0284c7; color: #ffffff; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
         .latency-badge { background: #0f172a; border: 1px solid #334155; color: #34d399; padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: 700; font-family: monospace; }
         .static-ip-bar { background: #131c31; border: 1px solid #334155; border-radius: 10px; padding: 12px 18px; margin-bottom: 14px; display: none; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
@@ -2943,7 +2980,9 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
     <h2>🔐 Private Live Trade & Positions Dashboard</h2>
     <div class="subtitle">
         <span>High-Speed Parallel Upstox Engine (B7 Signal Exit, B8 3:20 PM Exit, Edit Open Orders & Dynamic SL/Target)</span>
-        <div style="display: flex; align-items: center; gap: 8px;">
+        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <a href="/" class="nav-link-btn">📋 Option Chain</a>
+            <a href="/analysis" class="nav-link-btn">📊 Analytics</a>
             <span class="latency-badge" id="latencyBadge">Upstox: -ms | Sheet: -ms</span>
             <span class="timer-badge" id="syncBadge">Fast Sync: <span id="countdown">3</span>s</span>
         </div>
@@ -3417,10 +3456,40 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>"""
 
-# --- ROUTES ---
+# --- ROUTES & ALIASES ---
 @app.route("/health")
+@app.route("/healthz")
 def health():
     return "OK", 200
+
+@app.route("/favicon.ico")
+def favicon():
+    return "", 204
+
+@app.route("/callback")
+@app.route("/auth/callback")
+@app.route("/upstox/callback")
+def oauth_callback():
+    code = request.args.get("code", "").strip()
+    if code:
+        tok = exchange_oauth_code(code)
+        if tok:
+            return redirect("/positions")
+    return redirect("/")
+
+@app.route("/login")
+def oauth_login():
+    if all([CLIENT_ID, USER_ID, PIN, TOTP_KEY]):
+        perform_single_auth(force_refresh=True)
+        return redirect("/positions")
+    if CLIENT_ID:
+        auth_url = (
+            "https://api.upstox.com/v2/login/authorization/dialog"
+            f"?response_type=code&client_id={urllib.parse.quote(str(CLIENT_ID).strip())}"
+            f"&redirect_uri={urllib.parse.quote(str(REDIRECT_URI).strip())}"
+        )
+        return redirect(auth_url)
+    return redirect("/")
 
 @app.route("/api/diagnostics")
 def api_diagnostics():
@@ -3754,11 +3823,28 @@ def api_positions():
     return resp
 
 @app.route("/positions")
+@app.route("/position")
+@app.route("/dashboard")
+@app.route("/live")
+@app.route("/trades")
+@app.route("/orders")
+@app.route("/portfolio")
+@app.route("/pnl")
 def positions_dashboard():
     return render_template_string(POSITIONS_HTML_TEMPLATE)
 
 @app.route("/")
+@app.route("/index")
+@app.route("/home")
+@app.route("/chain")
+@app.route("/option-chain")
+@app.route("/optionchain")
 def index():
+    auth_code = request.args.get("code", "").strip()
+    if auth_code:
+        exchange_oauth_code(auth_code)
+        return redirect("/")
+
     symbol = request.args.get("symbol", "NIFTY").upper()
     if symbol not in INSTRUMENT_KEYS:
         symbol = "NIFTY"
@@ -3780,6 +3866,9 @@ def index():
     )
 
 @app.route("/analysis")
+@app.route("/analytics")
+@app.route("/chart")
+@app.route("/charts")
 def analysis():
     symbol = request.args.get("symbol", "NIFTY").upper()
     if symbol not in INSTRUMENT_KEYS:
@@ -3820,95 +3909,118 @@ def api_history():
     timeframe = request.args.get("timeframe", "5minute")
     day_range = request.args.get("day_range", "1day")
     chart_type = request.args.get("chart_type", "history")
-    sheet_name = request.args.get("sheet", None)
+    sheet_name = request.args.get("sheet")
 
-    snapshots, error = fetch_history_from_gsheet(symbol, sheet_name)
-    if error:
-        return jsonify({"symbol": symbol, "history": [], "error": error})
-    if not snapshots:
-        return jsonify({"symbol": symbol, "history": [], "error": f"No historical snapshots found in Google Sheet for {symbol}."})
+    snapshots, err = fetch_history_from_gsheet(symbol, sheet_name=sheet_name)
+    if err or not snapshots:
+        return jsonify({"symbol": symbol, "history": [], "error": err or f"No rows available for {symbol}."})
 
-    range_days_map = {"1day": 1, "3day": 3, "1week": 7, "2week": 14, "1month": 30, "3month": 90}
-    target_days = range_days_map.get(day_range, 1)
+    day_map = {"1day": 1, "3day": 3, "1week": 7, "2week": 14, "1month": 30, "3month": 90}
+    days_count = day_map.get(day_range, 1)
 
     unique_dates = []
     seen_dates = set()
     for s in snapshots:
-        d = s.get("date_str") or (s["datetime"].split(" ")[0] if " " in s.get("datetime", "") else "")
+        d = s.get("date_str", "")
         if d and d not in seen_dates:
             seen_dates.add(d)
             unique_dates.append(d)
 
     if unique_dates:
-        allowed_dates = set(unique_dates[-target_days:])
-        filtered_by_days = [
-            s for s in snapshots
-            if (s.get("date_str") or (s["datetime"].split(" ")[0] if " " in s.get("datetime", "") else "")) in allowed_dates
-        ]
+        allowed_dates = set(unique_dates[-days_count:])
+        filtered = [s for s in snapshots if s.get("date_str", "") in allowed_dates]
     else:
-        max_pts = target_days * 375
-        filtered_by_days = snapshots[-max_pts:]
+        filtered = snapshots[-days_count * 78:]
 
-    tf_minutes_map = {"1minute": 1, "5minute": 5, "15minute": 15, "30minute": 30, "60minute": 60, "day": 1440}
-    step_mins = tf_minutes_map.get(timeframe, 5)
-    bucket_sec = step_mins * 60
+    interval_minutes = {"5minute": 5, "15minute": 15, "30minute": 30, "60minute": 60, "day": 1440}.get(timeframe, 5)
 
-    if step_mins <= 1:
-        sampled = filtered_by_days
-    else:
-        sampled = []
-        last_bucket = None
-        for s in filtered_by_days:
+    def normalize_sig(val):
+        v = str(val or "").strip().upper()
+        return v if v in ("B", "BE", "S", "SE") else ""
+
+    if interval_minutes > 5 and len(filtered) > 1:
+        resampled = []
+        bucket = []
+        bucket_start_ts = None
+        step_sec = interval_minutes * 60
+
+        def flush_bucket(b_list):
+            last_item = dict(b_list[-1])
+            found_sig = ""
+            found_sig_5m = ""
+            found_sig_15m = ""
+            found_sig_30m = ""
+            found_sig_1h = ""
+            for item in reversed(b_list):
+                if not found_sig:
+                    s_val = normalize_sig(item.get("new_signal", ""))
+                    if s_val:
+                        found_sig = s_val
+                if not found_sig_5m:
+                    s_val = normalize_sig(item.get("signal_5m", ""))
+                    if s_val:
+                        found_sig_5m = s_val
+                if not found_sig_15m:
+                    s_val = normalize_sig(item.get("signal_15m", ""))
+                    if s_val:
+                        found_sig_15m = s_val
+                if not found_sig_30m:
+                    s_val = normalize_sig(item.get("signal_30m", ""))
+                    if s_val:
+                        found_sig_30m = s_val
+                if not found_sig_1h:
+                    s_val = normalize_sig(item.get("signal_1h", ""))
+                    if s_val:
+                        found_sig_1h = s_val
+            last_item["new_signal"] = found_sig
+            last_item["signal_5m"] = found_sig_5m
+            last_item["signal_15m"] = found_sig_15m
+            last_item["signal_30m"] = found_sig_30m
+            last_item["signal_1h"] = found_sig_1h
+            return last_item
+
+        for s in filtered:
             ts = s.get("timestamp", 0)
-            if ts > 0:
-                b_id = ts // bucket_sec
-                if b_id != last_bucket:
-                    sampled.append(s)
-                    last_bucket = b_id
-                else:
-                    prev = sampled[-1]
-                    for sig_k in ("new_signal", "signal_5m", "signal_15m", "signal_30m", "signal_1h"):
-                        if s.get(sig_k) in ("B", "BE", "S", "SE"):
-                            prev[sig_k] = s[sig_k]
+            if ts == 0:
+                resampled.append(s)
+                continue
+            if bucket_start_ts is None:
+                bucket_start_ts = ts
+                bucket = [s]
+            elif (ts - bucket_start_ts) < step_sec and s.get("date_str") == bucket[0].get("date_str"):
+                bucket.append(s)
             else:
-                sampled.append(s)
+                resampled.append(flush_bucket(bucket))
+                bucket_start_ts = ts
+                bucket = [s]
+        if bucket:
+            resampled.append(flush_bucket(bucket))
+        filtered = resampled
 
-    if chart_type == "signal":
-        for s in sampled:
-            s["sig"] = s.get("new_signal", "")
-    else:
-        tf_sig_key = {
-            "5minute": "signal_5m",
-            "15minute": "signal_15m",
-            "30minute": "signal_30m",
-            "60minute": "signal_1h",
-            "day": "signal_1h"
-        }.get(timeframe, "signal_5m")
-        for s in sampled:
-            s["sig"] = s.get(tf_sig_key, "")
-
-    return jsonify({"symbol": symbol, "history": sampled, "error": None})
+    max_points = 800 if chart_type == "signal" else 900
+    if len(filtered) > max_points:
+        filtered = filtered[-max_points:]
+    return jsonify({"symbol": symbol, "history": filtered, "error": None})
 
 @app.route("/download_history")
 def download_history():
     symbol = request.args.get("symbol", "NIFTY").upper()
     if symbol not in INSTRUMENT_KEYS:
         symbol = "NIFTY"
-    snapshots, _ = fetch_history_from_gsheet(symbol)
+    snapshots, _ = fetch_history_from_gsheet(symbol, sheet_name=request.args.get("sheet"))
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
         "Time", "Symbol", "Price LTP", "ATM Strike", "PCR", "CE OI", "PE OI",
-        "CE Chg in OI", "PE Chg in OI", "CE Vol", "PE Vol", "CE IV", "PE IV",
+        "CE Chng OI", "PE Chng OI", "CE Vol", "PE Vol", "CE IV", "PE IV",
         "CE Delta", "PE Delta", "CE Theta", "PE Theta", "CE Vega", "PE Vega",
         "CE Gamma", "PE Gamma", "CE Bid", "PE Bid", "CE Ask", "PE Ask",
         "CE LTP", "PE LTP", "Min ROC (Buy)", "Max ROC (Sell)", "Cross ROC Sig",
-        "Main Volatility", "New Signal", "5 Min Signal", "15 Min Signal",
-        "30 Min Signal", "1 HR Signal"
+        "Main Volatility", "New Signal", "5 Min Signal", "15 Min Signal", "30 Min Signal", "1 HR Signal"
     ])
     for s in snapshots:
         writer.writerow([
-            s.get("datetime", ""), s.get("symbol", ""), s.get("spot_price", 0), s.get("atm_strike", 0), s.get("pcr", 0),
+            s.get("datetime", ""), s.get("symbol", symbol), s.get("spot_price", 0), s.get("atm_strike", 0), s.get("pcr", 0),
             s.get("ce_oi", 0), s.get("pe_oi", 0), s.get("ce_oi_chg", 0), s.get("pe_oi_chg", 0),
             s.get("ce_vol", 0), s.get("pe_vol", 0), s.get("ce_iv", 0), s.get("pe_iv", 0),
             s.get("ce_delta", 0), s.get("pe_delta", 0), s.get("ce_theta", 0), s.get("pe_theta", 0),
@@ -3921,7 +4033,7 @@ def download_history():
     return Response(
         output.getvalue(),
         mimetype="text/csv",
-        headers={"Content-Disposition": f"attachment;filename={symbol}_Historical_GoogleSheet_Data.csv"}
+        headers={"Content-Disposition": f"attachment;filename={symbol}_history_report.csv"}
     )
 
 @app.route("/download")
@@ -3930,26 +4042,25 @@ def download_csv():
     if symbol not in INSTRUMENT_KEYS:
         symbol = "NIFTY"
     selected_expiry = request.args.get("expiry", "ALL")
-    rows, spot_price, atm_strike, expiry, expiries, updated, pcr, t_ce, t_pe, error = process_option_data(symbol, selected_expiry)
+    rows, spot_price, atm_strike, expiry, _, updated, pcr, _, _, _ = process_option_data(symbol, selected_expiry)
     output = io.StringIO()
     writer = csv.writer(output)
+    writer.writerow(["Symbol", symbol, "Spot Price", spot_price, "ATM Strike", atm_strike, "Expiry", expiry, "PCR", pcr, "Updated", updated])
     writer.writerow([
-        "Symbol", "Expiry", "Spot Price", "ATM Strike", "PCR", "Total Call OI", "Total Put OI",
-        "CE OI", "CE Chg in OI", "CE Vol", "CE IV", "CE Delta", "CE Theta", "CE Vega", "CE Gamma",
-        "CE Bid", "CE Ask", "CE LTP", "Strike Price", "PE LTP", "PE Bid", "PE Ask",
-        "PE Delta", "PE Theta", "PE Vega", "PE Gamma", "PE IV", "PE Vol", "PE Chg in OI", "PE OI", "Last Updated (IST)"
+        "CE OI", "CE Chg OI", "CE Vol", "CE IV", "CE Delta", "CE Theta", "CE Vega", "CE Gamma", "CE Bid", "CE Ask", "CE LTP",
+        "Strike Price",
+        "PE LTP", "PE Bid", "PE Ask", "PE Delta", "PE Theta", "PE Vega", "PE Gamma", "PE IV", "PE Vol", "PE Chg OI", "PE OI"
     ])
     for r in rows:
         writer.writerow([
-            symbol, expiry, spot_price, atm_strike, pcr, t_ce, t_pe,
-            r["ce_oi"], r["ce_oi_chg"], r["ce_vol"], r["ce_iv"], r["ce_delta"], r["ce_theta"], r["ce_vega"], r["ce_gamma"],
-            r["ce_bid"], r["ce_ask"], r["ce_ltp"], r["strike"], r["pe_ltp"], r["pe_bid"], r["pe_ask"],
-            r["pe_delta"], r["pe_theta"], r["pe_vega"], r["pe_gamma"], r["pe_iv"], r["pe_vol"], r["pe_oi_chg"], r["pe_oi"], updated
+            r["ce_oi"], r["ce_oi_chg"], r["ce_vol"], r["ce_iv"], r["ce_delta"], r["ce_theta"], r["ce_vega"], r["ce_gamma"], r["ce_bid"], r["ce_ask"], r["ce_ltp"],
+            r["strike"],
+            r["pe_ltp"], r["pe_bid"], r["pe_ask"], r["pe_delta"], r["pe_theta"], r["pe_vega"], r["pe_gamma"], r["pe_iv"], r["pe_vol"], r["pe_oi_chg"], r["pe_oi"]
         ])
     return Response(
         output.getvalue(),
         mimetype="text/csv",
-        headers={"Content-Disposition": f"attachment;filename={symbol}_{expiry}_Pro_Option_Chain.csv"}
+        headers={"Content-Disposition": f"attachment;filename={symbol}_{expiry}_option_chain.csv"}
     )
 
 if __name__ == "__main__":
