@@ -1771,7 +1771,8 @@ def process_option_data(symbol, selected_expiry="ALL"):
     spot_price = chain_data[0].get("underlying_spot_price", 0) if chain_data else 0
     step = 100 if symbol == "BANKNIFTY" else 50
     atm_strike = round(spot_price / step) * step if step > 0 else spot_price
-    min_s, max_s = atm_strike - (12 * step), atm_strike + (12 * step)
+    # 25 strikes up & 25 strikes down from Spot ATM Strike (51 strikes total)
+    min_s, max_s = atm_strike - (25 * step), atm_strike + (25 * step)
     strike_map = {}
 
     for item in chain_data:
@@ -1894,7 +1895,7 @@ MAIN_HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="table-container">
         <table>
             <thead>
-                <tr><th colspan="11" class="ce-header">CALL OPTIONS (CE)</th><th>STRIKE</th><th colspan="11" class="pe-header">PUT OPTIONS (PE)</th></tr>
+                <tr><th colspan="11" class="ce-header">CALL OPTIONS (CE)</th><th>STRIKE (25 UP / 25 DOWN)</th><th colspan="11" class="pe-header">PUT OPTIONS (PE)</th></tr>
                 <tr><th>OI</th><th>Chg in OI</th><th>Vol</th><th>IV</th><th>Delta</th><th>Theta</th><th>Vega</th><th>Gamma</th><th>Bid</th><th>Ask</th><th>LTP</th><th>Price</th><th>LTP</th><th>Bid</th><th>Ask</th><th>Delta</th><th>Theta</th><th>Vega</th><th>Gamma</th><th>IV</th><th>Vol</th><th>Chg in OI</th><th>OI</th></tr>
             </thead>
             <tbody>
@@ -1916,7 +1917,7 @@ MAIN_HTML_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>"""
 
-# --- ANALYSIS DASHBOARD TEMPLATE (FREEZABLE ZOOM + / - ON CHART 2 & 3) ---
+# --- ANALYSIS DASHBOARD TEMPLATE (FREEZABLE ZOOM + SMOOTH LEFT/RIGHT DRAG PANNING) ---
 ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
@@ -1956,11 +1957,12 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         .timer-badge { background: #0284c7; color: #ffffff; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
         .error-msg { color: #f87171; font-weight: bold; padding: 15px; background: #450a0a; border-radius: 8px; }
         .canvas-wrap { position: relative; height: 420px; width: 100%; }
+        .canvas-wrap canvas { touch-action: pan-y; user-select: none; }
     </style>
 </head>
 <body>
     <h2>📊 {{ symbol }} Advanced Analytics & Google Sheet Memory Dashboard</h2>
-    <div class="subtitle">High-speed parallel auto-sync — Click "🔒 Zoom: Frozen" to unrelease Zoom + / − controls on Chart 2 or Chart 3</div>
+    <div class="subtitle">High-speed parallel auto-sync — Click "🔒 Zoom: Frozen" to unrelease Zoom + / − and Left ↔ Right Drag Panning</div>
 
     <div class="nav-bar">
         <label style="color: #94a3b8; font-weight: bold;">Symbol:</label>
@@ -2026,8 +2028,8 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             <span class="chart-title">2 - 📈 Historical Snapshot Trend (Google Sheet Memory — B / BE / S / SE Signals)</span>
             <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
                 <div class="zoom-toolbar">
-                    <button type="button" id="histZoomLockBtn" class="btn-zoom-lock" onclick="toggleZoomFreeze('history')" title="Click to Unrelease or Freeze Zoom Controls">🔒 Zoom: Frozen</button>
-                    <button type="button" id="histDragModeBtn" class="btn-zoom" onclick="toggleChartDragMode('history')" title="Switch between Drag-to-Zoom Area and Drag-to-Pan" disabled>🔍 Drag: Zoom</button>
+                    <button type="button" id="histZoomLockBtn" class="btn-zoom-lock" onclick="toggleZoomFreeze('history')" title="Click to Unrelease or Freeze Zoom & Drag Pan Controls">🔒 Zoom: Frozen</button>
+                    <button type="button" id="histDragModeBtn" class="btn-zoom" onclick="toggleChartDragMode('history')" title="Switch between Drag Left/Right Pan and Area Zoom" style="background-color: #0284c7;" disabled>✋ Drag: Pan</button>
                     <button type="button" id="histZoomInBtn" class="btn-zoom" onclick="stepChartZoom('history', 1.35)" title="Zoom In (Unrelease Zoom first)" disabled>+</button>
                     <button type="button" id="histZoomOutBtn" class="btn-zoom" onclick="stepChartZoom('history', 0.74)" title="Zoom Out (Unrelease Zoom first)" disabled>−</button>
                     <button type="button" id="histResetZoomBtn" class="btn-zoom-reset" onclick="resetChartZoom('history')" title="Reset Zoom">🔄 Reset Zoom</button>
@@ -2059,7 +2061,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                 <a id="downloadHistoryBtn" href="/download_history?symbol={{ symbol }}" class="btn-dl">📥 CSV</a>
             </div>
         </div>
-        <div class="zoom-hint" id="histZoomHint">🔒 <strong>Zoom is Frozen:</strong> Click <strong>"🔒 Zoom: Frozen"</strong> to unrelease <strong>+</strong> / <strong>−</strong>, drag-to-zoom, and scroll-wheel zoom.</div>
+        <div class="zoom-hint" id="histZoomHint">🔒 <strong>Zoom is Frozen:</strong> Click <strong>"🔒 Zoom: Frozen"</strong> to unrelease <strong>+</strong> / <strong>−</strong> zoom and <strong>Left ↔ Right</strong> drag panning.</div>
         <div class="canvas-wrap">
             <canvas id="historyChart" ondblclick="resetChartZoom('history')"></canvas>
         </div>
@@ -2070,8 +2072,8 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             <span class="chart-title">3 - 🚀 Main Signal (B / BE / S / SE)</span>
             <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
                 <div class="zoom-toolbar">
-                    <button type="button" id="sigZoomLockBtn" class="btn-zoom-lock" onclick="toggleZoomFreeze('signal')" title="Click to Unrelease or Freeze Zoom Controls">🔒 Zoom: Frozen</button>
-                    <button type="button" id="sigDragModeBtn" class="btn-zoom" onclick="toggleChartDragMode('signal')" title="Switch between Drag-to-Zoom Area and Drag-to-Pan" disabled>🔍 Drag: Zoom</button>
+                    <button type="button" id="sigZoomLockBtn" class="btn-zoom-lock" onclick="toggleZoomFreeze('signal')" title="Click to Unrelease or Freeze Zoom & Drag Pan Controls">🔒 Zoom: Frozen</button>
+                    <button type="button" id="sigDragModeBtn" class="btn-zoom" onclick="toggleChartDragMode('signal')" title="Switch between Drag Left/Right Pan and Area Zoom" style="background-color: #0284c7;" disabled>✋ Drag: Pan</button>
                     <button type="button" id="sigZoomInBtn" class="btn-zoom" onclick="stepChartZoom('signal', 1.35)" title="Zoom In (Unrelease Zoom first)" disabled>+</button>
                     <button type="button" id="sigZoomOutBtn" class="btn-zoom" onclick="stepChartZoom('signal', 0.74)" title="Zoom Out (Unrelease Zoom first)" disabled>−</button>
                     <button type="button" id="sigResetZoomBtn" class="btn-zoom-reset" onclick="resetChartZoom('signal')" title="Reset Zoom">🔄 Reset Zoom</button>
@@ -2087,7 +2089,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                 </select>
             </div>
         </div>
-        <div class="zoom-hint" id="sigZoomHint">🔒 <strong>Zoom is Frozen:</strong> Click <strong>"🔒 Zoom: Frozen"</strong> to unrelease <strong>+</strong> / <strong>−</strong>, drag-to-zoom, and scroll-wheel zoom.</div>
+        <div class="zoom-hint" id="sigZoomHint">🔒 <strong>Zoom is Frozen:</strong> Click <strong>"🔒 Zoom: Frozen"</strong> to unrelease <strong>+</strong> / <strong>−</strong> zoom and <strong>Left ↔ Right</strong> drag panning.</div>
         <div class="canvas-wrap">
             <canvas id="signalChart" ondblclick="resetChartZoom('signal')"></canvas>
         </div>
@@ -2102,19 +2104,54 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         let hasHistoryData = false, hasSignalData = false;
         let histAbortCtrl = null, sigAbortCtrl = null, dataAbortCtrl = null;
 
-        // Zoom starts FROZEN (true) until user clicks "Zoom: Frozen" to unrelease it
+        // Zoom starts FROZEN (true) until user clicks "Zoom: Frozen" to unrelease it.
+        // Once released, dragAreaZoomState is false by default so dragging Left <-> Right moves/pans immediately!
         const zoomFrozenState = { history: true, signal: true };
-        const dragPanState = { history: false, signal: false };
+        const dragAreaZoomState = { history: false, signal: false };
 
         const DATE_PALETTE = ['#38bdf8', '#facc15', '#4ade80', '#f472b6', '#a78bfa', '#fb923c', '#2dd4bf'];
 
+        function getChartKey(chart) {
+            if (chart === historyChartObj) return 'history';
+            if (chart === signalChartObj) return 'signal';
+            return null;
+        }
+
+        function setDragModeUI(chartKey, isAreaZoom) {
+            const chart = chartKey === 'history' ? historyChartObj : signalChartObj;
+            const btn = document.getElementById(chartKey === 'history' ? 'histDragModeBtn' : 'sigDragModeBtn');
+            const canvas = document.getElementById(chartKey === 'history' ? 'historyChart' : 'signalChart');
+            dragAreaZoomState[chartKey] = isAreaZoom;
+
+            if (isAreaZoom) {
+                btn.innerText = '🔍 Drag: Area Zoom';
+                btn.style.backgroundColor = '#334155';
+                if (canvas) canvas.style.cursor = zoomFrozenState[chartKey] ? 'default' : 'crosshair';
+            } else {
+                btn.innerText = '✋ Drag: Pan';
+                btn.style.backgroundColor = '#0284c7';
+                if (canvas) canvas.style.cursor = zoomFrozenState[chartKey] ? 'default' : 'grab';
+            }
+
+            if (chart && chart.options && chart.options.plugins && chart.options.plugins.zoom) {
+                const frozen = zoomFrozenState[chartKey];
+                const z = chart.options.plugins.zoom;
+                z.pan.enabled = !frozen;
+                z.pan.modifierKey = (!frozen && isAreaZoom) ? 'shift' : null;
+                z.zoom.drag.enabled = (!frozen && isAreaZoom);
+                z.zoom.drag.modifierKey = (!frozen && !isAreaZoom) ? 'shift' : null;
+                chart.update('none');
+            }
+        }
+
         function updateZoomBadge(chart) {
-            if (!chart) return;
-            const btnId = chart === historyChartObj ? 'histResetZoomBtn' : (chart === signalChartObj ? 'sigResetZoomBtn' : null);
-            if (!btnId) return;
-            const btn = document.getElementById(btnId);
+            const chartKey = getChartKey(chart);
+            if (!chartKey) return;
+            const btn = document.getElementById(chartKey === 'history' ? 'histResetZoomBtn' : 'sigResetZoomBtn');
             if (!btn) return;
-            const zoomed = typeof chart.isZoomedOrPanned === 'function' ? chart.isZoomedOrPanned() : (chart.options.scales.x.min !== undefined || chart.options.scales.x.max !== undefined);
+            const zoomed = typeof chart.isZoomedOrPanned === 'function'
+                ? chart.isZoomedOrPanned()
+                : (chart.options.scales.x.min !== undefined || chart.options.scales.x.max !== undefined);
             if (zoomed) {
                 btn.classList.add('active-zoom');
             } else {
@@ -2125,12 +2162,13 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
         function buildInteractiveZoomOptions(isFrozen = true) {
             return {
                 limits: {
-                    x: { min: 'original', max: 'original', minRange: 4 }
+                    x: { min: 0, max: 10000, minRange: 3 }
                 },
                 pan: {
                     enabled: !isFrozen,
                     mode: 'x',
-                    modifierKey: 'shift',
+                    modifierKey: null,
+                    threshold: 2,
                     onPanComplete: ({ chart }) => updateZoomBadge(chart)
                 },
                 zoom: {
@@ -2142,15 +2180,31 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                         enabled: !isFrozen
                     },
                     drag: {
-                        enabled: !isFrozen,
+                        enabled: false,
+                        modifierKey: 'shift',
                         backgroundColor: 'rgba(56, 189, 248, 0.24)',
                         borderColor: '#38bdf8',
                         borderWidth: 1.5,
                         threshold: 6
                     },
                     mode: 'x',
-                    onZoomComplete: ({ chart }) => updateZoomBadge(chart)
+                    onZoomComplete: ({ chart }) => {
+                        updateZoomBadge(chart);
+                        const key = getChartKey(chart);
+                        // Automatically return to Left <-> Right Drag Pan mode right after zooming in
+                        if (key && !zoomFrozenState[key] && dragAreaZoomState[key]) {
+                            setDragModeUI(key, false);
+                        }
+                    }
                 }
+            };
+        }
+
+        function applyCategoryZoomLimits(chart, pointCount) {
+            if (!chart || !chart.options || !chart.options.plugins || !chart.options.plugins.zoom) return;
+            const maxIdx = Math.max(0, (pointCount || 1) - 1);
+            chart.options.plugins.zoom.limits = {
+                x: { min: 0, max: maxIdx, minRange: Math.min(3, maxIdx) }
             };
         }
 
@@ -2173,49 +2227,33 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
             if (frozen) {
                 lockBtn.innerText = '🔒 Zoom: Frozen';
                 lockBtn.classList.remove('unlocked');
-                hintEl.innerHTML = '🔒 <strong>Zoom is Frozen:</strong> Click <strong>"🔒 Zoom: Frozen"</strong> to unrelease <strong>+</strong> / <strong>−</strong>, drag-to-zoom, and scroll-wheel zoom.';
+                hintEl.innerHTML = '🔒 <strong>Zoom is Frozen:</strong> Click <strong>"🔒 Zoom: Frozen"</strong> to unrelease <strong>+</strong> / <strong>−</strong> zoom and <strong>Left ↔ Right</strong> drag panning.';
+                if (chart && chart.options && chart.options.plugins && chart.options.plugins.zoom) {
+                    const z = chart.options.plugins.zoom;
+                    z.zoom.wheel.enabled = false;
+                    z.zoom.pinch.enabled = false;
+                    z.zoom.drag.enabled = false;
+                    z.pan.enabled = false;
+                    chart.update('none');
+                }
+                const canvas = document.getElementById(isHist ? 'historyChart' : 'signalChart');
+                if (canvas) canvas.style.cursor = 'default';
             } else {
                 lockBtn.innerText = '🔓 Zoom: Released';
                 lockBtn.classList.add('unlocked');
-                hintEl.innerHTML = '🔓 <strong>Zoom Released:</strong> Use <strong>+</strong> / <strong>−</strong>, drag across any region to zoom, or scroll wheel • Click <strong>"🔓 Zoom: Released"</strong> to freeze again.';
-            }
-
-            if (chart && chart.options && chart.options.plugins && chart.options.plugins.zoom) {
-                const z = chart.options.plugins.zoom;
-                z.zoom.wheel.enabled = !frozen;
-                z.zoom.pinch.enabled = !frozen;
-                z.pan.enabled = !frozen;
-                if (frozen) {
-                    z.zoom.drag.enabled = false;
-                } else {
-                    const isPanMode = dragPanState[chartKey];
-                    z.zoom.drag.enabled = !isPanMode;
-                    z.pan.modifierKey = isPanMode ? null : 'shift';
+                hintEl.innerHTML = '🔓 <strong>Zoom Released:</strong> Use <strong>+</strong> / <strong>−</strong> or scroll wheel to zoom, then <strong>drag Left ↔ Right</strong> to pan across the chart (Shift+Drag for area zoom).';
+                if (chart && chart.options && chart.options.plugins && chart.options.plugins.zoom) {
+                    const z = chart.options.plugins.zoom;
+                    z.zoom.wheel.enabled = true;
+                    z.zoom.pinch.enabled = true;
                 }
-                chart.update('none');
+                setDragModeUI(chartKey, dragAreaZoomState[chartKey]);
             }
         }
 
         function toggleChartDragMode(chartKey) {
             if (zoomFrozenState[chartKey]) return;
-            const chart = chartKey === 'history' ? historyChartObj : signalChartObj;
-            const btn = document.getElementById(chartKey === 'history' ? 'histDragModeBtn' : 'sigDragModeBtn');
-            if (!chart || !chart.options.plugins.zoom) return;
-
-            dragPanState[chartKey] = !dragPanState[chartKey];
-            const isPanMode = dragPanState[chartKey];
-            if (isPanMode) {
-                chart.options.plugins.zoom.zoom.drag.enabled = false;
-                chart.options.plugins.zoom.pan.modifierKey = null;
-                btn.innerText = '✋ Drag: Pan';
-                btn.style.backgroundColor = '#0284c7';
-            } else {
-                chart.options.plugins.zoom.zoom.drag.enabled = true;
-                chart.options.plugins.zoom.pan.modifierKey = 'shift';
-                btn.innerText = '🔍 Drag: Zoom';
-                btn.style.backgroundColor = '#334155';
-            }
-            chart.update('none');
+            setDragModeUI(chartKey, !dragAreaZoomState[chartKey]);
         }
 
         function stepChartZoom(chartKey, factor) {
@@ -2517,6 +2555,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                             signalChartObj._hoverTimes = [];
                             signalChartObj.data.labels = [data.error || "No data found for Main Signal."];
                             signalChartObj.data.datasets = [{ label: 'Status', data: [0], borderColor: '#ef4444' }];
+                            applyCategoryZoomLimits(signalChartObj, 1);
                             signalChartObj.update('none');
                         }
                         return;
@@ -2530,6 +2569,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
 
                     const times = snapshots.map(s => s.formatted_time || s.datetime);
                     signalChartObj.data.labels = times;
+                    applyCategoryZoomLimits(signalChartObj, times.length);
                     signalChartObj.data.datasets = [
                         { label: 'Min ROC (Buy)', data: snapshots.map(s => s.min_roc || 0), borderColor: '#22c55e', borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: 0.2 },
                         { label: 'Max ROC (Sell)', data: snapshots.map(s => s.max_roc || 0), borderColor: '#ef4444', borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: 0.2 },
@@ -2604,6 +2644,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                             historyChartObj._hoverTimes = [];
                             historyChartObj.data.labels = [data.error || "No data found in Google Sheet."];
                             historyChartObj.data.datasets = [{ label: 'Status', data: [0], borderColor: '#ef4444' }];
+                            applyCategoryZoomLimits(historyChartObj, 1);
                             historyChartObj.update('none');
                         }
                         return;
@@ -2654,6 +2695,7 @@ ANALYSIS_HTML_TEMPLATE = """<!DOCTYPE html>
                         datasets.push({ label: `${cfg.r2} Trend`, data: computeLinearTrend(peVals), borderColor: '#4ade80', borderDash: [6, 4], borderWidth: 2, pointRadius: 0, yAxisID: 'y' });
                     }
                     historyChartObj.data.labels = times;
+                    applyCategoryZoomLimits(historyChartObj, times.length);
                     historyChartObj.data.datasets = datasets;
                     historyChartObj.update('none');
                     updateZoomBadge(historyChartObj);
@@ -3490,7 +3532,7 @@ POSITIONS_HTML_TEMPLATE = """<!DOCTYPE html>
         function resetCancelledPreview() {
             fetch('/api/manual_order_action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'RESET' }) })
                 .then(r => {
-                    if (r.status === 401) { window.location.reload(); return; }
+                    if (r.status === 401) { window.location.reload(); return null; }
                     fetchPositionsInBackground();
                 });
         }
@@ -3849,142 +3891,135 @@ def api_positions():
         "signal_exit_b7": "NO",
         "auto_exit_320_b8": "NO",
         "sheet_synced_at": sheet_sync_str,
-        "guard_blocked": False,
-        "guard_reason": "",
+        "status_message": "",
         "show_manual_panel": False,
         "evaluated_order": None,
+        "is_cancelled": False,
+        "guard_blocked": False,
+        "guard_reason": "",
         "auto_execution_notice": None,
         "auto_execution_ok": False,
         "exit_execution_notice": None,
         "exit_execution_ok": False,
         "show_static_ip_bar": False,
-        "tsl_updates": [],
-        "is_cancelled": False,
-        "status_message": ""
+        "tsl_updates": []
     }
 
-    if not error and cfg and not cfg_err:
-        order_engine["signal_exit_b7"] = cfg.get("signal_exit_b7", "NO")
-        order_engine["auto_exit_320_b8"] = cfg.get("auto_exit_320_b8", "NO")
-
-        if cfg.get("auto_exit_320_b8") == "YES" and is_after_320_pm:
-            with ORDER_EXECUTION_LOCK:
-                state = load_auto_order_state()
-                exit_cooldowns = state.setdefault("exit_cooldowns", {})
-                last_320_ts = float(exit_cooldowns.get("320_PM_EXIT", 0.0) or 0.0)
-                if (now_ts - last_320_ts) >= 12.0:
-                    ex_ok, ex_msg = execute_targeted_or_full_exit(
-                        positions, orders, gtt_orders,
-                        target_underlying=None,
-                        target_opt_type=None,
-                        only_options=False
-                    )
-                    if ex_ok is not None:
-                        exit_cooldowns["320_PM_EXIT"] = now_ts
-                        save_auto_order_state(state)
-                        order_engine["exit_execution_notice"] = f"⏰ 3:20 PM AUTO EXIT (B8=YES): {ex_msg}"
-                        order_engine["exit_execution_ok"] = bool(ex_ok)
-                        positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, _ = fetch_upstox_positions()
-
-        exit_cond = cfg.get("exit_condition", "")
-        if cfg.get("signal_exit_b7") == "YES" and exit_cond in ("BE", "SE"):
-            target_opt = "CE" if exit_cond == "BE" else "PE"
-            cooldown_key = f"B7_{exit_cond}"
-            with ORDER_EXECUTION_LOCK:
-                state = load_auto_order_state()
-                exit_cooldowns = state.setdefault("exit_cooldowns", {})
-                last_exit_ts = float(exit_cooldowns.get(cooldown_key, 0.0) or 0.0)
-                if (now_ts - last_exit_ts) >= 8.0:
-                    ex_ok, ex_msg = execute_targeted_or_full_exit(
-                        positions, orders, gtt_orders,
-                        target_underlying=None,
-                        target_opt_type=target_opt,
-                        only_options=True
-                    )
-                    if ex_ok is not None:
-                        exit_cooldowns[cooldown_key] = now_ts
-                        save_auto_order_state(state)
-                        order_engine["exit_execution_notice"] = f"🛑 SIGNAL EXIT (B7=YES | B29={exit_cond} → ALL {target_opt}): {ex_msg}"
-                        order_engine["exit_execution_ok"] = bool(ex_ok)
-                        positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, _ = fetch_upstox_positions()
-
-    if not error:
-        order_engine["tsl_updates"] = process_dynamic_sl_and_target(
-            positions, gtt_orders,
-            cfg.get("sl_percent") if cfg else None,
-            cfg.get("target_percent") if cfg else None
-        )
-
     if cfg_err or not cfg:
-        order_engine["status_message"] = f"DASHBOARD Sheet Alert: {cfg_err}"
+        order_engine["status_message"] = f"DASHBOARD Sheet Error: {cfg_err}"
     else:
         order_engine["manual_order"] = cfg["manual_order"]
         order_engine["want_to_trade"] = cfg["want_to_trade"]
         order_engine["max_active_trades"] = cfg["max_active_trades"]
-        order_engine["exit_condition"] = cfg.get("exit_condition") or "NONE"
+        order_engine["exit_condition"] = cfg["exit_condition"] or "NONE"
+        order_engine["signal_exit_b7"] = cfg.get("signal_exit_b7", "NO")
+        order_engine["auto_exit_320_b8"] = cfg.get("auto_exit_320_b8", "NO")
 
-        if cfg["want_to_trade"] != "YES":
-            guard = evaluate_trade_guards(
-                cfg["symbol"], cfg["option_type"], cfg["max_active_trades"],
-                positions, orders, gtt_orders,
-                load_auto_order_state().get("recent_submissions", {})
+        if not error:
+            order_engine["tsl_updates"] = process_dynamic_sl_and_target(
+                positions, gtt_orders, cfg["sl_percent"], cfg["target_percent"]
             )
-            order_engine["active_trade_count"] = guard["active_count"]
-            if cfg.get("signal_exit_b7") == "YES" and cfg.get("exit_condition") in ("BE", "SE"):
-                target_opt = "CE" if cfg["exit_condition"] == "BE" else "PE"
-                order_engine["status_message"] = f"B7=YES & B29={cfg['exit_condition']}: Monitoring & exiting ALL open {target_opt} positions/orders."
-            elif cfg.get("auto_exit_320_b8") == "YES" and is_after_320_pm:
-                order_engine["status_message"] = "B8=YES & Time >= 3:20 PM IST: All open positions/orders squared off."
-            else:
-                order_engine["status_message"] = "Want to Trade (B17) is NO — Order placement paused."
-        else:
-            evaluated, eval_err = prepare_evaluated_order(cfg)
-            if eval_err or not evaluated:
-                order_engine["status_message"] = f"Order Check: {eval_err}"
-            else:
-                order_engine["evaluated_order"] = evaluated
-                with ORDER_EXECUTION_LOCK:
-                    state = load_auto_order_state()
-                    guard = evaluate_trade_guards(
-                        evaluated["symbol"],
-                        evaluated["option_type"],
-                        cfg["max_active_trades"],
-                        positions,
-                        orders,
-                        gtt_orders,
-                        state.get("recent_submissions", {})
-                    )
-                    order_engine["active_trade_count"] = guard["active_count"]
-                    order_engine["guard_blocked"] = not guard["allowed"]
-                    order_engine["guard_reason"] = guard["reason"]
 
-                    if not guard["allowed"]:
-                        order_engine["status_message"] = guard["reason"]
-                        if cfg["manual_order"] != "Auto" and evaluated["signature"] not in state.get("cancelled_signatures", []):
-                            order_engine["show_manual_panel"] = True
-                    elif cfg["manual_order"] == "Auto":
-                        ok, msg, is_ip_err = submit_upstox_evaluated_order(evaluated)
-                        if is_ip_err:
-                            order_engine["show_static_ip_bar"] = True
-                        if ok:
-                            state.setdefault("recent_submissions", {})[evaluated["duplicate_key"]] = get_ist_now().timestamp()
-                            save_auto_order_state(state)
-                            order_engine["auto_execution_notice"] = f"⚡ AUTO-ORDER EXECUTED ({evaluated['symbol']} {evaluated['selected_strike']} {evaluated['option_type']}): {msg}"
-                            order_engine["auto_execution_ok"] = True
-                            order_engine["status_message"] = f"Auto-order placed ({guard['active_count'] + 1}/{cfg['max_active_trades']} active)."
-                            positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, _ = fetch_upstox_positions()
-                            process_dynamic_sl_and_target(positions, gtt_orders, cfg.get("sl_percent"), cfg.get("target_percent"))
-                        else:
-                            order_engine["auto_execution_notice"] = f"❌ AUTO-ORDER FAILED: {msg}"
-                            order_engine["auto_execution_ok"] = False
-                            order_engine["status_message"] = f"Auto-order failed: {msg}"
+        with ORDER_EXECUTION_LOCK:
+            state = load_auto_order_state()
+            exit_cooldowns = state.setdefault("exit_cooldowns", {})
+
+            # 1) 3:20 PM AUTO-EXIT CHECK (Cell B8 == YES)
+            if not error and cfg.get("auto_exit_320_b8") == "YES" and is_after_320_pm:
+                eod_key = f"EOD_320_{get_ist_today_str()}"
+                if (now_ts - float(exit_cooldowns.get(eod_key, 0))) >= 30:
+                    ok_eod, msg_eod = execute_targeted_or_full_exit(
+                        positions, orders, gtt_orders,
+                        target_underlying=None, target_opt_type=None, only_options=False
+                    )
+                    if msg_eod:
+                        exit_cooldowns[eod_key] = now_ts
+                        save_auto_order_state(state)
+                        order_engine["exit_execution_notice"] = f"⏰ 3:20 PM Auto Exit (B8=YES): {msg_eod}"
+                        order_engine["exit_execution_ok"] = bool(ok_eod)
+                        order_engine["status_message"] = f"⏰ 3:20 PM Auto Exit Triggered (B8=YES)!"
+                        positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, _ = fetch_upstox_positions()
+
+            # 2) SIGNAL EXIT CONDITION CHECK (Only active if Cell B7 == YES AND Cell B29 is BE or SE)
+            exit_cond = cfg.get("exit_condition", "")
+            if not error and cfg.get("signal_exit_b7") == "YES" and exit_cond in ("BE", "SE"):
+                target_opt = "CE" if exit_cond == "BE" else "PE"
+                target_sym = cfg["symbol"]
+                exit_key = f"EXIT_{target_sym}_{target_opt}_{exit_cond}"
+
+                if (now_ts - float(exit_cooldowns.get(exit_key, 0))) >= 15:
+                    ok_exit, msg_exit = execute_targeted_or_full_exit(
+                        positions, orders, gtt_orders,
+                        target_underlying=target_sym, target_opt_type=target_opt, only_options=True
+                    )
+                    if msg_exit:
+                        exit_cooldowns[exit_key] = now_ts
+                        save_auto_order_state(state)
+                        order_engine["exit_execution_notice"] = f"🚨 Signal Exit Triggered (B7=YES, B29={exit_cond} → Close {target_sym} {target_opt}): {msg_exit}"
+                        order_engine["exit_execution_ok"] = bool(ok_exit)
+                        order_engine["status_message"] = f"🚨 Signal Exit ({exit_cond}): Closed {target_sym} {target_opt} positions & orders."
+                        positions, orders, gtt_orders, total_pnl, realised_pnl, unrealised_pnl, _ = fetch_upstox_positions()
+                    elif not order_engine["status_message"]:
+                        order_engine["status_message"] = f"Signal Exit Ready (B7=YES, B29={exit_cond}): No open {target_sym} {target_opt} positions/orders."
+            elif cfg.get("signal_exit_b7") != "YES" and exit_cond in ("BE", "SE") and not order_engine["status_message"]:
+                order_engine["status_message"] = f"Signal Exit Paused (B7=NO, B29={exit_cond})."
+
+            # 3) ENTRY CONDITION CHECK (B17 Want to Trade == YES)
+            base_guard = evaluate_trade_guards(
+                cfg["symbol"],
+                cfg["option_type"],
+                cfg["max_active_trades"],
+                positions,
+                orders,
+                gtt_orders,
+                state.get("recent_submissions", {})
+            )
+            order_engine["active_trade_count"] = base_guard["active_count"]
+
+            if cfg["want_to_trade"] != "YES":
+                if not order_engine["status_message"]:
+                    order_engine["status_message"] = "Waiting: DASHBOARD B17 (Want to Trade) is NO."
+            elif cfg.get("auto_exit_320_b8") == "YES" and is_after_320_pm:
+                order_engine["status_message"] = "Trading Halted: Past 3:20 PM IST with B8 Auto-Exit enabled."
+            else:
+                if not base_guard["allowed"]:
+                    order_engine["guard_blocked"] = True
+                    order_engine["guard_reason"] = base_guard["reason"]
+
+                evaluated, eval_err = prepare_evaluated_order(cfg)
+                if eval_err or not evaluated:
+                    order_engine["status_message"] = f"Order Prep Warning: {eval_err}"
+                else:
+                    sig = evaluated["signature"]
+                    dup_key = evaluated["duplicate_key"]
+                    order_engine["evaluated_order"] = evaluated
+
+                    if sig in state.get("cancelled_signatures", []):
+                        order_engine["is_cancelled"] = True
+                        order_engine["status_message"] = "Order preview cancelled by user."
+                    elif cfg["manual_order"] == "Manual":
+                        order_engine["show_manual_panel"] = True
+                        order_engine["status_message"] = (
+                            f"Manual Approval Required ({evaluated['symbol']} {evaluated['selected_strike']} {evaluated['option_type']} @ ₹{evaluated['entry_price']})."
+                            if base_guard["allowed"] else f"Manual Preview ({base_guard['reason']})"
+                        )
                     else:
-                        if evaluated["signature"] in state.get("cancelled_signatures", []):
-                            order_engine["is_cancelled"] = True
-                            order_engine["status_message"] = "Manual order preview cancelled by user."
+                        if not base_guard["allowed"]:
+                            order_engine["status_message"] = f"Auto Mode Paused: {base_guard['reason']}"
                         else:
-                            order_engine["show_manual_panel"] = True
-                            order_engine["status_message"] = f"Manual Mode: Eligible ({guard['active_count']}/{cfg['max_active_trades']} active). Ready for approval."
+                            ok, msg, is_ip_err = submit_upstox_evaluated_order(evaluated)
+                            if is_ip_err:
+                                order_engine["show_static_ip_bar"] = True
+                            if ok:
+                                state.setdefault("recent_submissions", {})[dup_key] = get_ist_now().timestamp()
+                                save_auto_order_state(state)
+                                order_engine["auto_execution_notice"] = f"⚡ AUTO-ORDER EXECUTED: {msg}"
+                                order_engine["auto_execution_ok"] = True
+                                order_engine["status_message"] = f"Auto Order Placed ({evaluated['symbol']} {evaluated['selected_strike']} {evaluated['option_type']})."
+                            else:
+                                order_engine["auto_execution_notice"] = f"⚠️ Auto Order Failed: {msg}"
+                                order_engine["auto_execution_ok"] = False
+                                order_engine["status_message"] = f"Auto Order Failed: {msg}"
 
     LAST_DIAGNOSTICS["total_cycle_ms"] = int((time.time() - cycle_t0) * 1000)
     LAST_DIAGNOSTICS["updated_at"] = sheet_sync_str
@@ -4007,22 +4042,24 @@ def download_history():
     snapshots, _ = fetch_history_from_gsheet(symbol)
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Timestamp", "Date", "Time", "Symbol", "Spot Price", "ATM Strike", "PCR", "CE OI", "PE OI", "CE Chg OI", "PE Chg OI", "CE Vol", "PE Vol", "CE IV", "PE IV", "CE Delta", "PE Delta", "CE Theta", "PE Theta", "CE Vega", "PE Vega", "CE Gamma", "PE Gamma", "CE Bid", "PE Bid", "CE Ask", "PE Ask", "CE LTP", "PE LTP", "Min ROC (Buy)", "Max ROC (Sell)", "Cross ROC Sig", "Main Volatility", "New Signal", "5 Min Signal (AF)", "15 Min Signal (AG)", "30 Min Signal (AH)", "1 HR Signal (AI)"])
+    writer.writerow(["Time", "Symbol", "Price LTP", "ATM Strike", "PCR", "CE OI", "PE OI", "CE Chng OI", "PE Chng OI", "CE Vol", "PE Vol", "CE IV", "PE IV", "CE Delta", "PE Delta", "CE Theta", "PE Theta", "CE Vega", "PE Vega", "CE Gamma", "PE Gamma", "CE Bid", "PE Bid", "CE Ask", "PE Ask", "CE LTP", "PE LTP", "5 Min Signal", "15 Min Signal", "30 Min Signal", "1 HR Signal", "New Signal"])
     for s in snapshots:
-        writer.writerow([s.get("timestamp", ""), s.get("date_str", ""), s.get("formatted_time", ""), s.get("symbol", ""), s.get("spot_price", 0), s.get("atm_strike", 0), s.get("pcr", 0), s.get("ce_oi", 0), s.get("pe_oi", 0), s.get("ce_oi_chg", 0), s.get("pe_oi_chg", 0), s.get("ce_vol", 0), s.get("pe_vol", 0), s.get("ce_iv", 0), s.get("pe_iv", 0), s.get("ce_delta", 0), s.get("pe_delta", 0), s.get("ce_theta", 0), s.get("pe_theta", 0), s.get("ce_vega", 0), s.get("pe_vega", 0), s.get("ce_gamma", 0), s.get("pe_gamma", 0), s.get("ce_bid", 0), s.get("pe_bid", 0), s.get("ce_ask", 0), s.get("pe_ask", 0), s.get("ce_ltp", 0), s.get("pe_ltp", 0), s.get("min_roc", 0), s.get("max_roc", 0), s.get("cross_roc", 0), s.get("main_volatility", 0), s.get("new_signal", ""), s.get("signal_5m", ""), s.get("signal_15m", ""), s.get("signal_30m", ""), s.get("signal_1h", "")])
-    return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment;filename={symbol}_sheet_history.csv"})
+        writer.writerow([s.get("datetime"), s.get("symbol"), s.get("spot_price"), s.get("atm_strike"), s.get("pcr"), s.get("ce_oi"), s.get("pe_oi"), s.get("ce_oi_chg"), s.get("pe_oi_chg"), s.get("ce_vol"), s.get("pe_vol"), s.get("ce_iv"), s.get("pe_iv"), s.get("ce_delta"), s.get("pe_delta"), s.get("ce_theta"), s.get("pe_theta"), s.get("ce_vega"), s.get("pe_vega"), s.get("ce_gamma"), s.get("pe_gamma"), s.get("ce_bid"), s.get("pe_bid"), s.get("ce_ask"), s.get("pe_ask"), s.get("ce_ltp"), s.get("pe_ltp"), s.get("signal_5m"), s.get("signal_15m"), s.get("signal_30m"), s.get("signal_1h"), s.get("new_signal")])
+    return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename={symbol}_GoogleSheet_History.csv"})
 
 @app.route("/download", methods=["GET"])
 def download_csv():
     symbol = request.args.get("symbol", "NIFTY").upper()
     selected_expiry = request.args.get("expiry", "ALL")
-    rows, _, _, expiry, _, _, _, _, _, _ = process_option_data(symbol, selected_expiry)
+    rows, spot_price, atm_strike, expiry, _, updated, pcr, t_ce, t_pe, error = process_option_data(symbol, selected_expiry)
     output = io.StringIO()
     writer = csv.writer(output)
+    writer.writerow(["Symbol", symbol, "Spot Price", spot_price, "ATM Strike", atm_strike, "Expiry", expiry, "PCR", pcr, "Updated", updated])
+    writer.writerow([])
     writer.writerow(["CE_OI", "CE_Chg_OI", "CE_Vol", "CE_IV", "CE_Delta", "CE_Theta", "CE_Vega", "CE_Gamma", "CE_Bid", "CE_Ask", "CE_LTP", "Strike", "PE_LTP", "PE_Bid", "PE_Ask", "PE_Delta", "PE_Theta", "PE_Vega", "PE_Gamma", "PE_IV", "PE_Vol", "PE_Chg_OI", "PE_OI"])
     for r in rows:
         writer.writerow([r["ce_oi"], r["ce_oi_chg"], r["ce_vol"], r["ce_iv"], r["ce_delta"], r["ce_theta"], r["ce_vega"], r["ce_gamma"], r["ce_bid"], r["ce_ask"], r["ce_ltp"], r["strike"], r["pe_ltp"], r["pe_bid"], r["pe_ask"], r["pe_delta"], r["pe_theta"], r["pe_vega"], r["pe_gamma"], r["pe_iv"], r["pe_vol"], r["pe_oi_chg"], r["pe_oi"]])
-    return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment;filename={symbol}_{expiry}.csv"})
+    return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename={symbol}_OptionChain.csv"})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
